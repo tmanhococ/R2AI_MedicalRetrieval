@@ -1,0 +1,105 @@
+run:
+  experiment_name: "baseline_multilingual_hybrid"
+  seed: 42
+  output_dir: "artifacts/experiments"
+
+indexing:
+  chunking:
+    mode: "hybrid" # prechunked | auto | hybrid
+    auto_strategy:
+      type: "sliding_window" # sliding_window | fixed_tokens
+      chunk_size: 512
+      chunk_overlap: 64
+      min_chunk_length: 50
+  validation:
+    strict_foreign_keys: true
+    drop_duplicates: true
+
+query_understanding:
+  normalize: true
+  adaptive_routing:
+    enabled: true
+    length_threshold: 50
+    strip_clinical_boilerplate: true
+    dense_strategy: "head_tail" # full | head_tail
+    max_dense_tokens: 512
+  translation:
+    enabled: true
+    target_languages: ["en", "zh"]
+    provider: "precomputed_cache" # precomputed_cache | local_hf | api | passthrough
+    cache_path: "artifacts/cache/translations.jsonl"
+    fallback_on_error: true
+    local_hf_model: "facebook/nllb-200-distilled-600M"
+
+retrieval:
+  candidate_top_k: 200
+
+  bm25:
+    enabled: true
+    backend: "bm25s" # bm25s | rank_bm25
+    top_k: 200
+    tokenizers:
+      vi: "syllable"   # syllable | pyvi
+      en: "whitespace" # whitespace | nltk_stem
+      zh: "jieba"      # jieba | char
+
+  dense:
+    enabled: true
+    backend: "faiss" # faiss | numpy
+    device: "auto"   # auto | cuda | cpu
+    model_name: "intfloat/multilingual-e5-large"
+    top_k: 200
+    batch_size: 64
+    normalize_embeddings: true
+    instruction_prefix:
+      query: "query: "
+      passage: "passage: "
+
+fusion:
+  method: "weighted_rrf"
+  rrf_k: 60
+  weights:
+    vi_bm25: 1.0
+    vi_dense: 1.0
+    en_bm25: 1.0
+    en_dense: 1.0
+    zh_bm25: 1.0
+    zh_dense: 1.0
+
+reranker:
+  enabled: true
+  model_name: "BAAI/bge-reranker-v2-m3"
+  document_strategy: "chunk_aggregation" # chunk_aggregation | truncate_direct
+  document_top_k: 100
+  chunk_top_k: 200
+  batch_size: 32
+  max_length: 512
+
+joint_scoring:
+  document:
+    base_weight: 0.70
+    best_chunk_weight: 0.20
+    top_chunks_mean_weight: 0.10
+    top_m_chunks: 3
+
+  chunk:
+    base_weight: 0.85
+    parent_document_weight: 0.15
+
+post_processing:
+  consistency_mode: "independent" # independent | enforce_parent_doc | filter_orphan_chunks
+
+calibration:
+  metric: "macro_f2"
+  beta: 2.0
+  policies:
+    - "fixed_top_k"
+    - "global_threshold"
+    - "relative_threshold"
+    - "score_gap"
+  bounds:
+    documents: { min: 1, max: 50 }
+    chunks: { min: 1, max: 100 }
+
+submission:
+  exporter: "internal_jsonl" # internal_jsonl | competition_csv
