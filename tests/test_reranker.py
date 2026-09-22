@@ -641,3 +641,39 @@ def test_candidate_keyed_by_doc_id_and_all_missing():
     res_doc_none = dummy.rerank_documents_direct(variants, cand, {"unrelated": "text"})
     assert res_doc_none == []
 
+
+def test_standalone_keyword_arguments_and_whitespace_routing():
+    """Verify standalone helpers support keyword arguments and resolve whitespace translations."""
+    variants = QueryVariants(vi="tim mạch", en="   ", zh=None)
+    # en is whitespace, should fall back to vi
+    resolved_en = resolve_query_for_language(variants, "en")
+    assert resolved_en == "tim mạch"
+
+    cand = [
+        FusedHit(item_id="c1", item_type="chunk", doc_id="d1", language="en", fusion_score=0.2, stream_ranks={})
+    ]
+    texts = {"c1": "bệnh tim mạch"}
+
+    # Keyword-only call
+    scored_chunks = rerank_chunks(
+        query_variants=variants,
+        candidates=cand,
+        chunk_texts=texts,
+        top_k=5,
+    )
+    assert len(scored_chunks) == 1
+    assert scored_chunks[0].item_id == "c1"
+
+    doc_cand = [
+        FusedHit(item_id="d1", item_type="document", doc_id="d1", language="en", fusion_score=0.2, stream_ranks={})
+    ]
+    scored_docs = rerank_documents_direct(
+        query_variants=variants,
+        candidates=doc_cand,
+        doc_texts={"d1": "bệnh tim mạch trực tiếp"},
+        max_length=256,
+        top_k=5,
+    )
+    assert len(scored_docs) == 1
+
+

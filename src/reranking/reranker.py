@@ -28,9 +28,11 @@ def resolve_query_for_language(query_variants: QueryVariants, language: str | No
     """
     lang = (language or "").strip().lower()
     if lang == "en":
-        return query_variants.en or query_variants.vi
+        q_en = query_variants.en.strip() if query_variants.en else ""
+        return q_en if q_en else query_variants.vi
     elif lang == "zh":
-        return query_variants.zh or query_variants.vi
+        q_zh = query_variants.zh.strip() if query_variants.zh else ""
+        return q_zh if q_zh else query_variants.vi
     return query_variants.vi
 
 
@@ -436,10 +438,15 @@ class DummyReranker(BaseReranker):
 # =====================================================================
 
 def rerank_chunks(
-    query_variants_or_reranker: Any,
+    query_variants_or_reranker: Any = None,
     candidates_or_query_variants: Any = None,
     chunk_texts_or_candidates: Any = None,
     *args: Any,
+    query_variants: Any = None,
+    candidates: Any = None,
+    chunk_texts: Any = None,
+    top_k: int = 100,
+    reranker: Any = None,
     **kwargs: Any,
 ) -> list[ScoredHit]:
     """Rerank chunks either via (reranker, query_variants, candidates, chunk_texts)
@@ -448,29 +455,38 @@ def rerank_chunks(
     if hasattr(query_variants_or_reranker, "rerank_chunks"):
         # Called as rerank_chunks(reranker, query_variants, candidates, chunk_texts, ...)
         return query_variants_or_reranker.rerank_chunks(
-            query_variants=candidates_or_query_variants,
-            candidates=chunk_texts_or_candidates,
-            chunk_texts=args[0] if args else kwargs.get("chunk_texts", {}),
-            top_k=args[1] if len(args) > 1 else kwargs.get("top_k", 100),
+            query_variants=candidates_or_query_variants or query_variants,
+            candidates=chunk_texts_or_candidates or candidates,
+            chunk_texts=args[0] if args else (chunk_texts or kwargs.get("chunk_texts", {})),
+            top_k=args[1] if len(args) > 1 else kwargs.get("top_k", top_k),
         )
     else:
         # Called as rerank_chunks(query_variants, candidates, chunk_texts, top_k=..., reranker=...)
-        reranker = kwargs.get("reranker")
-        if reranker is None:
-            reranker = DummyReranker()
-        return reranker.rerank_chunks(
-            query_variants=query_variants_or_reranker,
-            candidates=candidates_or_query_variants,
-            chunk_texts=chunk_texts_or_candidates,
-            top_k=kwargs.get("top_k", args[0] if args else 100),
+        qv = query_variants_or_reranker or query_variants
+        cands = candidates_or_query_variants or candidates
+        texts = chunk_texts_or_candidates or chunk_texts or {}
+        r_inst = reranker or kwargs.get("reranker")
+        if r_inst is None:
+            r_inst = DummyReranker()
+        return r_inst.rerank_chunks(
+            query_variants=qv,
+            candidates=cands,
+            chunk_texts=texts,
+            top_k=kwargs.get("top_k", args[0] if args else top_k),
         )
 
 
 def rerank_documents_direct(
-    query_variants_or_reranker: Any,
+    query_variants_or_reranker: Any = None,
     candidates_or_query_variants: Any = None,
     doc_texts_or_candidates: Any = None,
     *args: Any,
+    query_variants: Any = None,
+    candidates: Any = None,
+    doc_texts: Any = None,
+    max_length: int = 512,
+    top_k: int = 100,
+    reranker: Any = None,
     **kwargs: Any,
 ) -> list[ScoredHit]:
     """Rerank documents directly either via (reranker, query_variants, candidates, doc_texts)
@@ -478,20 +494,23 @@ def rerank_documents_direct(
     """
     if hasattr(query_variants_or_reranker, "rerank_documents_direct"):
         return query_variants_or_reranker.rerank_documents_direct(
-            query_variants=candidates_or_query_variants,
-            candidates=doc_texts_or_candidates,
-            doc_texts=args[0] if args else kwargs.get("doc_texts", {}),
-            max_length=args[1] if len(args) > 1 else kwargs.get("max_length", 512),
-            top_k=args[2] if len(args) > 2 else kwargs.get("top_k", 100),
+            query_variants=candidates_or_query_variants or query_variants,
+            candidates=doc_texts_or_candidates or candidates,
+            doc_texts=args[0] if args else (doc_texts or kwargs.get("doc_texts", {})),
+            max_length=args[1] if len(args) > 1 else kwargs.get("max_length", max_length),
+            top_k=args[2] if len(args) > 2 else kwargs.get("top_k", top_k),
         )
     else:
-        reranker = kwargs.get("reranker")
-        if reranker is None:
-            reranker = DummyReranker()
-        return reranker.rerank_documents_direct(
-            query_variants=query_variants_or_reranker,
-            candidates=candidates_or_query_variants,
-            doc_texts=doc_texts_or_candidates,
-            max_length=kwargs.get("max_length", args[0] if len(args) > 0 else 512),
-            top_k=kwargs.get("top_k", args[1] if len(args) > 1 else 100),
+        qv = query_variants_or_reranker or query_variants
+        cands = candidates_or_query_variants or candidates
+        texts = doc_texts_or_candidates or doc_texts or {}
+        r_inst = reranker or kwargs.get("reranker")
+        if r_inst is None:
+            r_inst = DummyReranker()
+        return r_inst.rerank_documents_direct(
+            query_variants=qv,
+            candidates=cands,
+            doc_texts=texts,
+            max_length=kwargs.get("max_length", args[0] if len(args) > 0 else max_length),
+            top_k=kwargs.get("top_k", args[1] if len(args) > 1 else top_k),
         )
