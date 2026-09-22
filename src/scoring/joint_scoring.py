@@ -24,14 +24,15 @@ def _normalize_or_pass_scores(
         return []
 
     raw_scores = [float(h.normalized_score) for h in hits]
+    if mode is False:
+        return raw_scores
+
     if all(s == 0.0 for s in raw_scores) and any(float(h.rerank_score) != 0.0 for h in hits):
         raw_scores = [float(h.rerank_score) for h in hits]
         return min_max_normalize(raw_scores)
 
     if mode is True:
         return min_max_normalize(raw_scores)
-    elif mode is False:
-        return raw_scores
     else:  # "auto"
         if any(s < 0.0 or s > 1.0 for s in raw_scores):
             return min_max_normalize(raw_scores)
@@ -85,6 +86,7 @@ def compute_joint_scores(
         chunks_by_doc.setdefault(chunk.doc_id, []).append(chunk_score)
 
     # 2. Compute Final Document Scores
+    m_chunks = max(1, int(top_m_chunks))
     final_doc_scores: list[float] = []
     final_doc_score_map: dict[str, float] = {}
 
@@ -98,7 +100,7 @@ def compute_joint_scores(
         if matching_chunk_scores:
             best_chunk_score = max(matching_chunk_scores)
             sorted_chunks = sorted(matching_chunk_scores, reverse=True)
-            top_k_chunks = sorted_chunks[:top_m_chunks]
+            top_k_chunks = sorted_chunks[:m_chunks]
             top_chunks_mean = sum(top_k_chunks) / len(top_k_chunks)
         else:
             best_chunk_score = 0.0
