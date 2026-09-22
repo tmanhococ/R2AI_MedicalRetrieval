@@ -45,12 +45,44 @@ class JsonlDatasetAdapter:
 
     def __init__(
         self,
-        docs_path: str | Path | None = None,
+        docs_path_or_dir: str | Path | None = None,
         chunks_path: str | Path | None = None,
         queries_dir: str | Path | None = None,
         qrels_dir: str | Path | None = None,
+        *,
+        dataset_dir: str | Path | None = None,
+        docs_path: str | Path | None = None,
     ) -> None:
-        self.docs_path = Path(docs_path) if docs_path is not None else None
+        target_dir = dataset_dir
+        if target_dir is None and docs_path_or_dir is not None and docs_path is None:
+            p = Path(docs_path_or_dir)
+            if p.is_dir():
+                target_dir = p
+
+        if target_dir is not None:
+            td = Path(target_dir)
+            if docs_path is None:
+                for candidate in ["documents.jsonl", "docs.jsonl", "corpus.jsonl"]:
+                    if (td / candidate).exists():
+                        docs_path = td / candidate
+                        break
+                if docs_path is None:
+                    docs_path = td / "documents.jsonl"
+
+            if chunks_path is None:
+                for candidate in ["chunks.jsonl", "passages.jsonl"]:
+                    if (td / candidate).exists():
+                        chunks_path = td / candidate
+                        break
+
+            if queries_dir is None:
+                queries_dir = (td / "queries") if (td / "queries").is_dir() else td
+
+            if qrels_dir is None:
+                qrels_dir = (td / "qrels") if (td / "qrels").is_dir() else td
+
+        effective_docs_path = docs_path if docs_path is not None else docs_path_or_dir
+        self.docs_path = Path(effective_docs_path) if effective_docs_path is not None else None
         self.chunks_path = Path(chunks_path) if chunks_path is not None else None
         self.queries_dir = Path(queries_dir) if queries_dir is not None else None
         self.qrels_dir = Path(qrels_dir) if qrels_dir is not None else None

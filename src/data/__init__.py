@@ -13,7 +13,7 @@ from src.data.schemas import (
     ScoredHit,
     SearchHit,
 )
-from src.data.validators import validate_corpus_integrity
+from src.data.validators import validate_corpus, validate_corpus_integrity
 
 __all__ = [
     "QueryRecord",
@@ -24,6 +24,7 @@ __all__ = [
     "FusedHit",
     "ScoredHit",
     "FinalPrediction",
+    "validate_corpus",
     "validate_corpus_integrity",
     "DatasetAdapter",
     "JsonlDatasetAdapter",

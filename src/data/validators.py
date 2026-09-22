@@ -33,3 +33,7 @@ def validate_corpus_integrity(
             return False
 
     return True
+
+
+# Alias for pipeline entrypoints
+validate_corpus = validate_corpus_integrity
