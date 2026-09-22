@@ -127,7 +127,7 @@ def weighted_rrf(
                 candidates[item_id] = _CandidateAccumulator(
                     item_id=item_id,
                     item_type=getattr(hit, "item_type", "document"),
-                    doc_id=getattr(hit, "doc_id", item_id),
+                    doc_id=getattr(hit, "doc_id", None) or item_id,
                     language=getattr(hit, "language", ""),
                     best_rank=rank,
                     best_weight=weight,
