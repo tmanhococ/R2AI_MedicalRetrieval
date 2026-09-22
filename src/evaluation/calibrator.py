@@ -8,7 +8,7 @@ or fitted on test evaluation queries to prevent optimistic bias and test set dat
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -33,7 +33,7 @@ class CalibrationState:
     best_policy: str
     best_params: dict[str, Any]
     best_f2: float
-    all_policy_results: dict[str, Any]
+    all_policy_results: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert calibration state to dictionary for serialization."""
@@ -117,10 +117,10 @@ class CutoffCalibrator:
         """Generate grid of parameter configurations for a given policy."""
         if policy == "fixed_top_k":
             b = self.bounds.get("fixed_top_k")
-            if isinstance(b, (tuple, list)) and len(b) == 2 and isinstance(b[0], int) and isinstance(b[1], int):
+            if isinstance(b, (tuple, list)) and len(b) == 2 and isinstance(b[0], int) and isinstance(b[1], int) and b[0] <= b[1]:
                 k_vals = list(range(b[0], b[1] + 1))
-            elif isinstance(b, list):
-                k_vals = b
+            elif isinstance(b, (list, tuple)):
+                k_vals = list(b)
             elif isinstance(b, dict):
                 k_vals = list(range(b.get("min_k", 1), b.get("max_k", 10) + 1))
             else:
@@ -131,14 +131,14 @@ class CutoffCalibrator:
             b = self.bounds.get("global_threshold")
             if isinstance(b, (tuple, list)) and len(b) == 2 and isinstance(b[0], (int, float)) and isinstance(b[1], (int, float)):
                 min_t, max_t = float(b[0]), float(b[1])
-                t_vals = [round(min_t + i * 0.05, 3) for i in range(int((max_t - min_t) / 0.05) + 1)]
+                t_vals = [round(min_t + i * 0.05, 3) for i in range(int(round((max_t - min_t) / 0.05)) + 1)]
             elif isinstance(b, list):
                 t_vals = b
             elif isinstance(b, dict):
                 min_t = b.get("min_t", 0.0)
                 max_t = b.get("max_t", 1.0)
                 step = b.get("step", 0.05)
-                t_vals = [round(min_t + i * step, 3) for i in range(int((max_t - min_t) / step) + 1)]
+                t_vals = [round(min_t + i * step, 3) for i in range(int(round((max_t - min_t) / step)) + 1)]
             else:
                 t_vals = [round(x * 0.05, 2) for x in range(1, 20)]
             return [{"threshold": t} for t in t_vals]
@@ -147,14 +147,14 @@ class CutoffCalibrator:
             b = self.bounds.get("relative_threshold")
             if isinstance(b, (tuple, list)) and len(b) == 2 and isinstance(b[0], (int, float)) and isinstance(b[1], (int, float)):
                 min_r, max_r = float(b[0]), float(b[1])
-                r_vals = [round(min_r + i * 0.05, 3) for i in range(int((max_r - min_r) / 0.05) + 1)]
+                r_vals = [round(min_r + i * 0.05, 3) for i in range(int(round((max_r - min_r) / 0.05)) + 1)]
             elif isinstance(b, list):
                 r_vals = b
             elif isinstance(b, dict):
                 min_r = b.get("min_ratio", 0.1)
                 max_r = b.get("max_ratio", 1.0)
                 step = b.get("step", 0.05)
-                r_vals = [round(min_r + i * step, 3) for i in range(int((max_r - min_r) / step) + 1)]
+                r_vals = [round(min_r + i * step, 3) for i in range(int(round((max_r - min_r) / step)) + 1)]
             else:
                 r_vals = [round(x * 0.05, 2) for x in range(2, 21)]
             return [{"lambda_ratio": r} for r in r_vals]
@@ -208,6 +208,8 @@ class CutoffCalibrator:
         elif policy == "relative_threshold":
             ratio = float(params.get("lambda_ratio", params.get("lambda", 0.5)))
             _, top_score = _extract_id_and_score(ranked_items[0])
+            if top_score <= 0.0:
+                return 1
             threshold = ratio * top_score
             count = 0
             for it in ranked_items:
@@ -216,7 +218,7 @@ class CutoffCalibrator:
                     count += 1
                 else:
                     break
-            return count
+            return max(1, count)
 
         elif policy == "score_gap":
             if n <= 1:

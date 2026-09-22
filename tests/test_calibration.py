@@ -202,3 +202,25 @@ def test_calibrator_deterministic_tie_breaking():
     state = calibrator.fit(query_scores, gt)
     assert state.best_params["k"] == 1
     assert state.best_f2 == pytest.approx(1.0)
+
+
+def test_calibrator_with_pure_floats_and_discrete_bounds():
+    calibrator = CutoffCalibrator(
+        policies=["fixed_top_k", "relative_threshold"],
+        bounds={
+            "fixed_top_k": (1, 3, 5),  # discrete tuple
+            "relative_threshold": (0.2, 0.8),
+        },
+    )
+    state = CalibrationState(
+        item_type="document",
+        best_policy="relative_threshold",
+        best_params={"lambda_ratio": 0.5},
+        best_f2=0.9,
+    )
+    # Apply on pure float list
+    cutoff = calibrator.apply([0.9, 0.8, 0.3, 0.1], state)
+    assert cutoff == 2
+    filtered = calibrator.filter_items([0.9, 0.8, 0.3, 0.1], state)
+    assert filtered == [0.9, 0.8]
+
