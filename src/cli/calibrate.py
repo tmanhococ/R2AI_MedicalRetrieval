@@ -52,6 +52,9 @@ def run_calibrate(
     Returns:
         Dictionary containing calibration file path and state summaries.
     """
+    if split.lower() in ("test", "hidden_test", "submission"):
+        raise ValueError(f"Cannot calibrate on split '{split}': anti-leakage violation.")
+
     dataset_path = Path(dataset_dir)
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")

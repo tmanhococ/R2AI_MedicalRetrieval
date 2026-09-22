@@ -109,8 +109,10 @@ def run_predict(
 
     # 3. Load calibration.json if provided
     calib_data = None
-    calib_path = Path(calibration_path) if calibration_path else None
-    if calib_path and calib_path.exists():
+    if calibration_path:
+        calib_path = Path(calibration_path)
+        if not calib_path.exists():
+            raise FileNotFoundError(f"Calibration file not found: {calibration_path}")
         with open(calib_path, "r", encoding="utf-8") as f:
             calib_data = json.load(f)
 
@@ -119,9 +121,9 @@ def run_predict(
         calibrator = CutoffCalibrator(beta=config.get("calibration", {}).get("beta", 2.0))
 
     consistency_mode = config.get("post_processing", {}).get("consistency_mode", "independent")
-    reranker_cfg = config.get("reranker", {})
-    default_doc_top_k = reranker_cfg.get("document_top_k", 10)
-    default_chunk_top_k = reranker_cfg.get("chunk_top_k", 20)
+    calib_bounds = config.get("calibration", {}).get("bounds", {})
+    default_doc_top_k = int(calib_bounds.get("documents", {}).get("min", 10))
+    default_chunk_top_k = int(calib_bounds.get("chunks", {}).get("min", 20))
 
     predictions: list[FinalPrediction] = []
 

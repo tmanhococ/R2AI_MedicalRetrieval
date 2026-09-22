@@ -54,13 +54,16 @@ def load_corpus_and_texts(
     """Load corpus documents and chunks, providing fast lookup tables for text and doc relationships."""
     adapter = JsonlDatasetAdapter(dataset_dir)
     documents = adapter.load_documents()
-    chunks = adapter.load_chunks()
 
-    if not chunks and index_dir is not None:
+    chunks: list[ChunkRecord] = []
+    if index_dir is not None:
         idx_chunks = Path(index_dir) / "chunks.jsonl"
         if idx_chunks.exists():
             chunk_adapter = JsonlDatasetAdapter(chunks_path=idx_chunks)
             chunks = chunk_adapter.load_chunks()
+
+    if not chunks:
+        chunks = adapter.load_chunks()
 
     if not chunks and config is not None:
         chunker = create_chunker(config.get("indexing", {}).get("chunking", {}))

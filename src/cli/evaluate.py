@@ -110,20 +110,27 @@ def run_evaluate(
     )
 
     # Resolve calibration if provided or present in output directory
-    calib_file = Path(calibration_path) if calibration_path else (out_dir / "calibration.json")
     calib_data = None
-    if calib_file.exists():
+    if calibration_path:
+        calib_file = Path(calibration_path)
+        if not calib_file.exists():
+            raise FileNotFoundError(f"Calibration file not found: {calibration_path}")
         with open(calib_file, "r", encoding="utf-8") as f:
             calib_data = json.load(f)
+    else:
+        calib_file = out_dir / "calibration.json"
+        if calib_file.exists():
+            with open(calib_file, "r", encoding="utf-8") as f:
+                calib_data = json.load(f)
 
     calibrator: CutoffCalibrator | None = None
     if calib_data:
         calibrator = CutoffCalibrator(beta=config.get("calibration", {}).get("beta", 2.0))
 
     consistency_mode = config.get("post_processing", {}).get("consistency_mode", "independent")
-    reranker_cfg = config.get("reranker", {})
-    default_doc_top_k = reranker_cfg.get("document_top_k", 10)
-    default_chunk_top_k = reranker_cfg.get("chunk_top_k", 20)
+    calib_bounds = config.get("calibration", {}).get("bounds", {})
+    default_doc_top_k = int(calib_bounds.get("documents", {}).get("min", 10))
+    default_chunk_top_k = int(calib_bounds.get("chunks", {}).get("min", 20))
 
     predictions: list[FinalPrediction] = []
 
