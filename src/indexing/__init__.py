@@ -7,6 +7,7 @@ from src.indexing.chunker import (
     PrechunkedChunker,
     create_chunker,
 )
+from src.indexing.dense_index import DenseIndexer
 from src.indexing.tokenizers import get_tokenizer
 
 __all__ = [
@@ -17,5 +18,7 @@ __all__ = [
     "PrechunkedAdapter",
     "create_chunker",
     "BM25Indexer",
+    "DenseIndexer",
     "get_tokenizer",
 ]
+
