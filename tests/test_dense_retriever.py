@@ -350,3 +350,29 @@ def test_dense_invalid_encoder():
             output_dir="tmp",
         )
 
+
+def test_dense_vector_query_and_aggregation(tmp_path):
+    dummy_encoder = DummyEncoder(dim=16)
+    indexer = DenseIndexer(encoder=dummy_encoder, backend="numpy")
+    index_dir = tmp_path / "dense_vec_test"
+    chunks = [
+        ChunkRecord(chunk_id="c1", doc_id="d1", language="vi", text="tim mạch"),
+        ChunkRecord(chunk_id="c2", doc_id="d1", language="vi", text="suy tim"),
+        ChunkRecord(chunk_id="c3", doc_id="d2", language="vi", text="huyết áp"),
+    ]
+    indexer.build_index(chunks=chunks, output_dir=index_dir)
+
+    retriever = DenseRetriever(encoder=dummy_encoder, index_dir=index_dir)
+    vec = np.ones(16, dtype=np.float32)
+    chunk_hits = retriever.search_chunks(query=vec, language="vi", top_k=2)
+    assert len(chunk_hits) == 2
+    assert chunk_hits[0].rank == 1
+    assert chunk_hits[1].rank == 2
+
+    doc_hits = retriever.search_documents(
+        query=vec, language="vi", top_k=2, aggregation="max"
+    )
+    assert len(doc_hits) <= 2
+    assert doc_hits[0].rank == 1
+
+

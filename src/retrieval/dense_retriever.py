@@ -34,11 +34,21 @@ class DenseRetriever:
 
         self._manifest = self._load_manifest()
 
+        # Inherit normalize_embeddings from manifest if available
+        if normalize_embeddings is None:
+            self.normalize_embeddings = bool(self._manifest.get("normalize_embeddings", True))
+        else:
+            self.normalize_embeddings = bool(normalize_embeddings)
+
         # Determine backend: explicit argument -> manifest -> default "faiss" (or "numpy")
         if backend is not None:
             self.backend = backend.lower()
         elif "backend" in self._manifest:
-            self.backend = str(self._manifest["backend"]).lower()
+            manifest_backend = str(self._manifest["backend"]).lower()
+            if manifest_backend == "faiss" and not _FAISS_AVAILABLE:
+                self.backend = "numpy"
+            else:
+                self.backend = manifest_backend
         else:
             self.backend = "faiss" if _FAISS_AVAILABLE else "numpy"
 
@@ -175,12 +185,25 @@ class DenseRetriever:
 
     def search_chunks(
         self,
-        query: str,
+        query: str | np.ndarray,
         language: str,
         top_k: int = 10,
     ) -> list[SearchHit]:
         """Search chunk index for a given language partition."""
-        if not query or not query.strip() or top_k <= 0:
+        if top_k <= 0:
+            return []
+
+        if isinstance(query, str):
+            if not query or not query.strip():
+                return []
+            query_vec = self.encode_query(query)
+        elif isinstance(query, np.ndarray):
+            query_vec = query.astype(np.float32).ravel()
+            if self.normalize_embeddings:
+                norm = np.linalg.norm(query_vec)
+                if norm > 0:
+                    query_vec = query_vec / norm
+        else:
             return []
 
         partition = self._get_partition(language)
@@ -192,7 +215,6 @@ class DenseRetriever:
         if num_items == 0:
             return []
 
-        query_vec = self.encode_query(query)
         k = min(top_k, num_items)
 
         if self.backend == "faiss":
@@ -210,7 +232,7 @@ class DenseRetriever:
             indices = sorted_indices
 
         hits: list[SearchHit] = []
-        for rank_idx, (idx, score) in enumerate(zip(indices, scores), start=1):
+        for idx, score in zip(indices, scores):
             if idx < 0 or idx >= num_items:
                 continue
             item_meta = metadata[int(idx)]
@@ -222,13 +244,17 @@ class DenseRetriever:
                     language=language,
                     source="dense",
                     raw_score=float(score),
-                    rank=rank_idx,
+                    rank=len(hits) + 1,
                 )
             )
 
         return hits
 
-    def aggregate_documents(self, chunk_hits: list[SearchHit]) -> list[SearchHit]:
+    def aggregate_documents(
+        self,
+        chunk_hits: list[SearchHit],
+        aggregation: str = "max",
+    ) -> list[SearchHit]:
         """Aggregate chunk hits into document hits by maximum chunk score."""
         if not chunk_hits:
             return []
@@ -266,14 +292,20 @@ class DenseRetriever:
 
     def search_documents(
         self,
-        query: str,
+        query: str | np.ndarray,
         language: str,
         top_k: int = 10,
+        aggregation: str = "max",
     ) -> list[SearchHit]:
         """Search and return document hits by aggregating chunk hits."""
-        if not query or not query.strip() or top_k <= 0:
+        if top_k <= 0:
             return []
-        # Retrieve chunks with a multiplier to ensure sufficient unique documents
-        chunk_hits = self.search_chunks(query=query, language=language, top_k=top_k * 4)
-        doc_hits = self.aggregate_documents(chunk_hits)
+        if isinstance(query, str) and (not query or not query.strip()):
+            return []
+
+        # Retrieve chunks with dynamic multiplier to ensure sufficient unique documents
+        chunk_hits = self.search_chunks(
+            query=query, language=language, top_k=max(top_k * 5, 50)
+        )
+        doc_hits = self.aggregate_documents(chunk_hits, aggregation=aggregation)
         return doc_hits[:top_k]
