@@ -1,6 +1,7 @@
 """Evaluation package for Multilingual Medical Retrieval MVP."""
 
 from src.evaluation.calibrator import CalibrationState, CutoffCalibrator
+from src.evaluation.error_analysis import generate_error_analysis_report
 from src.evaluation.metrics import (
     calculate_f2,
     calculate_precision_recall_fbeta,
@@ -15,4 +16,5 @@ __all__ = [
     "evaluate_predictions",
     "CutoffCalibrator",
     "CalibrationState",
+    "generate_error_analysis_report",
 ]
