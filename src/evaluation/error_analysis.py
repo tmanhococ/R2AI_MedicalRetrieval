@@ -43,7 +43,7 @@ def generate_error_analysis_report(
     query_text_map: dict[str, str] = {}
     if queries is not None:
         for q in queries:
-            text = getattr(q, "text_vi", None) or getattr(q, "text", "")
+            text = str(getattr(q, "text_vi", None) or getattr(q, "text", "") or "")
             query_text_map[q.query_id] = text
 
     all_qids = sorted(set(gt_map.keys()) | set(pred_map.keys()))
