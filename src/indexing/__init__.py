@@ -1,11 +1,13 @@
+from src.indexing.bm25_index import BM25Indexer
 from src.indexing.chunker import (
-    Chunker,
     AutoChunker,
+    Chunker,
     HybridChunker,
-    PrechunkedChunker,
     PrechunkedAdapter,
+    PrechunkedChunker,
     create_chunker,
 )
+from src.indexing.tokenizers import get_tokenizer
 
 __all__ = [
     "Chunker",
@@ -14,4 +16,6 @@ __all__ = [
     "PrechunkedChunker",
     "PrechunkedAdapter",
     "create_chunker",
+    "BM25Indexer",
+    "get_tokenizer",
 ]
