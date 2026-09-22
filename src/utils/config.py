@@ -19,4 +19,5 @@ def load_config(config_path: Union[str, Path]) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        loaded = yaml.safe_load(f)
+        return loaded if isinstance(loaded, dict) else {}

@@ -47,13 +47,15 @@ def _en_whitespace_tokenizer(text: str) -> list[str]:
     return _EN_WORD_PATTERN.findall(text.lower())
 
 
+_PORTER_STEMMER = PorterStemmer() if _NLTK_AVAILABLE else None
+
+
 def _en_stem_tokenizer(text: str) -> list[str]:
     if not text:
         return []
     words = _EN_WORD_PATTERN.findall(text.lower())
-    if _NLTK_AVAILABLE:
-        stemmer = PorterStemmer()
-        return [stemmer.stem(w) for w in words]
+    if _PORTER_STEMMER is not None:
+        return [_PORTER_STEMMER.stem(w) for w in words]
     return words
 
 

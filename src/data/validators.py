@@ -14,6 +14,12 @@ def validate_corpus_integrity(
             raise ValueError("Duplicate doc_id found in document list.")
         return False
 
+    chunk_ids = {c.chunk_id for c in chunks}
+    if len(chunk_ids) != len(chunks):
+        if strict:
+            raise ValueError("Duplicate chunk_id found in chunk list.")
+        return False
+
     for d in documents:
         if d.language not in VALID_LANGUAGES:
             if strict:
