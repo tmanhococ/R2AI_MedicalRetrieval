@@ -1,3 +1,8 @@
+from src.data.dataset_adapter import (
+    DatasetAdapter,
+    InMemoryDatasetAdapter,
+    JsonlDatasetAdapter,
+)
 from src.data.schemas import (
     ChunkRecord,
     DocumentRecord,
@@ -20,4 +25,7 @@ __all__ = [
     "ScoredHit",
     "FinalPrediction",
     "validate_corpus_integrity",
+    "DatasetAdapter",
+    "JsonlDatasetAdapter",
+    "InMemoryDatasetAdapter",
 ]
