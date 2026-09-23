@@ -41,3 +41,8 @@ artifacts/
 .env
 .DS_Store
 Thumbs.db
+# Agent, Superpowers & Tooling
+.agent/
+.superpowers/
+docs/superpowers/
+uv.lock
