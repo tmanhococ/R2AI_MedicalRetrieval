@@ -270,10 +270,35 @@ class SnapshotManifest:
 @dataclass(frozen=True)
 class ValidationReport:
     """Offline validation verdict for submission file."""
-    is_valid: bool
+    valid: bool
     query_count: int
+    document_count: int = 0
+    chunk_count: int = 0
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    snapshot_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.errors, list):
+            object.__setattr__(self, "errors", tuple(self.errors))
+        if isinstance(self.warnings, list):
+            object.__setattr__(self, "warnings", tuple(self.warnings))
+
+    @property
+    def is_valid(self) -> bool:
+        return self.valid
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    """Summary of exported official submission files and checksums."""
+    json_path: Path
+    zip_path: Path
+    validation_report_path: Path
+    json_sha256: str
+    zip_sha256: str
+    validation_report: ValidationReport | None = None
+
 
 
 class PerQueryMetrics(tuple):
