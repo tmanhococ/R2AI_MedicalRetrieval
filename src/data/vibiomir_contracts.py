@@ -199,6 +199,25 @@ class ExtractionReport:
 
 
 @dataclass(frozen=True)
+class PackedPair:
+    """Token-budgeted pair inputs prepared for cross-encoder reranking."""
+    query_text: str
+    passage_text: str
+    input_ids: tuple[int, ...] | list[int]
+    attention_mask: tuple[int, ...] | list[int]
+    query_window_index: int
+
+
+@dataclass(frozen=True)
+class MigrationResult:
+    """Outcome of migrating legacy chunks without full provenance."""
+    migrated_chunks: tuple[SpanChunk, ...] = ()
+    quarantined_chunks: tuple[Any, ...] = ()
+    regenerated_chunks: tuple[SpanChunk, ...] = ()
+
+
+
+@dataclass(frozen=True)
 class SnapshotManifest:
     """Immutable manifest pinning all artifacts and hashes of a frozen snapshot."""
     snapshot_id: str

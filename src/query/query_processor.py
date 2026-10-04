@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import re
 import unicodedata
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.data.schemas import QueryRecord
+
+logger = logging.getLogger(__name__)
+
 
 CLINICAL_BOILERPLATE_PATTERNS: list[str] = [
     # Patient demographics boilerplate (e.g. "Bệnh nhân nam 54 tuổi", "BN nữ", "Bệnh nhân")
@@ -40,6 +44,8 @@ class ProcessedQuery:
     dense_text: str
     is_clinical_case: bool
     word_count: int
+    bm25_original_text: str = ""
+    dense_query_overflow: bool = False
 
     @property
     def condensed_vi(self) -> str | None:
@@ -167,6 +173,16 @@ class AdaptiveQueryRouter:
                 else:
                     dense_text = normalized
 
+        dense_overflow = word_count > self.max_dense_tokens
+        if dense_overflow:
+            logger.warning(
+                "dense_query_overflow: query %s tokens %d > %d (strategy=%s)",
+                qid,
+                word_count,
+                self.max_dense_tokens,
+                self.dense_strategy,
+            )
+
         return ProcessedQuery(
             query_id=qid,
             original_text=raw_text,
@@ -175,4 +191,7 @@ class AdaptiveQueryRouter:
             dense_text=dense_text,
             is_clinical_case=is_clinical_case,
             word_count=word_count,
+            bm25_original_text=normalized,
+            dense_query_overflow=dense_overflow,
         )
+

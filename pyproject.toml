@@ -31,3 +31,6 @@ include = ["src*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "integration: integration tests requiring models or external dependencies",
+]
