@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+from dataclasses import asdict
 import json
 import logging
 from pathlib import Path
@@ -15,10 +17,17 @@ from src.cli.common import (
     run_pipeline_for_queries,
 )
 from src.data.dataset_adapter import JsonlDatasetAdapter
-from src.data.schemas import FinalPrediction, ScoredHit
+from src.data.schemas import FinalPrediction, QueryRecord, ScoredHit
+from src.data.source_store import SnapshotSourceStore
+from src.data.vibiomir_adapter import ViBioMIRAdapter, load_official_queries
 from src.evaluation.calibrator import CutoffCalibrator
+from src.evaluation.dev_records import FORBIDDEN_SPLITS, load_dev_records
 from src.evaluation.error_analysis import generate_error_analysis_report
 from src.evaluation.metrics import evaluate_predictions
+from src.evaluation.vibiomir_metrics import (
+    PROVISIONAL_SPEC_V1_PROFILE,
+    evaluate_dataset,
+)
 from src.retrieval.orchestrator import RetrievalOrchestrator
 from src.scoring.consistency import apply_structural_consistency
 from src.scoring.joint_scoring import JointScorer
@@ -30,7 +39,9 @@ logger = logging.getLogger(__name__)
 def run_evaluate(
     config: dict[str, Any],
     split: str = "validation",
-    dataset_dir: Path | str = "",
+    dataset_dir: Path | str | None = None,
+    snapshot_dir: Path | str | None = None,
+    dev_records_path: Path | str | None = None,
     output_dir: Path | str | None = None,
     index_dir: Path | str | None = None,
     calibration_path: Path | str | None = None,
@@ -40,23 +51,15 @@ def run_evaluate(
 ) -> dict[str, Any]:
     """Execute end-to-end retrieval evaluation on a split with Macro F2 calculation and error analysis.
 
-    Args:
-        config: Configuration dictionary.
-        split: Dataset split to evaluate (default: "validation").
-        dataset_dir: Path to dataset directory.
-        output_dir: Path where metrics.json and error analysis artifacts will be saved.
-        index_dir: Path where BM25 and Dense indexes reside.
-        calibration_path: Optional path to calibration.json.
-        reranker: Optional pre-instantiated reranker override.
-        encoder: Optional pre-instantiated dense encoder override.
-        translator: Optional pre-instantiated translator override.
-
-    Returns:
-        Dictionary containing overall and per-query evaluation metrics.
+    ANTI-LEAKAGE PRINCIPLE:
+    Rejects evaluation on test splits without ground truth labels.
     """
-    dataset_path = Path(dataset_dir)
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+    clean_split = split.lower().strip()
+    if clean_split in FORBIDDEN_SPLITS:
+        raise ValueError(
+            f"Cannot run evaluation on '{split}' split without ground truth labels. "
+            f"Test set does not contain ground truth labels; use src.cli.predict to generate predictions."
+        )
 
     if output_dir is not None:
         out_dir = Path(output_dir)
@@ -64,17 +67,63 @@ def run_evaluate(
         out_dir = Path(config.get("run", {}).get("output_dir", "artifacts"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load queries and ground truth for split
-    adapter = JsonlDatasetAdapter(dataset_path)
-    queries = adapter.load_queries(split)
-    ground_truths = adapter.load_ground_truth(split)
+    queries: list[QueryRecord] = []
+    ground_truths: Any = None
+    dev_records: Any = None
+    doc_texts: dict[str, str] = {}
+    chunk_texts: dict[str, str] = {}
+    chunk_to_doc: dict[str, str] = {}
 
-    # Load corpus text lookups
-    documents, chunks, doc_texts, chunk_texts, chunk_to_doc = load_corpus_and_texts(
-        dataset_dir=dataset_path,
-        index_dir=index_dir,
-        config=config,
-    )
+    if snapshot_dir is not None:
+        snap_path = Path(snapshot_dir)
+        if not snap_path.exists():
+            raise FileNotFoundError(f"Snapshot directory not found: {snap_path}")
+
+        store = SnapshotSourceStore(snap_path)
+        adapter = ViBioMIRAdapter(snap_path)
+
+        # Official queries namespace check
+        query_path_str = config.get("dataset", {}).get("query_path", "data/official/query.parquet")
+        official_queries = load_official_queries(Path(query_path_str), expected_count=None)
+        official_query_ids = {q.query_id for q in official_queries}
+
+        # Dev records loading
+        dev_path_str = dev_records_path or config.get("dataset", {}).get("dev_records_path", "data/dev/dev_qrels.jsonl")
+        dev_file = Path(dev_path_str)
+        if not dev_file.exists() and dataset_dir:
+            cand = Path(dataset_dir) / "dev_qrels.jsonl"
+            if cand.exists():
+                dev_file = cand
+
+        dev_records = load_dev_records(dev_file, official_query_ids=official_query_ids, store=store)
+        queries = [
+            QueryRecord(
+                query_id=str(r.query_id),
+                text_vi=r.metadata.query_text if r.metadata else str(r.query_id),
+            )
+            for r in dev_records
+        ]
+
+        doc_texts = {str(d.doc_id): f"{d.title} {d.text}".strip() if d.title else d.text for d in adapter.iter_documents()}
+        chunk_texts = {c.chunk_id: c.text for c in adapter.iter_chunks()}
+        chunk_to_doc = {c.chunk_id: str(c.doc_id) for c in adapter.iter_chunks()}
+
+    else:
+        if dataset_dir is None:
+            raise ValueError("Either dataset_dir or snapshot_dir must be provided")
+        dataset_path = Path(dataset_dir)
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+
+        adapter_legacy = JsonlDatasetAdapter(dataset_path)
+        queries = adapter_legacy.load_queries(split)
+        ground_truths = adapter_legacy.load_ground_truth(split)
+
+        documents, chunks, doc_texts, chunk_texts, chunk_to_doc = load_corpus_and_texts(
+            dataset_dir=dataset_path,
+            index_dir=index_dir,
+            config=config,
+        )
 
     # 2. Setup pipeline components
     bm25_dir, dense_dir = resolve_index_dirs(config, index_dir)
@@ -135,7 +184,6 @@ def run_evaluate(
     predictions: list[FinalPrediction] = []
 
     for qid, (joint_docs, joint_chunks) in query_scores.items():
-        # 8. Apply cutoff threshold/top-k
         if calibrator is not None and calib_data is not None:
             doc_state = calib_data.get("documents", calib_data)
             chunk_state = calib_data.get("chunks", calib_data)
@@ -145,7 +193,6 @@ def run_evaluate(
             selected_docs = joint_docs[:default_doc_top_k]
             selected_chunks = joint_chunks[:default_chunk_top_k]
 
-        # 9. Apply structural consistency
         final_docs, final_chunks = apply_structural_consistency(
             selected_docs=selected_docs,
             selected_chunks=selected_chunks,
@@ -172,22 +219,76 @@ def run_evaluate(
             )
         )
 
-    # 10. Compute metrics via evaluate_predictions
-    beta = float(config.get("calibration", {}).get("beta", 2.0))
-    metrics = evaluate_predictions(
-        predictions=predictions,
-        ground_truth=ground_truths,
-        beta=beta,
-    )
+    # 10. Compute metrics
+    if snapshot_dir is not None and dev_records is not None:
+        sub_rows = []
+        for p in predictions:
+            row_chunks = []
+            for c_id in p.chunk_ids:
+                doc_id_val = int(chunk_to_doc.get(c_id, 0))
+                c_text = chunk_texts.get(c_id, "")
+                row_chunks.append({"doc_id": doc_id_val, "chunk_text": c_text})
+            sub_rows.append(
+                {
+                    "id": int(p.query_id),
+                    "relevant_docs": [int(d) for d in p.document_ids],
+                    "relevant_chunks": row_chunks,
+                }
+            )
 
-    # 11. Generate error analysis report
-    generate_error_analysis_report(
-        predictions=predictions,
-        ground_truths=ground_truths,
-        output_dir=out_dir,
-        queries=queries,
-        beta=beta,
-    )
+        summary = evaluate_dataset(
+            predictions=sub_rows,
+            gold=dev_records,
+            query_ids=[r.query_id for r in dev_records],
+            profile=PROVISIONAL_SPEC_V1_PROFILE,
+        )
+
+        metrics = {
+            "documents": {
+                "macro_precision": summary.macro_documents.precision,
+                "macro_recall": summary.macro_documents.recall,
+                "macro_f2": summary.macro_documents.f2,
+            },
+            "chunks": {
+                "macro_precision": summary.macro_chunks.precision,
+                "macro_recall": summary.macro_chunks.recall,
+                "macro_f2": summary.macro_chunks.f2,
+            },
+            "inferred_final_mean": summary.inferred_final_mean,
+            "query_count": summary.query_count,
+            "profile_fingerprint": summary.profile_fingerprint,
+        }
+
+        # Write per_query_metrics.csv
+        per_query_csv = out_dir / "per_query_metrics.csv"
+        with open(per_query_csv, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["query_id", "doc_p", "doc_r", "doc_f2", "chunk_p", "chunk_r", "chunk_f2"])
+            for qm in summary.per_query:
+                writer.writerow([
+                    qm.query_id,
+                    round(qm.documents.precision, 4),
+                    round(qm.documents.recall, 4),
+                    round(qm.documents.f2, 4),
+                    round(qm.chunks.precision, 4),
+                    round(qm.chunks.recall, 4),
+                    round(qm.chunks.f2, 4),
+                ])
+
+    else:
+        beta = float(config.get("calibration", {}).get("beta", 2.0))
+        metrics = evaluate_predictions(
+            predictions=predictions,
+            ground_truth=ground_truths,
+            beta=beta,
+        )
+        generate_error_analysis_report(
+            predictions=predictions,
+            ground_truths=ground_truths,
+            output_dir=out_dir,
+            queries=queries,
+            beta=beta,
+        )
 
     # 12. Save metrics.json
     metrics_file = out_dir / "metrics.json"
@@ -211,16 +312,26 @@ def main(args: list[str] | None = None) -> None:
         "-c",
         "--config",
         default="configs/r2ai_mvp.yaml",
-        help="Path to YAML configuration file (default: configs/r2ai_mvp.yaml)",
+        help="Path to YAML configuration file",
     )
     parser.add_argument(
         "-d",
         "--dataset",
-        required=True,
+        default=None,
         help="Path to dataset directory",
     )
     parser.add_argument(
         "-s",
+        "--snapshot",
+        default=None,
+        help="Path to frozen snapshot directory",
+    )
+    parser.add_argument(
+        "--dev-records-path",
+        default=None,
+        help="Path to dev_qrels.jsonl ground truth file",
+    )
+    parser.add_argument(
         "--split",
         default="validation",
         help="Dataset split to evaluate (default: validation)",
@@ -243,11 +354,16 @@ def main(args: list[str] | None = None) -> None:
     )
 
     parsed = parser.parse_args(args)
+    if not parsed.dataset and not parsed.snapshot:
+        parser.error("At least one of --dataset or --snapshot must be specified")
+
     cfg = load_config(parsed.config)
     res = run_evaluate(
         config=cfg,
         split=parsed.split,
         dataset_dir=parsed.dataset,
+        snapshot_dir=parsed.snapshot,
+        dev_records_path=parsed.dev_records_path,
         output_dir=parsed.output_dir,
         index_dir=parsed.index_dir,
         calibration_path=parsed.calibration_path,

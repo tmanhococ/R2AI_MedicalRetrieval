@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 from src.data.dataset_adapter import JsonlDatasetAdapter
+from src.data.schemas import ChunkRecord, DocumentRecord
 from src.data.validators import validate_corpus
 from src.data.vibiomir_adapter import ViBioMIRAdapter, validate_index_manifest
 from src.indexing.bm25_index import BM25Indexer

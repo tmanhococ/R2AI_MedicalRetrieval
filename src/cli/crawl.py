@@ -1,104 +1,194 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
+from dataclasses import asdict
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 import sys
 import time
+from typing import Any
 
-from src.data.vibiomir_contracts import CrawlConfig
+from src.data.vibiomir_contracts import CrawlConfig, CrawlReport
 from src.data.vibiomir_registry import SourceRegistry
 from src.ingestion.crawl_runner import run_crawl
+from src.utils.config import load_config
 
 
-def main() -> None:
+def run_crawl_cli(
+    registry_path: Path | str,
+    raw_root: Path | str,
+    limit: int | None = 100,
+    concurrency: int = 16,
+    per_domain_concurrency: int = 2,
+    min_domain_interval_seconds: float = 1.0,
+    respect_robots: bool = True,
+    max_redirects: int = 5,
+    max_html_bytes: int = 10485760,
+    max_pdf_bytes: int = 31457280,
+    output_coverage_file: Path | str | None = None,
+) -> CrawlReport:
+    """Run ViBioMIR resumable crawler and write coverage report."""
+    reg_path = Path(registry_path)
+    raw_path = Path(raw_root)
+
+    if not reg_path.exists():
+        raise FileNotFoundError(f"Registry DB not found: {reg_path}")
+
+    config = CrawlConfig(
+        concurrency=concurrency,
+        per_domain_concurrency=per_domain_concurrency,
+        min_domain_interval_seconds=min_domain_interval_seconds,
+        respect_robots=respect_robots,
+        max_redirects=max_redirects,
+        max_html_bytes=max_html_bytes,
+        max_pdf_bytes=max_pdf_bytes,
+        raw_root=raw_path,
+    )
+
+    with SourceRegistry(reg_path) as registry:
+        report = asyncio.run(run_crawl(registry, config, limit=limit))
+
+        # Write coverage.json
+        state_counts: dict[str, int] = {}
+        for row in registry.conn.execute("SELECT state, count(*) FROM fetch_jobs GROUP BY state"):
+            state_counts[row[0]] = row[1]
+
+        coverage_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "registry_sources": registry.count_sources(),
+            "unique_urls": registry.count_unique_urls(),
+            "state_counts": state_counts,
+            "crawl_run_report": asdict(report),
+        }
+
+        cov_file = Path(output_coverage_file) if output_coverage_file else raw_path / "coverage.json"
+        cov_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(cov_file, "w", encoding="utf-8") as f:
+            json.dump(coverage_data, f, indent=2, ensure_ascii=False)
+
+    return report
+
+
+def main(args: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Run ViBioMIR resumable web/PDF crawler"
     )
     parser.add_argument(
+        "-c",
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to YAML configuration file",
+    )
+    parser.add_argument(
         "--registry-path",
         type=Path,
-        default=Path("artifacts/vibiomir/registry.sqlite"),
+        default=None,
         help="Path to SQLite registry database",
     )
     parser.add_argument(
         "--raw-root",
         type=Path,
-        default=Path("artifacts/vibiomir/raw"),
+        default=None,
         help="Directory to store compressed raw payloads",
+    )
+    parser.add_argument(
+        "--pilot-size",
+        type=int,
+        default=None,
+        help="Pilot sample size (overrides limit)",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=100,
-        help="Maximum number of URLs to crawl in this run (default: 100 for pilot, set -1 for all)",
+        default=None,
+        help="Maximum number of URLs to crawl in this run",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume crawler from current registry state",
     )
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=16,
-        help="Global concurrent workers (default: 16)",
+        default=None,
+        help="Global concurrent workers",
     )
     parser.add_argument(
         "--per-domain-concurrency",
         type=int,
-        default=2,
-        help="Max concurrency per domain (default: 2)",
+        default=None,
+        help="Max concurrency per domain",
     )
     parser.add_argument(
         "--min-domain-interval",
         type=float,
-        default=1.0,
-        help="Minimum delay in seconds between requests to same domain (default: 1.0)",
+        default=None,
+        help="Minimum delay in seconds between requests to same domain",
     )
     parser.add_argument(
-        "--ignore-robots",
-        action="store_true",
-        help="Ignore robots.txt (not recommended)",
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for pilot sampling",
     )
 
-    args = parser.parse_args()
+    parsed = parser.parse_args(args)
 
-    limit = None if args.limit <= 0 else args.limit
+    cfg: dict[str, Any] = {}
+    config_file = parsed.config
+    if config_file is None and Path("configs/vibiomir_phase1.yaml").exists():
+        config_file = Path("configs/vibiomir_phase1.yaml")
+
+    if config_file is not None and Path(config_file).exists():
+        cfg = load_config(config_file)
+
+    cr_cfg = cfg.get("crawl", {})
+    ds_cfg = cfg.get("dataset", {})
+
+    reg_p = parsed.registry_path or Path(ds_cfg.get("registry_path", "artifacts/vibiomir/registry.sqlite"))
+    raw_p = parsed.raw_root or Path(cr_cfg.get("raw_root", "artifacts/vibiomir/raw"))
+
+    effective_limit = parsed.pilot_size if parsed.pilot_size is not None else parsed.limit
+    if effective_limit is None:
+        effective_limit = cr_cfg.get("limit", 100)
+    if effective_limit <= 0:
+        effective_limit = None
+
+    concurrency = parsed.concurrency or cr_cfg.get("concurrency", 16)
+    per_domain = parsed.per_domain_concurrency or cr_cfg.get("per_domain_concurrency", 2)
+    interval = parsed.min_domain_interval or cr_cfg.get("min_domain_interval_seconds", 1.0)
+    respect_robots = cr_cfg.get("respect_robots", True)
 
     print("=== ViBioMIR Crawler Runner ===")
-    print(f"Registry DB:     {args.registry_path}")
-    print(f"Raw storage:     {args.raw_root}")
-    print(f"Job limit:       {limit if limit is not None else 'ALL (unlimited)'}")
-    print(f"Concurrency:     {args.concurrency} (per-domain: {args.per_domain_concurrency})")
-    print(f"Min interval:    {args.min_domain_interval}s")
-    print(f"Respect robots:  {not args.ignore_robots}")
-
-    if not args.registry_path.exists():
-        print(f"Error: Registry DB not found: {args.registry_path}", file=sys.stderr)
-        print("Please run 'python -m src.cli.ingest_vibiomir' first.", file=sys.stderr)
-        sys.exit(1)
-
-    config = CrawlConfig(
-        concurrency=args.concurrency,
-        per_domain_concurrency=args.per_domain_concurrency,
-        min_domain_interval_seconds=args.min_domain_interval,
-        respect_robots=not args.ignore_robots,
-        raw_root=args.raw_root,
-    )
+    print(f"Registry DB:     {reg_p}")
+    print(f"Raw storage:     {raw_p}")
+    print(f"Job limit:       {effective_limit if effective_limit is not None else 'ALL (unlimited)'}")
+    print(f"Concurrency:     {concurrency} (per-domain: {per_domain})")
+    print(f"Min interval:    {interval}s")
+    print(f"Respect robots:  {respect_robots}")
 
     t0 = time.time()
-    with SourceRegistry(args.registry_path) as registry:
-        if not registry.is_complete():
-            print(
-                "Warning: Registry ingest is not marked complete. Running on available sources...",
-                file=sys.stderr,
-            )
-
-        print("\nStarting crawl loop...")
-        report = asyncio.run(run_crawl(registry, config, limit=limit))
-
+    report = run_crawl_cli(
+        registry_path=reg_p,
+        raw_root=raw_p,
+        limit=effective_limit,
+        concurrency=concurrency,
+        per_domain_concurrency=per_domain,
+        min_domain_interval_seconds=interval,
+        respect_robots=respect_robots,
+    )
     elapsed = time.time() - t0
+
     print("\n=== Crawl Execution Summary ===")
     print(f"Leased Jobs:      {report.leased}")
     print(f"Successfully Fetched: {report.fetched}")
     print(f"Retry Scheduled:  {report.retry_wait}")
     print(f"Failed:           {report.failed}")
     print(f"Blocked (Robots): {report.blocked}")
-    print(f"Unsupported:      {report.unsupported}")
     print(f"Bytes Written:    {report.bytes_written:,} bytes ({report.bytes_written / 1024 / 1024:.2f} MiB)")
     print(f"Elapsed Time:     {elapsed:.1f}s")
 
