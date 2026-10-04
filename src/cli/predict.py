@@ -472,7 +472,7 @@ def main(args: list[str] | None = None) -> None:
     parser.add_argument(
         "-c",
         "--config",
-        default="configs/r2ai_mvp.yaml",
+        default="configs/vibiomir_phase1.yaml" if Path("configs/vibiomir_phase1.yaml").exists() else "configs/r2ai_mvp.yaml",
         help="Path to YAML configuration file",
     )
     parser.add_argument(

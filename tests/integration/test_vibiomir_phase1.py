@@ -404,18 +404,173 @@ def test_resume_with_mismatched_run_fingerprint_rejected(tmp_path: Path):
         InferenceCheckpointManager(output_dir=output_dir, run_fingerprint="run_fingerprint_v2", resume=True)
 
 
+def test_checkpoint_non_resume_clears_stale_data(tmp_path: Path):
+    """When resume=False, existing checkpoints are cleared and completed queries are not skipped."""
+    output_dir = tmp_path / "non_resume_test"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    from src.utils.checkpoint import InferenceCheckpointManager
+
+    mgr1 = InferenceCheckpointManager(output_dir=output_dir, run_fingerprint="fp1")
+    mgr1.save_checkpoint(query_id=1, status="completed", prediction={"query_id": "1", "document_ids": [101], "chunk_ids": []})
+    assert mgr1.is_query_completed(1) is True
+
+    # New run with resume=False
+    mgr2 = InferenceCheckpointManager(output_dir=output_dir, run_fingerprint="fp1", resume=False)
+    assert mgr2.is_query_completed(1) is False
+    assert len(mgr2.completed_predictions) == 0
+    assert not mgr2.checkpoint_path.exists()
+
+
+def setup_mock_snapshot_and_indexes(base_dir: Path, dataset_dir: Path) -> tuple[Path, Path]:
+    """Helper to ingest, mock-crawl, snapshot, and index the test fixture data."""
+    raw_root = base_dir / "raw"
+    registry_path = base_dir / "registry.sqlite"
+    snapshots_dir = base_dir / "snapshots"
+    experiments_dir = base_dir / "experiments"
+
+    from src.cli.ingest_vibiomir import run_ingest
+    run_ingest(
+        corpus_path=dataset_dir / "links_corpus.parquet",
+        query_path=dataset_dir / "query.parquet",
+        registry_path=registry_path,
+        batch_size=10,
+        expected_query_count=3,
+    )
+
+    alias_html = (
+        "<!DOCTYPE html><html><head><title>Bệnh tiểu đường</title></head><body>"
+        "<h1>Kiểm soát đường huyết</h1>"
+        "<p>Bệnh đái tháo đường là bệnh lý mạn tính cần được theo dõi đường huyết thường xuyên.</p>"
+        "<p>Dấu hiệu cảnh báo hạ đường huyết cấp tính bao gồm vã mồ hôi, run tay và chóng mặt.</p>"
+        "</body></html>"
+    ).encode("utf-8")
+
+    valid2_html = (
+        "<!DOCTYPE html><html><head><title>Tim mạch và đái tháo đường</title></head><body>"
+        "<h1>Biến chứng tim mạch</h1>"
+        "<p>Biện pháp phòng ngừa biến chứng tim mạch ở người tiểu đường là duy trì huyết áp ổn định.</p>"
+        "</body></html>"
+    ).encode("utf-8")
+
+    async def mock_fetch_one(job, client, config):
+        if "fail" in job.url:
+            return FetchResult(
+                job_id=job.job_id,
+                state="fetch_failed",
+                raw_path=None,
+                raw_sha256=None,
+                final_url=job.url,
+                mime_type="text/html",
+                http_status=404,
+                fetched_at="2026-10-04T12:00:00Z",
+                error_code="http_404",
+            )
+        content = alias_html if "alias" in job.url else valid2_html
+        content_hash = hashlib.sha256(content).hexdigest()
+        raw_path = raw_root / f"{job.job_id}.html.gz"
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(raw_path, "wb") as gf:
+            gf.write(content)
+        return FetchResult(
+            job_id=job.job_id,
+            state="fetched",
+            raw_path=str(raw_path),
+            raw_sha256=content_hash,
+            final_url=job.url,
+            mime_type="text/html",
+            http_status=200,
+            fetched_at="2026-10-04T12:00:00Z",
+            error_code=None,
+            bytes_written=len(content),
+        )
+
+    with patch("src.ingestion.crawl_runner.fetch_one", side_effect=mock_fetch_one):
+        from src.cli.crawl import run_crawl_cli
+        run_crawl_cli(
+            registry_path=registry_path,
+            raw_root=raw_root,
+            limit=10,
+        )
+
+    from src.cli.build_snapshot import run_build_snapshot
+    run_build_snapshot(
+        registry_path=registry_path,
+        snapshot_root=snapshots_dir,
+        name="test_snapshot_01",
+        raw_root=raw_root,
+        queries_path=dataset_dir / "query.parquet",
+    )
+    snapshot_path = snapshots_dir / "test_snapshot_01"
+
+    from src.cli.index import run_index
+    index_cfg = {
+        "run": {"output_dir": str(experiments_dir)},
+        "retrieval": {
+            "bm25": {"enabled": True, "backend": "bm25s"},
+            "dense": {"enabled": True, "backend": "faiss", "batch_size": 16},
+        },
+    }
+    index_dir = experiments_dir / "indexes"
+    run_index(
+        config=index_cfg,
+        snapshot_dir=snapshot_path,
+        output_dir=index_dir,
+        encoder=FastMockDenseEncoder(),
+    )
+
+    return snapshot_path, index_dir
+
+
 # ==============================================================================
 # 4. Anti-leakage and Edge Cases Tests
 # ==============================================================================
 
-def test_test_set_without_labels_does_not_generate_fake_zero_metrics(tmp_path: Path):
-    """Test set without labels does NOT generate fake '0' metrics or metrics.json."""
-    output_dir = tmp_path / "no_labels_test"
-    output_dir.mkdir(parents=True, exist_ok=True)
+def test_test_set_without_labels_does_not_generate_fake_zero_metrics(tmp_path: Path, e2e_dataset_dir: Path):
+    """Test set without labels runs predictions but does NOT generate fake '0' metrics or metrics.json."""
+    from src.cli.predict import run_predict
+    from src.cli.evaluate import run_evaluate
 
-    # Verify run_predict does not write metrics.json
-    metrics_file = output_dir / "metrics.json"
-    assert not metrics_file.exists()
+    snapshot_path, index_dir = setup_mock_snapshot_and_indexes(tmp_path / "env", e2e_dataset_dir)
+    pred_out = tmp_path / "pred_out"
+
+    predict_cfg = {
+        "run": {"output_dir": str(pred_out), "experiment_name": "test_exp"},
+        "dataset": {"query_path": str(e2e_dataset_dir / "query.parquet")},
+        "retrieval": {
+            "candidate_top_k": 10,
+            "bm25": {"enabled": True, "backend": "bm25s"},
+            "dense": {"enabled": True, "backend": "faiss", "batch_size": 16},
+        },
+        "fusion": {"weights": {"vi_bm25": 1.0, "vi_dense": 1.0}},
+        "reranker": {"enabled": True, "model_name": "dummy"},
+        "calibration": {"bounds": {"documents": {"min": 1, "max": 5}, "chunks": {"min": 1, "max": 5}}},
+    }
+
+    # 1. run_predict on split="test"
+    run_predict(
+        config=predict_cfg,
+        split="test",
+        snapshot_dir=snapshot_path,
+        index_dir=index_dir,
+        output_dir=pred_out,
+        encoder=FastMockDenseEncoder(),
+        reranker=DummyReranker(),
+        export_submission=False,
+    )
+
+    # 2. Check output files: predictions and manifests generated, but NO metrics.json
+    assert (pred_out / "predictions.jsonl").exists()
+    assert (pred_out / "run_manifest.json").exists()
+    assert not (pred_out / "metrics.json").exists()
+
+    # 3. Anti-leakage: calling evaluate on split="test" without labels must be rejected
+    with pytest.raises(ValueError, match="(?i)without ground truth labels"):
+        run_evaluate(
+            config={"run": {"output_dir": str(pred_out)}},
+            split="test",
+            snapshot_dir=snapshot_path,
+        )
 
 
 def test_missing_language_stream_does_not_crash():
@@ -452,9 +607,20 @@ def test_evaluate_on_dev_split_with_snapshot_and_anti_leakage(tmp_path: Path, e2
     """Test evaluate.py on dev split with snapshot produces metrics and csv, while rejecting test split."""
     from src.cli.evaluate import run_evaluate
 
+    snapshot_path, index_dir = setup_mock_snapshot_and_indexes(tmp_path / "env", e2e_dataset_dir)
+    eval_out = tmp_path / "eval_out"
+
     eval_cfg = {
-        "run": {"output_dir": str(tmp_path / "eval_out")},
+        "run": {"output_dir": str(eval_out)},
         "dataset": {"query_path": str(e2e_dataset_dir / "query.parquet")},
+        "retrieval": {
+            "candidate_top_k": 10,
+            "bm25": {"enabled": True, "backend": "bm25s"},
+            "dense": {"enabled": True, "backend": "faiss", "batch_size": 16},
+        },
+        "fusion": {"weights": {"vi_bm25": 1.0, "vi_dense": 1.0}},
+        "reranker": {"enabled": True, "model_name": "dummy"},
+        "calibration": {"bounds": {"documents": {"min": 1, "max": 5}, "chunks": {"min": 1, "max": 5}}},
     }
 
     # 1. Anti-leakage: split="test" without labels must be rejected immediately
@@ -462,6 +628,62 @@ def test_evaluate_on_dev_split_with_snapshot_and_anti_leakage(tmp_path: Path, e2
         run_evaluate(
             config=eval_cfg,
             split="test",
-            snapshot_dir=tmp_path / "dummy_snapshot",
+            snapshot_dir=snapshot_path,
         )
+
+    # 2. Prepare valid dev_qrels.jsonl:
+    # Query ID 999 (non-colliding with official queries 1, 4, 9)
+    # References doc_id 101 which exists in snapshot with matching text
+    dev_qrels_path = tmp_path / "dev_qrels.jsonl"
+    dev_record = {
+        "query_id": 999,
+        "query": "Bệnh đái tháo đường là gì",
+        "split": "validation",
+        "origin": "manual_review",
+        "relevant_docs": [101],
+        "relevant_chunks": [
+            {
+                "doc_id": 101,
+                "chunk_text": "Bệnh đái tháo đường là bệnh lý mạn tính",
+            }
+        ],
+    }
+    dev_qrels_path.write_text(json.dumps(dev_record, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    # 3. Run evaluation on dev split
+    res = run_evaluate(
+        config=eval_cfg,
+        split="dev",
+        snapshot_dir=snapshot_path,
+        dev_records_path=dev_qrels_path,
+        output_dir=eval_out,
+        index_dir=index_dir,
+        encoder=FastMockDenseEncoder(),
+        reranker=DummyReranker(),
+    )
+
+    # 4. Verify metrics dictionary
+    assert "documents" in res
+    assert "chunks" in res
+    assert "macro_f2" in res["documents"]
+    assert "macro_f2" in res["chunks"]
+    assert res["query_count"] == 1
+
+    # 5. Verify written artifacts
+    metrics_json_path = eval_out / "metrics.json"
+    per_query_csv_path = eval_out / "per_query_metrics.csv"
+    assert metrics_json_path.exists()
+    assert per_query_csv_path.exists()
+
+    with open(metrics_json_path, "r", encoding="utf-8") as f:
+        saved_metrics = json.load(f)
+        assert saved_metrics["query_count"] == 1
+        assert "documents" in saved_metrics
+        assert "chunks" in saved_metrics
+
+    with open(per_query_csv_path, "r", encoding="utf-8") as f:
+        csv_lines = [line.strip() for line in f if line.strip()]
+        assert len(csv_lines) >= 2  # header + at least 1 query row
+        assert "query_id,doc_p,doc_r,doc_f2,chunk_p,chunk_r,chunk_f2" in csv_lines[0]
+        assert "999," in csv_lines[1]
 

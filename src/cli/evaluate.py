@@ -264,7 +264,7 @@ def run_evaluate(
         with open(per_query_csv, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(["query_id", "doc_p", "doc_r", "doc_f2", "chunk_p", "chunk_r", "chunk_f2"])
-            for qm in summary.per_query:
+            for qm in summary.per_query_metrics:
                 writer.writerow([
                     qm.query_id,
                     round(qm.documents.precision, 4),
@@ -311,7 +311,7 @@ def main(args: list[str] | None = None) -> None:
     parser.add_argument(
         "-c",
         "--config",
-        default="configs/r2ai_mvp.yaml",
+        default="configs/vibiomir_phase1.yaml" if Path("configs/vibiomir_phase1.yaml").exists() else "configs/r2ai_mvp.yaml",
         help="Path to YAML configuration file",
     )
     parser.add_argument(

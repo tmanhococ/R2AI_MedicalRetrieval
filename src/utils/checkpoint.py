@@ -25,7 +25,7 @@ def compute_run_fingerprint(
     # 1. Queries
     if query_manifest_or_ids is not None:
         if isinstance(query_manifest_or_ids, (list, tuple, set)):
-            q_repr = ",".join(str(qid) for qid in sorted(query_manifest_or_ids))
+            q_repr = ",".join(str(qid) for qid in sorted(query_manifest_or_ids, key=str))
             h.update(q_repr.encode("utf-8"))
         else:
             h.update(str(query_manifest_or_ids).encode("utf-8"))
@@ -90,7 +90,14 @@ class InferenceCheckpointManager:
         self.completed_predictions: dict[Any, FinalPrediction | dict[str, Any]] = {}
         self.failed_queries: dict[Any, str] = {}
 
-        if self.checkpoint_path.exists():
+        if not resume:
+            # Clean run: clear existing checkpoint file so stale runs are not loaded
+            if self.checkpoint_path.exists():
+                try:
+                    self.checkpoint_path.unlink()
+                except OSError:
+                    pass
+        elif self.checkpoint_path.exists():
             with open(self.checkpoint_path, "r", encoding="utf-8") as f:
                 for line_idx, line in enumerate(f, start=1):
                     line_str = line.strip()
@@ -104,11 +111,10 @@ class InferenceCheckpointManager:
 
                     fp = record.get("run_fingerprint")
                     if fp is not None and fp != self.run_fingerprint:
-                        if resume:
-                            raise ValueError(
-                                f"Run fingerprint mismatch in checkpoint: expected {self.run_fingerprint}, "
-                                f"found {fp}. Cannot resume."
-                            )
+                        raise ValueError(
+                            f"Run fingerprint mismatch in checkpoint: expected {self.run_fingerprint}, "
+                            f"found {fp}. Cannot resume."
+                        )
 
                     qid = _norm_qid(record["query_id"])
                     status = record.get("status")
@@ -161,6 +167,9 @@ class InferenceCheckpointManager:
         elif status == "failed":
             self.failed_queries[norm_id] = str(error)
             self.completed_predictions.pop(norm_id, None)
+
+    def is_query_completed(self, query_id: Any) -> bool:
+        return _norm_qid(query_id) in self.completed_predictions
 
     def get_completed_query_ids(self) -> set[Any]:
         return set(self.completed_predictions.keys())
