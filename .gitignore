@@ -36,6 +36,7 @@ coverage.xml
 # Artifacts & Local Experimentation
 artifacts/
 .cache/
+data/
 
 # Environments & OS
 .env
