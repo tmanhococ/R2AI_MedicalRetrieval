@@ -54,6 +54,8 @@ class FetchResult:
     http_status: int | None
     fetched_at: str
     error_code: str | None
+    retry_at: str | None = None
+    bytes_written: int = 0
 
 
 @dataclass(frozen=True)
@@ -161,11 +163,29 @@ class IngestReport:
 @dataclass(frozen=True)
 class CrawlReport:
     """Summary of crawler execution."""
-    total_jobs: int
-    succeeded: int
-    failed: int
-    retried: int
-    skipped: int
+    leased: int = 0
+    fetched: int = 0
+    retry_wait: int = 0
+    failed: int = 0
+    blocked: int = 0
+    unsupported: int = 0
+    bytes_written: int = 0
+
+    @property
+    def total_jobs(self) -> int:
+        return self.leased
+
+    @property
+    def succeeded(self) -> int:
+        return self.fetched
+
+    @property
+    def retried(self) -> int:
+        return self.retry_wait
+
+    @property
+    def skipped(self) -> int:
+        return self.blocked + self.unsupported
 
 
 @dataclass(frozen=True)

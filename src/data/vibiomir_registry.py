@@ -1,10 +1,12 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from pathlib import Path
 import sqlite3
-from typing import Iterable
+from typing import Any, Iterable
 
 from src.data.vibiomir_contracts import (
+    FetchJob,
+    FetchResult,
     IngestReport,
     OfficialSource,
 )
@@ -48,15 +50,23 @@ class SourceRegistry:
                     state TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
                     lease_until TEXT,
+                    retry_at TEXT,
                     raw_path TEXT,
                     raw_sha256 TEXT,
                     http_status INTEGER,
+                    mime_type TEXT,
+                    final_url TEXT,
                     error_code TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 """
             )
+            for col, col_type in [("retry_at", "TEXT"), ("mime_type", "TEXT"), ("final_url", "TEXT")]:
+                try:
+                    self.conn.execute(f"ALTER TABLE fetch_jobs ADD COLUMN {col} {col_type};")
+                except sqlite3.OperationalError:
+                    pass
             self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ingest_state (
@@ -190,6 +200,148 @@ class SourceRegistry:
 
     def count_unique_urls(self) -> int:
         return self.conn.execute("SELECT count(DISTINCT original_url) FROM sources").fetchone()[0]
+
+    def lease_jobs(
+        self,
+        limit: int,
+        lease_seconds: int = 120,
+        max_attempts: int = 3,
+        now: datetime | None = None,
+    ) -> list[FetchJob]:
+        """Leases up to limit jobs, reclaiming expired leases and elapsed retry_wait jobs."""
+        if limit <= 0:
+            return []
+
+        now_dt = now or datetime.now(timezone.utc)
+        now_iso = now_dt.isoformat()
+        lease_until_iso = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+
+        with self.conn:
+            # 1. Reclaim expired leases that have exceeded max_attempts
+            self.conn.execute(
+                """
+                UPDATE fetch_jobs
+                SET state = 'fetch_failed',
+                    lease_until = NULL,
+                    error_code = 'lease_timeout_exhausted',
+                    updated_at = ?
+                WHERE state = 'fetching'
+                  AND lease_until IS NOT NULL
+                  AND lease_until <= ?
+                  AND attempts >= ?
+                """,
+                (now_iso, now_iso, max_attempts),
+            )
+            # Reclaim remaining expired leases back to pending
+            self.conn.execute(
+                """
+                UPDATE fetch_jobs
+                SET state = 'pending',
+                    lease_until = NULL,
+                    updated_at = ?
+                WHERE state = 'fetching'
+                  AND lease_until IS NOT NULL
+                  AND lease_until <= ?
+                """,
+                (now_iso, now_iso),
+            )
+
+            # 2. Transition retry_wait jobs whose backoff expired back to pending
+            self.conn.execute(
+                """
+                UPDATE fetch_jobs
+                SET state = 'pending',
+                    retry_at = NULL,
+                    updated_at = ?
+                WHERE state = 'retry_wait'
+                  AND (retry_at IS NULL OR retry_at <= ?)
+                """,
+                (now_iso, now_iso),
+            )
+
+            # 3. Select pending jobs ordered by attempts ASC, rowid ASC
+            rows = self.conn.execute(
+                """
+                SELECT job_id, url, attempts
+                FROM fetch_jobs
+                WHERE state = 'pending'
+                ORDER BY attempts ASC, rowid ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            if not rows:
+                return []
+
+            leased_jobs: list[FetchJob] = []
+            for job_id, url, attempts in rows:
+                next_attempt = attempts + 1
+                self.conn.execute(
+                    """
+                    UPDATE fetch_jobs
+                    SET state = 'fetching',
+                        attempts = ?,
+                        lease_until = ?,
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (next_attempt, lease_until_iso, now_iso, job_id),
+                )
+                leased_jobs.append(FetchJob(job_id=job_id, url=url, attempt=next_attempt))
+
+            return leased_jobs
+
+    def finish_fetch(self, result: FetchResult, now: datetime | None = None) -> None:
+        """Atomically updates fetch_job state, hashes, metadata, and error codes."""
+        now_iso = (now or datetime.now(timezone.utc)).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE fetch_jobs
+                SET state = ?,
+                    raw_path = ?,
+                    raw_sha256 = ?,
+                    final_url = ?,
+                    mime_type = ?,
+                    http_status = ?,
+                    error_code = ?,
+                    retry_at = ?,
+                    lease_until = NULL,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    result.state,
+                    result.raw_path,
+                    result.raw_sha256,
+                    result.final_url,
+                    result.mime_type,
+                    result.http_status,
+                    result.error_code,
+                    result.retry_at,
+                    now_iso,
+                    result.job_id,
+                ),
+            )
+
+    def get_fetch_job(self, job_id: str) -> dict[str, Any] | None:
+        """Returns fetch_job details as dictionary or None."""
+        cursor = self.conn.execute(
+            """
+            SELECT job_id, url, state, attempts, lease_until, retry_at,
+                   raw_path, raw_sha256, http_status, mime_type, final_url,
+                   error_code, created_at, updated_at
+            FROM fetch_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cols = [col[0] for col in cursor.description]
+        return dict(zip(cols, row))
 
     def close(self) -> None:
         self.conn.close()
