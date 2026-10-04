@@ -68,6 +68,33 @@ class DenseRetriever:
         else:
             self.instruction_prefix = self._manifest.get("instruction_prefix", {})
 
+        # Pre-search checks: ensure model, prefix, and normalization match index manifest
+        if self._manifest:
+            manifest_norm = self._manifest.get("normalize_embeddings")
+            if normalize_embeddings is not None and manifest_norm is not None:
+                if bool(normalize_embeddings) != bool(manifest_norm):
+                    raise ValueError(
+                        f"Normalization mismatch: retriever has normalize_embeddings={normalize_embeddings}, "
+                        f"but index manifest has {manifest_norm}"
+                    )
+
+            manifest_prefix = self._manifest.get("instruction_prefix", {})
+            if instruction_prefix is not None and manifest_prefix:
+                for k in ("passage", "query"):
+                    if k in instruction_prefix and k in manifest_prefix:
+                        if instruction_prefix[k] != manifest_prefix[k]:
+                            raise ValueError(
+                                f"Instruction prefix mismatch for '{k}': retriever has '{instruction_prefix[k]}', "
+                                f"but index manifest has '{manifest_prefix[k]}'"
+                            )
+
+            manifest_model = self._manifest.get("model_name")
+            if manifest_model and isinstance(encoder, str) and encoder != manifest_model:
+                raise ValueError(
+                    f"Model mismatch: retriever configured with '{encoder}', "
+                    f"but index manifest has '{manifest_model}'"
+                )
+
         # Cache for loaded partitions
         self._loaded_partitions: dict[str, dict[str, Any]] = {}
 

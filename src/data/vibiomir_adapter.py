@@ -1,7 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -297,8 +297,13 @@ class ViBioMIRAdapter:
         return results
 
 
-def validate_index_manifest(index_path: Path | str, snapshot: SnapshotManifest) -> None:
-    """Validates that an index manifest aligns with the given snapshot manifest."""
+def validate_index_manifest(
+    index_path: Path | str,
+    snapshot: SnapshotManifest,
+    expected_mapping_hash: str | None = None,
+    expected_config: dict[str, Any] | None = None,
+) -> None:
+    """Validates that an index manifest strictly aligns with the given snapshot manifest and search config."""
     path = Path(index_path)
     if path.is_file():
         manifest_files = [path]
@@ -313,6 +318,7 @@ def validate_index_manifest(index_path: Path | str, snapshot: SnapshotManifest) 
         with open(mf, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        # 1. snapshot_id is strictly required
         if "snapshot_id" not in data:
             raise ValueError(f"Index manifest {mf.name} missing required field 'snapshot_id'")
 
@@ -321,12 +327,75 @@ def validate_index_manifest(index_path: Path | str, snapshot: SnapshotManifest) 
                 f"Snapshot ID mismatch in {mf}: index has '{data['snapshot_id']}', expected '{snapshot.snapshot_id}'"
             )
 
-        if "source_membership_sha256" in data and data["source_membership_sha256"] != snapshot.source_membership_sha256:
+        # 2. source_membership_sha256 is strictly required
+        if "source_membership_sha256" not in data:
+            raise ValueError(f"Index manifest {mf.name} missing required field 'source_membership_sha256'")
+
+        if data["source_membership_sha256"] != snapshot.source_membership_sha256:
             raise ValueError(
                 f"Source membership SHA-256 mismatch in {mf}: index has '{data['source_membership_sha256']}', expected '{snapshot.source_membership_sha256}'"
             )
 
-        if "chunker_fingerprint" in data and data["chunker_fingerprint"] != snapshot.chunker_fingerprint:
+        # 3. chunker_fingerprint is strictly required
+        if "chunker_fingerprint" not in data:
+            raise ValueError(f"Index manifest {mf.name} missing required field 'chunker_fingerprint'")
+
+        if data["chunker_fingerprint"] != snapshot.chunker_fingerprint:
             raise ValueError(
                 f"Chunker fingerprint mismatch in {mf}: index has '{data['chunker_fingerprint']}', expected '{snapshot.chunker_fingerprint}'"
             )
+
+        # 4. vector_chunk_mapping_hash verification
+        if expected_mapping_hash is not None:
+            if "vector_chunk_mapping_hash" not in data:
+                raise ValueError(f"Index manifest {mf.name} missing required field 'vector_chunk_mapping_hash'")
+            if data["vector_chunk_mapping_hash"] != expected_mapping_hash:
+                raise ValueError(
+                    f"Vector-chunk mapping hash mismatch in {mf}: index has '{data['vector_chunk_mapping_hash']}', expected '{expected_mapping_hash}'"
+                )
+
+        # 5. Pre-search config checks if expected_config is provided
+        if expected_config is not None:
+            validate_search_compatibility(data, **expected_config)
+
+
+def validate_search_compatibility(
+    manifest_or_path: dict[str, Any] | Path | str,
+    expected_model_name: str | None = None,
+    expected_prefix: dict[str, str] | None = None,
+    expected_normalize: bool | None = None,
+    **kwargs: Any,
+) -> None:
+    """Pre-search check: fail before search if model_name, prefix, or normalization settings mismatch."""
+    if isinstance(manifest_or_path, (str, Path)):
+        p = Path(manifest_or_path)
+        if p.is_dir():
+            p = p / "manifest.json"
+        if not p.exists():
+            return
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = manifest_or_path
+
+    if expected_model_name is not None and "model_name" in data and data["model_name"] is not None:
+        if data["model_name"] != expected_model_name:
+            raise ValueError(
+                f"Model mismatch: index has '{data['model_name']}', expected '{expected_model_name}'"
+            )
+
+    if expected_prefix is not None and "instruction_prefix" in data:
+        manifest_prefix = data["instruction_prefix"]
+        for key in ("passage", "query"):
+            if key in expected_prefix and key in manifest_prefix:
+                if expected_prefix[key] != manifest_prefix[key]:
+                    raise ValueError(
+                        f"Instruction prefix mismatch for '{key}': index has '{manifest_prefix[key]}', expected '{expected_prefix[key]}'"
+                    )
+
+    if expected_normalize is not None and "normalize_embeddings" in data:
+        if bool(data["normalize_embeddings"]) != bool(expected_normalize):
+            raise ValueError(
+                f"Normalization mismatch: index has '{data['normalize_embeddings']}', expected '{expected_normalize}'"
+            )
+

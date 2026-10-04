@@ -272,124 +272,130 @@ def build_snapshot(
             ORDER BY s.doc_id ASC
             """
         )
-        rows = cursor.fetchall()
-
-        official_doc_tuples = [(r[0],) for r in rows]
-        with lookup_conn:
-            lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_tuples)
-
         doc_loc_batch: list[tuple[int, str, int]] = []
         chunk_loc_batch: list[tuple[str, int, str, int]] = []
+        official_doc_batch: list[tuple[int]] = []
 
-        for doc_id, original_url, job_id, state, raw_path_str, raw_sha256, mime_type, http_status in rows:
-            all_registered_doc_ids.append(doc_id)
+        while True:
+            rows = cursor.fetchmany(1000)
+            if not rows:
+                break
 
-            if state != "fetched" or not raw_path_str or not raw_sha256:
-                continue
+            for doc_id, original_url, job_id, state, raw_path_str, raw_sha256, mime_type, http_status in rows:
+                all_registered_doc_ids.append(doc_id)
+                official_doc_batch.append((doc_id,))
 
-            raw_path = Path(raw_path_str)
-            if not raw_path.exists() and raw_root is not None:
-                candidate = raw_root / raw_path_str
-                if candidate.exists():
-                    raw_path = candidate
+                if state != "fetched" or not raw_path_str or not raw_sha256:
+                    continue
 
-            if not raw_path.exists():
-                logger.warning(f"Raw file {raw_path_str} not found for doc {doc_id}")
-                continue
+                raw_path = Path(raw_path_str)
+                if not raw_path.exists() and raw_root is not None:
+                    candidate = raw_root / raw_path_str
+                    if candidate.exists():
+                        raw_path = candidate
 
-            # Read raw content
-            if str(raw_path).endswith(".gz"):
-                with gzip.open(raw_path, "rb") as gf:
-                    raw_bytes = gf.read()
-            else:
-                raw_bytes = raw_path.read_bytes()
+                if not raw_path.exists():
+                    logger.warning(f"Raw file {raw_path_str} not found for doc {doc_id}")
+                    continue
 
-            # Hash verification
-            computed_raw_sha = hashlib.sha256(raw_bytes).hexdigest()
-            if computed_raw_sha != raw_sha256:
-                raise ValueError(
-                    f"Raw SHA256 mismatch for doc {doc_id}: expected {raw_sha256}, got {computed_raw_sha}"
+                # Read raw content
+                if str(raw_path).endswith(".gz"):
+                    with gzip.open(raw_path, "rb") as gf:
+                        raw_bytes = gf.read()
+                else:
+                    raw_bytes = raw_path.read_bytes()
+
+                # Hash verification
+                computed_raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+                if computed_raw_sha != raw_sha256:
+                    raise ValueError(
+                        f"Raw SHA256 mismatch for doc {doc_id}: expected {raw_sha256}, got {computed_raw_sha}"
+                    )
+
+                # Extract document
+                extracted_doc = extract_document(
+                    doc_id=doc_id,
+                    raw=raw_bytes,
+                    mime_type=mime_type or "text/html",
+                    raw_sha256=raw_sha256,
+                    config=ext_cfg,
                 )
 
-            # Extract document
-            extracted_doc = extract_document(
-                doc_id=doc_id,
-                raw=raw_bytes,
-                mime_type=mime_type or "text/html",
-                raw_sha256=raw_sha256,
-                config=ext_cfg,
-            )
+                # Classify quality
+                quality = classify_quality(extracted_doc, language_detector, ext_cfg)
 
-            # Classify quality
-            quality = classify_quality(extracted_doc, language_detector, ext_cfg)
+                if quality.state == "ready":
+                    # Finalize extracted document with verified language
+                    ready_doc = ExtractedDocument(
+                        doc_id=extracted_doc.doc_id,
+                        source_version=extracted_doc.source_version,
+                        source_text=extracted_doc.source_text,
+                        source_sha256=extracted_doc.source_sha256,
+                        raw_sha256=extracted_doc.raw_sha256,
+                        title=extracted_doc.title,
+                        language=quality.language,
+                        blocks=extracted_doc.blocks,
+                        quality_flags=quality.flags,
+                    )
 
-            if quality.state == "ready":
-                # Finalize extracted document with verified language
-                ready_doc = ExtractedDocument(
-                    doc_id=extracted_doc.doc_id,
-                    source_version=extracted_doc.source_version,
-                    source_text=extracted_doc.source_text,
-                    source_sha256=extracted_doc.source_sha256,
-                    raw_sha256=extracted_doc.raw_sha256,
-                    title=extracted_doc.title,
-                    language=quality.language,
-                    blocks=extracted_doc.blocks,
-                    quality_flags=quality.flags,
-                )
-
-                # Write ready document to parquet shard
-                blocks_data = [
-                    {
-                        "block_index": b.block_index,
-                        "kind": b.kind,
-                        "start_char": b.start_char,
-                        "end_char": b.end_char,
-                        "section": b.section,
+                    # Write ready document to parquet shard
+                    blocks_data = [
+                        {
+                            "block_index": b.block_index,
+                            "kind": b.kind,
+                            "start_char": b.start_char,
+                            "end_char": b.end_char,
+                            "section": b.section,
+                        }
+                        for b in ready_doc.blocks
+                    ]
+                    doc_row = {
+                        "doc_id": ready_doc.doc_id,
+                        "source_version": ready_doc.source_version,
+                        "source_text": ready_doc.source_text,
+                        "source_sha256": ready_doc.source_sha256,
+                        "raw_sha256": ready_doc.raw_sha256,
+                        "title": ready_doc.title,
+                        "language": ready_doc.language,
+                        "blocks_json": json.dumps(blocks_data, ensure_ascii=False),
+                        "quality_flags_json": json.dumps(list(ready_doc.quality_flags), ensure_ascii=False),
                     }
-                    for b in ready_doc.blocks
-                ]
-                doc_row = {
-                    "doc_id": ready_doc.doc_id,
-                    "source_version": ready_doc.source_version,
-                    "source_text": ready_doc.source_text,
-                    "source_sha256": ready_doc.source_sha256,
-                    "raw_sha256": ready_doc.raw_sha256,
-                    "title": ready_doc.title,
-                    "language": ready_doc.language,
-                    "blocks_json": json.dumps(blocks_data, ensure_ascii=False),
-                    "quality_flags_json": json.dumps(list(ready_doc.quality_flags), ensure_ascii=False),
-                }
-                doc_shard_name, doc_row_idx = doc_writer.add_row(doc_row)
-                doc_loc_batch.append((ready_doc.doc_id, doc_shard_name, doc_row_idx))
-                ready_doc_ids.append(ready_doc.doc_id)
-                language_counts[ready_doc.language] += 1
+                    doc_shard_name, doc_row_idx = doc_writer.add_row(doc_row)
+                    doc_loc_batch.append((ready_doc.doc_id, doc_shard_name, doc_row_idx))
+                    ready_doc_ids.append(ready_doc.doc_id)
+                    language_counts[ready_doc.language] += 1
 
-                # Generate SpanChunks
-                spans = list(chunk_source_document(ready_doc, dense_tokenizer, reranker_tokenizer, chk_cfg))
-                for sp in spans:
-                    chunk_row = {
-                        "chunk_id": sp.chunk_id,
-                        "doc_id": sp.doc_id,
-                        "source_version": sp.source_version,
-                        "source_sha256": sp.source_sha256,
-                        "start_char": sp.start_char,
-                        "end_char": sp.end_char,
-                        "chunk_index": sp.chunk_index,
-                        "language": sp.language,
-                        "section": sp.section,
-                        "text": sp.text,
-                        "index_text": sp.index_text,
-                        "dense_token_count": sp.dense_token_count,
-                        "reranker_token_count": sp.reranker_token_count,
-                    }
-                    chunk_shard_name, chunk_row_idx = chunk_writer.add_row(chunk_row)
-                    chunk_loc_batch.append((sp.chunk_id, sp.doc_id, chunk_shard_name, chunk_row_idx))
-                    chunk_count += 1
-            else:
-                for flg in quality.flags:
-                    quarantine_counts[flg] += 1
+                    # Generate SpanChunks
+                    spans = list(chunk_source_document(ready_doc, dense_tokenizer, reranker_tokenizer, chk_cfg))
+                    for sp in spans:
+                        chunk_row = {
+                            "chunk_id": sp.chunk_id,
+                            "doc_id": sp.doc_id,
+                            "source_version": sp.source_version,
+                            "source_sha256": sp.source_sha256,
+                            "start_char": sp.start_char,
+                            "end_char": sp.end_char,
+                            "chunk_index": sp.chunk_index,
+                            "language": sp.language,
+                            "section": sp.section,
+                            "text": sp.text,
+                            "index_text": sp.index_text,
+                            "dense_token_count": sp.dense_token_count,
+                            "reranker_token_count": sp.reranker_token_count,
+                        }
+                        chunk_shard_name, chunk_row_idx = chunk_writer.add_row(chunk_row)
+                        chunk_loc_batch.append((sp.chunk_id, sp.doc_id, chunk_shard_name, chunk_row_idx))
+                        chunk_count += 1
+                else:
+                    for flg in quality.flags:
+                        quarantine_counts[flg] += 1
 
             # Commit batches to lookup db periodically
+            if len(official_doc_batch) >= 1000:
+                with lookup_conn:
+                    lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_batch)
+                official_doc_batch.clear()
+
             if len(doc_loc_batch) >= 500:
                 with lookup_conn:
                     lookup_conn.executemany(
@@ -404,6 +410,11 @@ def build_snapshot(
                 chunk_loc_batch.clear()
 
         # Final commit to lookup db
+        if official_doc_batch:
+            with lookup_conn:
+                lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_batch)
+            official_doc_batch.clear()
+
         if doc_loc_batch or chunk_loc_batch:
             with lookup_conn:
                 lookup_conn.executemany(

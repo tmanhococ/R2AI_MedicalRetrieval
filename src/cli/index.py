@@ -58,6 +58,9 @@ def run_index(
     source_membership_sha256 = None
     chunker_fingerprint = None
 
+    documents: list[DocumentRecord] = []
+    chunks: list[ChunkRecord] = []
+
     if effective_snapshot is not None:
         snap_path = Path(effective_snapshot)
         if not snap_path.exists():
@@ -67,9 +70,6 @@ def run_index(
         snapshot_id = adapter.manifest.snapshot_id
         source_membership_sha256 = adapter.manifest.source_membership_sha256
         chunker_fingerprint = adapter.manifest.chunker_fingerprint
-
-        documents = adapter.load_documents()
-        chunks = adapter.load_chunks()
     else:
         if dataset_dir is None:
             raise ValueError("Either dataset_dir or snapshot_dir must be provided")
@@ -81,37 +81,37 @@ def run_index(
         documents = adapter.load_documents()
         chunks = adapter.load_chunks()
 
-    # 2. Initial validation
-    strict_val = config.get("indexing", {}).get("validation", {}).get("strict_foreign_keys", True)
-    validate_corpus(documents, chunks, strict=strict_val)
-
-    # 3. Chunking if chunks missing or mode != "prechunked"
-    chunk_cfg = config.get("indexing", {}).get("chunking", {})
-    mode = chunk_cfg.get("mode", "hybrid")
-    if not chunks or (mode != "prechunked" and effective_snapshot is None):
-        chunker = create_chunker(chunk_cfg)
-        chunks = chunker.chunk_documents(documents, existing_chunks=chunks)
-        # Re-validate with new chunks
+        # 2. Initial validation
+        strict_val = config.get("indexing", {}).get("validation", {}).get("strict_foreign_keys", True)
         validate_corpus(documents, chunks, strict=strict_val)
 
-    # Persist generated chunks to output_dir for downstream stages if not already in dataset
-    chunks_out = out_path / "chunks.jsonl"
-    with open(chunks_out, "w", encoding="utf-8") as f:
-        for c in chunks:
-            f.write(
-                json.dumps(
-                    {
-                        "chunk_id": c.chunk_id,
-                        "doc_id": c.doc_id,
-                        "language": c.language,
-                        "text": c.text,
-                        "chunk_index": c.chunk_index,
-                        "metadata": c.metadata,
-                    },
-                    ensure_ascii=False,
+        # 3. Chunking if chunks missing or mode != "prechunked"
+        chunk_cfg = config.get("indexing", {}).get("chunking", {})
+        mode = chunk_cfg.get("mode", "hybrid")
+        if not chunks or mode != "prechunked":
+            chunker = create_chunker(chunk_cfg)
+            chunks = chunker.chunk_documents(documents, existing_chunks=chunks)
+            # Re-validate with new chunks
+            validate_corpus(documents, chunks, strict=strict_val)
+
+        # Persist generated chunks to output_dir for downstream stages if not already in dataset
+        chunks_out = out_path / "chunks.jsonl"
+        with open(chunks_out, "w", encoding="utf-8") as f:
+            for c in chunks:
+                f.write(
+                    json.dumps(
+                        {
+                            "chunk_id": c.chunk_id,
+                            "doc_id": c.doc_id,
+                            "language": c.language,
+                            "text": c.text,
+                            "chunk_index": c.chunk_index,
+                            "metadata": c.metadata,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
 
     retrieval_cfg = config.get("retrieval", {})
     bm25_cfg = retrieval_cfg.get("bm25", {})
@@ -129,9 +129,11 @@ def run_index(
             backend=bm25_cfg.get("backend", "bm25s"),
             tokenizers_config=bm25_cfg.get("tokenizers"),
         )
+        docs_source = adapter.iter_documents() if effective_snapshot is not None else documents
+        chunks_source = adapter.iter_chunks() if effective_snapshot is not None else chunks
         bm25_manifest = bm25_indexer.build_indexes(
-            documents=documents,
-            chunks=chunks,
+            documents=docs_source,
+            chunks=chunks_source,
             output_dir=bm25_output_dir,
             snapshot_id=snapshot_id,
             source_membership_sha256=source_membership_sha256,
@@ -149,8 +151,9 @@ def run_index(
             normalize_embeddings=dense_cfg.get("normalize_embeddings", True),
             batch_size=dense_cfg.get("batch_size", 64),
         )
+        chunks_dense_source = adapter.iter_chunks() if effective_snapshot is not None else chunks
         dense_manifest = dense_indexer.build_index(
-            chunks=chunks,
+            chunks=chunks_dense_source,
             output_dir=dense_output_dir,
             snapshot_id=snapshot_id,
             source_membership_sha256=source_membership_sha256,
@@ -162,14 +165,21 @@ def run_index(
         if bm25_cfg.get("enabled", True):
             validate_index_manifest(bm25_output_dir, snapshot_manifest)
         if dense_cfg.get("enabled", True):
-            validate_index_manifest(dense_output_dir, snapshot_manifest)
+            validate_index_manifest(
+                dense_output_dir,
+                snapshot_manifest,
+                expected_mapping_hash=dense_manifest.get("vector_chunk_mapping_hash"),
+            )
+
+    num_docs = snapshot_manifest.ready_document_count if snapshot_manifest is not None else len(documents)
+    num_chunks = snapshot_manifest.chunk_count if snapshot_manifest is not None else len(chunks)
 
     return {
         "output_dir": str(out_path),
         "bm25_index_dir": str(bm25_output_dir),
         "dense_index_dir": str(dense_output_dir),
-        "num_documents": len(documents),
-        "num_chunks": len(chunks),
+        "num_documents": num_docs,
+        "num_chunks": num_chunks,
         "bm25_manifest": bm25_manifest,
         "dense_manifest": dense_manifest,
     }

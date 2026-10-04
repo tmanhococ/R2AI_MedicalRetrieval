@@ -184,8 +184,10 @@ class DenseIndexer:
         seen_langs = set(embeddings_by_lang.keys()) | set(metadata_by_lang.keys())
         languages = sorted(set(self.DEFAULT_LANGUAGES) | seen_langs)
 
+        model_name = self._raw_encoder if isinstance(self._raw_encoder, str) else getattr(self._raw_encoder, "model_name", None)
         manifest: dict[str, Any] = {
             "backend": self.backend,
+            "model_name": model_name,
             "instruction_prefix": self.instruction_prefix,
             "normalize_embeddings": self.normalize_embeddings,
             "device": self.device,

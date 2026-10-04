@@ -7,13 +7,20 @@ import pytest
 from src.data.dataset_adapter import DatasetAdapter
 from src.data.schemas import ChunkRecord, DocumentRecord, QueryRecord
 from src.data.source_store import SnapshotSourceStore
-from src.data.vibiomir_adapter import ViBioMIRAdapter, validate_index_manifest
+from src.data.validators import validate_corpus
+from src.data.vibiomir_adapter import (
+    ViBioMIRAdapter,
+    validate_index_manifest,
+    validate_search_compatibility,
+)
 from src.data.vibiomir_contracts import (
     ChunkConfig,
+    EvaluationRecord,
     ExtractionConfig,
     ExtractedDocument,
     OfficialQuery,
     OfficialSource,
+    ReferenceChunk,
     SnapshotConfig,
     SnapshotManifest,
     SourceStore,
@@ -505,7 +512,200 @@ def test_validate_index_manifest(tmp_path: Path):
     missing_id_dir = tmp_path / "missing_id_index"
     missing_id_dir.mkdir()
     with open(missing_id_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump({"backend": "faiss"}, f)
+        json.dump({"backend": "faiss", "source_membership_sha256": "membersha999", "chunker_fingerprint": "chunk_strat_v1"}, f)
 
     with pytest.raises(ValueError, match="missing required field 'snapshot_id'"):
         validate_index_manifest(missing_id_dir, snapshot_manifest)
+
+    # Missing source_membership_sha256
+    missing_mem_dir = tmp_path / "missing_mem_index"
+    missing_mem_dir.mkdir()
+    with open(missing_mem_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump({"snapshot_id": "snap_20261004_v1", "chunker_fingerprint": "chunk_strat_v1"}, f)
+
+    with pytest.raises(ValueError, match="missing required field 'source_membership_sha256'"):
+        validate_index_manifest(missing_mem_dir, snapshot_manifest)
+
+    # Missing chunker_fingerprint
+    missing_chk_dir = tmp_path / "missing_chk_index"
+    missing_chk_dir.mkdir()
+    with open(missing_chk_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump({"snapshot_id": "snap_20261004_v1", "source_membership_sha256": "membersha999"}, f)
+
+    with pytest.raises(ValueError, match="missing required field 'chunker_fingerprint'"):
+        validate_index_manifest(missing_chk_dir, snapshot_manifest)
+
+
+def test_vector_chunk_mapping_hash_and_presearch_verification(tmp_path: Path):
+    """validate_index_manifest verifies vector_chunk_mapping_hash and pre-search config compatibility."""
+    snapshot_manifest = SnapshotManifest(
+        snapshot_id="snap_20261004_v1",
+        created_at="2026-10-04T12:00:00Z",
+        registry_sha256="abc123reg",
+        queries_sha256="q123sha",
+        source_membership_sha256="membersha999",
+        extractor_fingerprint="ext_trafilatura_v1",
+        chunker_fingerprint="chunk_strat_v1",
+        source_count=100,
+        ready_document_count=95,
+        chunk_count=350,
+        language_counts={"vi": 95},
+        quarantine_counts={},
+        shard_paths_and_hashes=[],
+    )
+
+    mapping_dir = tmp_path / "mapping_test_index"
+    mapping_dir.mkdir()
+    manifest_data = {
+        "snapshot_id": "snap_20261004_v1",
+        "source_membership_sha256": "membersha999",
+        "chunker_fingerprint": "chunk_strat_v1",
+        "vector_chunk_mapping_hash": "correct_mapping_hash_abc",
+        "model_name": "bkai-foundation-models/vietnamese-bi-encoder",
+        "instruction_prefix": {"passage": "passage: ", "query": "query: "},
+        "normalize_embeddings": True,
+    }
+    with open(mapping_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f)
+
+    # Valid mapping hash matches
+    validate_index_manifest(
+        mapping_dir,
+        snapshot_manifest,
+        expected_mapping_hash="correct_mapping_hash_abc",
+    )
+
+    # Mismatched mapping hash raises ValueError
+    with pytest.raises(ValueError, match="Vector-chunk mapping hash mismatch"):
+        validate_index_manifest(
+            mapping_dir,
+            snapshot_manifest,
+            expected_mapping_hash="wrong_mapping_hash_xyz",
+        )
+
+    # Missing mapping hash when expected raises ValueError
+    nomap_dir = tmp_path / "nomap_index"
+    nomap_dir.mkdir()
+    with open(nomap_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "snapshot_id": "snap_20261004_v1",
+            "source_membership_sha256": "membersha999",
+            "chunker_fingerprint": "chunk_strat_v1",
+        }, f)
+    with pytest.raises(ValueError, match="missing required field 'vector_chunk_mapping_hash'"):
+        validate_index_manifest(
+            nomap_dir,
+            snapshot_manifest,
+            expected_mapping_hash="expected_hash",
+        )
+
+    # Pre-search checks: model mismatch
+    with pytest.raises(ValueError, match="Model mismatch"):
+        validate_search_compatibility(
+            mapping_dir,
+            expected_model_name="different-model-name",
+        )
+
+    # Pre-search checks: prefix mismatch
+    with pytest.raises(ValueError, match="Instruction prefix mismatch"):
+        validate_search_compatibility(
+            mapping_dir,
+            expected_prefix={"query": "different_query_prefix: "},
+        )
+
+    # Pre-search checks: normalization mismatch
+    with pytest.raises(ValueError, match="Normalization mismatch"):
+        validate_search_compatibility(
+            mapping_dir,
+            expected_normalize=False,
+        )
+
+
+def test_missing_foreign_key_detection(tmp_path: Path):
+    """Resolving orphan chunks or documents not present in snapshot raises KeyError, and validator detects dangling IDs."""
+    registry, raw_root, _ = create_sample_registry_and_raw(tmp_path, num_sources=2)
+    config = SnapshotConfig(
+        snapshot_root=tmp_path / "snapshots",
+        name="snapshot_fk_test",
+    )
+    build_snapshot(
+        registry=registry,
+        config=config,
+        raw_root=raw_root,
+        language_detector=DummyLanguageDetector(),
+    )
+    store = SnapshotSourceStore(tmp_path / "snapshots" / "snapshot_fk_test")
+
+    # Valid doc resolves
+    assert store.get_document(1).doc_id == 1
+
+    # Orphan doc_id (foreign key missing from snapshot documents) raises KeyError
+    with pytest.raises(KeyError, match="Document 9999 not found"):
+        store.get_document(9999)
+
+    # Orphan chunk_id raises KeyError
+    with pytest.raises(KeyError, match="Chunk .* not found"):
+        store.get_chunk("9999:orphan_chunk_id")
+
+    # validate_corpus with strict foreign key validation flags dangling doc_ids
+    docs = [DocumentRecord(doc_id="1", language="vi", text="valid doc")]
+    orphan_chunks = [ChunkRecord(chunk_id="c_orphan", doc_id="9999", language="vi", text="orphan chunk")]
+    with pytest.raises(ValueError, match="does not exist in document table"):
+        validate_corpus(docs, orphan_chunks, strict=True)
+
+
+def test_vibiomir_adapter_load_ground_truth(tmp_path: Path):
+    """ViBioMIRAdapter loads and parses ground truth qrels with ReferenceChunks and EvaluationRecords."""
+    qrels_path = tmp_path / "test_qrels.jsonl"
+    qrels_records = [
+        {
+            "query_id": 201,
+            "relevant_docs": [1, 5],
+            "relevant_chunks": [
+                {"doc_id": 1, "chunk_text": "đoạn y tế liên quan 1"},
+                {"doc_id": 5, "chunk_text": "đoạn y tế liên quan 2"},
+            ],
+        },
+        {
+            "query_id": 202,
+            "relevant_docs": [2],
+            "relevant_chunks": [
+                {"doc_id": 2, "chunk_text": "đoạn y tế liên quan 3"},
+            ],
+        },
+    ]
+    with open(qrels_path, "w", encoding="utf-8") as f:
+        for rec in qrels_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    registry, raw_root, _ = create_sample_registry_and_raw(tmp_path, num_sources=2)
+    config = SnapshotConfig(
+        snapshot_root=tmp_path / "snapshots",
+        name="snapshot_eval_test",
+    )
+    build_snapshot(
+        registry=registry,
+        config=config,
+        raw_root=raw_root,
+        language_detector=DummyLanguageDetector(),
+    )
+
+    adapter = ViBioMIRAdapter(
+        snapshot_path=tmp_path / "snapshots" / "snapshot_eval_test",
+        qrels_path=qrels_path,
+    )
+    eval_records = adapter.load_ground_truth("dev")
+    assert len(eval_records) == 2
+    assert isinstance(eval_records[0], EvaluationRecord)
+    assert eval_records[0].query_id == 201
+    assert eval_records[0].relevant_doc_ids == frozenset({1, 5})
+    assert len(eval_records[0].relevant_chunks) == 2
+    assert isinstance(eval_records[0].relevant_chunks[0], ReferenceChunk)
+    assert eval_records[0].relevant_chunks[0].doc_id == 1
+    assert eval_records[0].relevant_chunks[0].chunk_text == "đoạn y tế liên quan 1"
+
+    assert eval_records[1].query_id == 202
+    assert eval_records[1].relevant_doc_ids == frozenset({2})
+    assert len(eval_records[1].relevant_chunks) == 1
+    assert eval_records[1].relevant_chunks[0].doc_id == 2
+
