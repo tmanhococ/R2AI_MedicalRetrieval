@@ -1,0 +1,87 @@
+run:
+  experiment_name: vibiomir_phase1_A
+  seed: 42
+
+dataset:
+  adapter: vibiomir
+  query_path: data/official/query.parquet
+  source_path: data/official/links_corpus.parquet
+  expected_query_count: 1200
+  registry_path: artifacts/vibiomir/registry.sqlite
+
+crawl:
+  concurrency: 16
+  per_domain_concurrency: 2
+  min_domain_interval_seconds: 1
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 30
+  total_deadline_seconds: 60
+  max_attempts: 3
+  base_backoff_seconds: 2
+  lease_seconds: 120
+  max_redirects: 5
+  max_html_bytes: 10485760
+  max_pdf_bytes: 31457280
+  respect_robots: true
+  raw_root: artifacts/vibiomir/raw
+
+extraction:
+  html_backend: trafilatura
+  pdf_backend: pymupdf
+  language_model_path: artifacts/models/lid.176.ftz
+  language_confidence_min: 0.70
+  accepted_languages: [vi, en, zh]
+  quarantine_unknown_language: true
+
+indexing:
+  snapshot_root: artifacts/vibiomir/snapshots
+  parquet_row_group_size: 5000
+  target_shard_bytes: 67108864
+  chunking:
+    mode: auto
+    auto_strategy:
+      type: paragraph_token_spans
+      body_max_tokens: 320
+      long_block_overlap_tokens: 64
+      contextual_header_max_tokens: 32
+      drop_short_blocks: false
+
+query_understanding:
+  adaptive_routing:
+    strip_clinical_boilerplate: false
+    dense_strategy: full
+
+reranker:
+  max_length: 512
+  query_window_tokens: 128
+  query_window_overlap_tokens: 16
+  query_window_aggregation: max
+  body_truncation: reject
+
+post_processing:
+  consistency_mode: independent
+
+evaluation:
+  profile: provisional_spec_v1
+  normalization: btc_order_v1
+  tokenizer: whitespace_v1
+  overlap_threshold: "2/5"
+  undefined_pr: 0
+  empty_both_f2: 1
+  scorer_parity_verified: false
+
+calibration:
+  fit_enabled: false
+  fallback_policy: fixed_top_k
+  fixed_top_k: {documents: 5, chunks: 10}
+  bounds:
+    documents: {min: 0, max: 50}
+    chunks: {min: 0, max: 100}
+
+submission:
+  exporter: vibiomir_json_zip
+  doc_id_type: integer
+  emit_chunk_order: true
+  json_filename: results.json
+  zip_filename: submission_A.zip
+  provenance_check: strict
