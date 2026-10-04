@@ -8,6 +8,16 @@ from src.evaluation.metrics import (
     evaluate_predictions,
     evaluate_query,
 )
+from src.evaluation.vibiomir_text import (
+    PROVISIONAL_SPEC_V1,
+    TextMatchProfile,
+    TextOverlapEvaluator,
+    clear_eval_text_caches,
+    lcs_length,
+    normalize_eval_text,
+    overlap_matches,
+    tokenize_eval_text,
+)
 
 __all__ = [
     "calculate_f2",
@@ -17,4 +27,12 @@ __all__ = [
     "CutoffCalibrator",
     "CalibrationState",
     "generate_error_analysis_report",
+    "normalize_eval_text",
+    "tokenize_eval_text",
+    "lcs_length",
+    "overlap_matches",
+    "TextMatchProfile",
+    "TextOverlapEvaluator",
+    "PROVISIONAL_SPEC_V1",
+    "clear_eval_text_caches",
 ]
