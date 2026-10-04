@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -106,6 +109,14 @@ class ReferenceChunk:
     doc_id: int
     chunk_text: str
 
+    def __post_init__(self) -> None:
+        if isinstance(self.doc_id, bool) or not isinstance(self.doc_id, int):
+            raise ValueError(f"doc_id must be integer, got {type(self.doc_id).__name__}: {self.doc_id}")
+        if not (-9223372036854775808 <= self.doc_id <= 9223372036854775807):
+            raise ValueError(f"doc_id out of signed int64 range: {self.doc_id}")
+        if not isinstance(self.chunk_text, str) or not self.chunk_text.strip():
+            raise ValueError(f"chunk_text must be non-empty string, got {self.chunk_text!r}")
+
 
 @dataclass(frozen=True)
 class DevQueryMetadata:
@@ -129,6 +140,17 @@ class EvaluationRecord:
     relevant_chunks: tuple[ReferenceChunk, ...]
     metadata: DevQueryMetadata | None = None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.query_id, bool) or not isinstance(self.query_id, int):
+            raise ValueError(f"query_id must be integer, got {type(self.query_id).__name__}: {self.query_id}")
+        if not (-9223372036854775808 <= self.query_id <= 9223372036854775807):
+            raise ValueError(f"query_id out of signed int64 range: {self.query_id}")
+        for ref in self.relevant_chunks:
+            if not isinstance(ref, ReferenceChunk):
+                raise TypeError(f"relevant_chunks must contain ReferenceChunk objects, got {type(ref).__name__}")
+            if not ref.chunk_text or not ref.chunk_text.strip():
+                raise ValueError("ReferenceChunk chunk_text cannot be empty")
+
 
 @dataclass(frozen=True)
 class LevelMetrics:
@@ -143,11 +165,21 @@ class LevelMetrics:
 
 
 @dataclass(frozen=True)
+class MacroMetrics:
+    """Macro-averaged precision, recall, and F2 scores across a query dataset."""
+    precision: float
+    recall: float
+    f2: float
+
+
+@dataclass(frozen=True)
 class QueryMetrics:
     """Evaluation metrics for a single query across document and chunk levels."""
     query_id: int
     documents: LevelMetrics
     chunks: LevelMetrics
+    matched_reference_indices: tuple[int, ...] = ()
+    matched_prediction_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -244,13 +276,73 @@ class ValidationReport:
     warnings: tuple[str, ...] = ()
 
 
+class PerQueryMetrics(tuple):
+    """Tuple of QueryMetrics supporting sequence indexing, iteration, and query_id dict lookup."""
+
+    def __new__(cls, items: Any = ()) -> PerQueryMetrics:
+        return super().__new__(cls, items)
+
+    def __init__(self, items: Any = ()) -> None:
+        self._by_id: dict[int, QueryMetrics] = {qm.query_id: qm for qm in self}
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, slice):
+            return PerQueryMetrics(super().__getitem__(key))
+        if isinstance(key, int):
+            if key in self._by_id:
+                return self._by_id[key]
+            return super().__getitem__(key)
+        raise KeyError(f"Query ID {key!r} not found in per_query_metrics")
+
+    def __contains__(self, item: Any) -> bool:
+        if isinstance(item, int):
+            return item in self._by_id
+        return super().__contains__(item)
+
+    def get(self, query_id: int, default: Any = None) -> QueryMetrics | None:
+        return self._by_id.get(query_id, default)
+
+    def keys(self) -> Any:
+        return self._by_id.keys()
+
+    def values(self) -> Any:
+        return self._by_id.values()
+
+    def items(self) -> Any:
+        return self._by_id.items()
+
+
 @dataclass(frozen=True)
 class EvaluationSummary:
     """Overall dataset-level macro evaluation report."""
-    profile_name: str
-    macro_f2_documents: float
-    macro_f2_chunks: float
-    total_queries: int
+    profile_fingerprint: str
+    scorer_parity_verified: bool
+    query_count: int
+    macro_documents: MacroMetrics
+    macro_chunks: MacroMetrics
+    per_query_metrics: tuple[QueryMetrics, ...]
+    inferred_final_mean: float
+    warnings: tuple[str, ...] = ()
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def profile_name(self) -> str:
+        for part in self.profile_fingerprint.split(":"):
+            if part.startswith("name="):
+                return part.split("=", 1)[1]
+        return self.profile_fingerprint
+
+    @property
+    def macro_f2_documents(self) -> float:
+        return self.macro_documents.f2
+
+    @property
+    def macro_f2_chunks(self) -> float:
+        return self.macro_chunks.f2
+
+    @property
+    def total_queries(self) -> int:
+        return self.query_count
 
 
 @dataclass(frozen=True)
@@ -345,6 +437,19 @@ class EvaluationProfile:
     undefined_pr: int
     empty_both_f2: int
     scorer_parity_verified: bool
+
+    @property
+    def profile_fingerprint(self) -> str:
+        """Deterministic fingerprint representing full evaluator configuration."""
+        return (
+            f"name={self.name}:"
+            f"norm={self.normalization_version}:"
+            f"tok={self.tokenizer_name}:"
+            f"thresh={self.threshold.numerator}/{self.threshold.denominator}:"
+            f"undef={self.undefined_pr}:"
+            f"empty_both={self.empty_both_f2}:"
+            f"parity={self.scorer_parity_verified}"
+        )
 
 
 @runtime_checkable

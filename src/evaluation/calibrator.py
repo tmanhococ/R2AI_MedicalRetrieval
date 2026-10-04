@@ -27,6 +27,9 @@ class CalibrationState:
         best_params: Parameter dictionary for the optimal policy.
         best_f2: Best macro F2 score achieved on validation data.
         all_policy_results: Evaluation summary for all tested policy configurations.
+        profile_fingerprint: Optional fingerprint of evaluation profile used for fitting.
+        dataset_fingerprint: Optional fingerprint of validation dataset used for fitting.
+        model_fingerprint: Optional fingerprint of model checkpoint used for fitting.
     """
 
     item_type: str
@@ -34,6 +37,9 @@ class CalibrationState:
     best_params: dict[str, Any]
     best_f2: float
     all_policy_results: dict[str, Any] = field(default_factory=dict)
+    profile_fingerprint: str | None = None
+    dataset_fingerprint: str | None = None
+    model_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert calibration state to dictionary for serialization."""
@@ -48,6 +54,9 @@ class CalibrationState:
             best_params=dict(data["best_params"]),
             best_f2=float(data["best_f2"]),
             all_policy_results=dict(data.get("all_policy_results", {})),
+            profile_fingerprint=data.get("profile_fingerprint"),
+            dataset_fingerprint=data.get("dataset_fingerprint"),
+            model_fingerprint=data.get("model_fingerprint"),
         )
 
     def save(self, filepath: str | Path) -> None:
@@ -101,6 +110,10 @@ class CutoffCalibrator:
         beta: float = 2.0,
         policies: Sequence[str] | None = None,
         bounds: dict[str, Any] | None = None,
+        fit_enabled: bool = True,
+        expected_profile_fingerprint: str | None = None,
+        expected_dataset_fingerprint: str | None = None,
+        expected_model_fingerprint: str | None = None,
     ) -> None:
         """Initialize CutoffCalibrator.
 
@@ -108,10 +121,18 @@ class CutoffCalibrator:
             beta: Beta weight for F_beta evaluation (default 2.0 for Macro F2).
             policies: List of policy names to tune. Defaults to all 4 supported policies.
             bounds: Parameter search bounds for candidate policies.
+            fit_enabled: Whether fitting on validation data is permitted.
+            expected_profile_fingerprint: Expected evaluation profile fingerprint.
+            expected_dataset_fingerprint: Expected dataset provenance fingerprint.
+            expected_model_fingerprint: Expected model checkpoint fingerprint.
         """
         self.beta = beta
         self.policies = list(policies) if policies is not None else list(self.SUPPORTED_POLICIES)
         self.bounds = bounds or {}
+        self.fit_enabled = fit_enabled
+        self.expected_profile_fingerprint = expected_profile_fingerprint
+        self.expected_dataset_fingerprint = expected_dataset_fingerprint
+        self.expected_model_fingerprint = expected_model_fingerprint
 
     def _generate_candidate_params(self, policy: str) -> list[dict[str, Any]]:
         """Generate grid of parameter configurations for a given policy."""
@@ -247,8 +268,11 @@ class CutoffCalibrator:
     def fit(
         self,
         query_scores: dict[str, Sequence[Any]],
-        ground_truths: Sequence[GroundTruthRecord] | dict[str, GroundTruthRecord],
+        ground_truths: Sequence[Any] | dict[str, Any],
         item_type: str = "document",
+        profile_fingerprint: str | None = None,
+        dataset_fingerprint: str | None = None,
+        model_fingerprint: str | None = None,
     ) -> CalibrationState:
         """Calibrate cutoff policy using validation set queries to maximize Macro F2.
 
@@ -258,19 +282,55 @@ class CutoffCalibrator:
 
         Args:
             query_scores: Mapping from query_id to sequence of ranked items (ScoredHit or (id, score)).
-            ground_truths: GroundTruthRecord instances for validation queries.
+            ground_truths: GroundTruthRecord or EvaluationRecord instances for validation queries.
             item_type: 'document' or 'chunk'.
+            profile_fingerprint: Evaluation profile fingerprint to pin to calibrated state.
+            dataset_fingerprint: Dataset provenance fingerprint to pin to calibrated state.
+            model_fingerprint: Model checkpoint fingerprint to pin to calibrated state.
 
         Returns:
             CalibrationState with the best policy and parameter configuration.
         """
+        if not self.fit_enabled:
+            raise RuntimeError(
+                "Cutoff calibration fitting is disabled (fit_enabled=False). "
+                "Fitting is disabled by default; use fallback cutoff or enable explicitly."
+            )
+
         # Normalize ground truths
         if isinstance(ground_truths, dict):
             gt_dict = ground_truths
         else:
-            gt_dict = {gt.query_id: gt for gt in ground_truths}
+            gt_dict = {
+                (str(getattr(gt, "query_id", idx)) if not isinstance(gt, dict) else str(gt.get("query_id", gt.get("id", idx)))): gt
+                for idx, gt in enumerate(ground_truths)
+            }
+
+        # Anti-leakage: Reject test/public/private qrels
+        forbidden_splits = {"test", "public", "private", "official_test", "test_set"}
+        for qid, gt_rec in gt_dict.items():
+            split = None
+            if hasattr(gt_rec, "metadata") and gt_rec.metadata is not None:
+                split = getattr(gt_rec.metadata, "split", None)
+            elif hasattr(gt_rec, "split"):
+                split = getattr(gt_rec, "split", None)
+            elif isinstance(gt_rec, dict):
+                if "metadata" in gt_rec and isinstance(gt_rec["metadata"], dict):
+                    split = gt_rec["metadata"].get("split")
+                else:
+                    split = gt_rec.get("split")
+
+            if split and str(split).strip().lower() in forbidden_splits:
+                raise ValueError(
+                    f"Cannot fit calibration on forbidden split '{split}' (query {qid}): "
+                    "Fitting on test/public/private qrels is strictly rejected to prevent evaluation leakage."
+                )
 
         num_queries = len(gt_dict)
+        resolved_profile = profile_fingerprint or self.expected_profile_fingerprint
+        resolved_dataset = dataset_fingerprint or self.expected_dataset_fingerprint
+        resolved_model = model_fingerprint or self.expected_model_fingerprint
+
         if num_queries == 0:
             return CalibrationState(
                 item_type=item_type,
@@ -278,15 +338,31 @@ class CutoffCalibrator:
                 best_params={"k": 5},
                 best_f2=0.0,
                 all_policy_results={},
+                profile_fingerprint=resolved_profile,
+                dataset_fingerprint=resolved_dataset,
+                model_fingerprint=resolved_model,
             )
 
         # Pre-extract ground truth target sets
         gt_target_ids: dict[str, set[str]] = {}
         for qid, gt_rec in gt_dict.items():
+            qid_str = str(qid)
             if item_type == "chunk":
-                gt_target_ids[qid] = gt_rec.relevant_chunk_ids
+                if hasattr(gt_rec, "relevant_chunk_ids"):
+                    gt_target_ids[qid_str] = set(str(c) for c in gt_rec.relevant_chunk_ids)
+                elif hasattr(gt_rec, "relevant_chunks"):
+                    gt_target_ids[qid_str] = set(
+                        str(getattr(c, "chunk_text", c)) for c in gt_rec.relevant_chunks
+                    )
+                elif isinstance(gt_rec, dict):
+                    chunks = gt_rec.get("relevant_chunk_ids", gt_rec.get("relevant_chunks", []))
+                    gt_target_ids[qid_str] = set(str(c) for c in chunks)
             else:
-                gt_target_ids[qid] = gt_rec.relevant_doc_ids
+                if hasattr(gt_rec, "relevant_doc_ids"):
+                    gt_target_ids[qid_str] = set(str(d) for d in gt_rec.relevant_doc_ids)
+                elif isinstance(gt_rec, dict):
+                    docs = gt_rec.get("relevant_doc_ids", gt_rec.get("relevant_docs", []))
+                    gt_target_ids[qid_str] = set(str(d) for d in docs)
 
         # Pre-extract item IDs and scores per query
         preprocessed_candidates: dict[str, list[tuple[str, float]]] = {}
@@ -363,31 +439,114 @@ class CutoffCalibrator:
             best_params=best_params,
             best_f2=-best_neg_f2,
             all_policy_results=all_policy_results,
+            profile_fingerprint=resolved_profile,
+            dataset_fingerprint=resolved_dataset,
+            model_fingerprint=resolved_model,
         )
 
-    def apply(self, ranked_items: Sequence[Any], state: CalibrationState | dict[str, Any]) -> int:
+    def validate_state(
+        self,
+        state: CalibrationState | dict[str, Any],
+        expected_profile_fingerprint: str | None = None,
+        expected_dataset_fingerprint: str | None = None,
+        expected_model_fingerprint: str | None = None,
+    ) -> None:
+        """Validate calibration state compatibility with target runtime fingerprints."""
+        if isinstance(state, dict):
+            state = CalibrationState.from_dict(state)
+
+        target_profile = (
+            expected_profile_fingerprint
+            if expected_profile_fingerprint is not None
+            else self.expected_profile_fingerprint
+        )
+        target_dataset = (
+            expected_dataset_fingerprint
+            if expected_dataset_fingerprint is not None
+            else self.expected_dataset_fingerprint
+        )
+        target_model = (
+            expected_model_fingerprint
+            if expected_model_fingerprint is not None
+            else self.expected_model_fingerprint
+        )
+
+        if target_profile is not None and state.profile_fingerprint is not None:
+            if state.profile_fingerprint != target_profile:
+                raise ValueError(
+                    f"Evaluation profile fingerprint mismatch: state has '{state.profile_fingerprint}' "
+                    f"but expected '{target_profile}'"
+                )
+
+        if target_dataset is not None and state.dataset_fingerprint is not None:
+            if state.dataset_fingerprint != target_dataset:
+                raise ValueError(
+                    f"Dataset fingerprint mismatch: state has '{state.dataset_fingerprint}' "
+                    f"but expected '{target_dataset}'"
+                )
+
+        if target_model is not None and state.model_fingerprint is not None:
+            if state.model_fingerprint != target_model:
+                raise ValueError(
+                    f"Model fingerprint mismatch: state has '{state.model_fingerprint}' "
+                    f"but expected '{target_model}'"
+                )
+
+    def apply(
+        self,
+        ranked_items: Sequence[Any],
+        state: CalibrationState | dict[str, Any],
+        expected_profile_fingerprint: str | None = None,
+        expected_dataset_fingerprint: str | None = None,
+        expected_model_fingerprint: str | None = None,
+    ) -> int:
         """Apply calibrated state to ranked items and return cutoff index K.
 
         Args:
             ranked_items: Ranked candidate items.
             state: CalibrationState instance or serialized dict.
+            expected_profile_fingerprint: Optional profile fingerprint to verify.
+            expected_dataset_fingerprint: Optional dataset fingerprint to verify.
+            expected_model_fingerprint: Optional model fingerprint to verify.
 
         Returns:
             Integer cutoff index K indicating how many top items to retain.
         """
+        self.validate_state(
+            state,
+            expected_profile_fingerprint=expected_profile_fingerprint,
+            expected_dataset_fingerprint=expected_dataset_fingerprint,
+            expected_model_fingerprint=expected_model_fingerprint,
+        )
         if isinstance(state, dict):
             state = CalibrationState.from_dict(state)
         return self._apply_policy(ranked_items, state.best_policy, state.best_params)
 
-    def filter_items(self, ranked_items: Sequence[Any], state: CalibrationState | dict[str, Any]) -> list[Any]:
+    def filter_items(
+        self,
+        ranked_items: Sequence[Any],
+        state: CalibrationState | dict[str, Any],
+        expected_profile_fingerprint: str | None = None,
+        expected_dataset_fingerprint: str | None = None,
+        expected_model_fingerprint: str | None = None,
+    ) -> list[Any]:
         """Filter ranked items using calibrated state cutoff.
 
         Args:
             ranked_items: Ranked candidate items.
             state: CalibrationState instance or serialized dict.
+            expected_profile_fingerprint: Optional profile fingerprint to verify.
+            expected_dataset_fingerprint: Optional dataset fingerprint to verify.
+            expected_model_fingerprint: Optional model fingerprint to verify.
 
         Returns:
             Sliced list containing top items according to calibrated cutoff.
         """
-        cutoff = self.apply(ranked_items, state)
+        cutoff = self.apply(
+            ranked_items,
+            state,
+            expected_profile_fingerprint=expected_profile_fingerprint,
+            expected_dataset_fingerprint=expected_dataset_fingerprint,
+            expected_model_fingerprint=expected_model_fingerprint,
+        )
         return list(ranked_items[:cutoff])

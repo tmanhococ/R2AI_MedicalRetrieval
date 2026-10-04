@@ -155,7 +155,7 @@ def overlap_matches(
         raise ValueError("Reference tokens cannot be empty")
 
     if not isinstance(threshold, Fraction):
-        threshold = Fraction(threshold)
+        threshold = Fraction(str(threshold))
 
     if threshold < 0 or threshold > 1:
         raise ValueError(f"Threshold must be in [0, 1], got {threshold}")
