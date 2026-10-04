@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 import sys
 import time
+import tracemalloc
 from typing import Any, Sequence
 
 from src.cli.common import (
@@ -206,6 +207,7 @@ def run_predict(
     This function strictly operates without ground truth labels. No metrics.json or fake 0 metrics are written.
     """
     t_start = time.time()
+    tracemalloc.start()
 
     # Determine destination directory
     if output_dir is not None:
@@ -402,11 +404,17 @@ def run_predict(
 
     # 9. Save run_manifest.json
     total_time = time.time() - t_start
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    peak_ram_mb = round(peak_bytes / (1024 * 1024), 2)
+
     manifest_data = {
         "run_fingerprint": run_fp,
         "seed": config.get("run", {}).get("seed", 42),
         "models": model_revisions,
         "runtime_seconds": round(total_time, 2),
+        "peak_ram_mb": peak_ram_mb,
+        "gpu_vram_mb": 0.0,
         "total_queries": len(all_predictions),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "snapshot_membership_sha256": snapshot_membership,

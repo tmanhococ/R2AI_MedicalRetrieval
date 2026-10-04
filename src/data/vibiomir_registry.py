@@ -1,8 +1,13 @@
+import collections
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
+import os
 from pathlib import Path
+import random
 import sqlite3
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
+from urllib.parse import urlparse
 
 from src.data.vibiomir_contracts import (
     FetchJob,
@@ -201,12 +206,108 @@ class SourceRegistry:
     def count_unique_urls(self) -> int:
         return self.conn.execute("SELECT count(DISTINCT original_url) FROM sources").fetchone()[0]
 
+    def sample_stratified_jobs(
+        self,
+        sample_size: int = 500,
+        seed: int = 42,
+        persist_path: Path | str | None = None,
+    ) -> list[str]:
+        """Draw a deterministic stratified sample of jobs by (domain, url_type).
+
+        Guarantees proportional quota allocation across strata using the largest remainder method,
+        representing every non-empty stratum when sample_size >= num_strata, and persists the sample IDs.
+        """
+        rows = self.conn.execute("SELECT job_id, url FROM fetch_jobs").fetchall()
+        if not rows:
+            return []
+
+        strata: dict[str, list[str]] = collections.defaultdict(list)
+        for jid, url in rows:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower().split(":")[0]
+            path = parsed.path.lower()
+            ext = os.path.splitext(path)[1]
+            if path.endswith(".pdf") or ".pdf" in path:
+                utype = "pdf"
+            elif ext in (".html", ".htm"):
+                utype = "html"
+            elif ext in (".aspx", ".asp", ".php", ".jsp"):
+                utype = "dynamic"
+            elif not ext or ext == "/":
+                utype = "slug"
+            else:
+                utype = ext.lstrip(".")[:8]
+            strata[f"{domain}::{utype}"].append(jid)
+
+        total_items = len(rows)
+        effective_sample_size = min(sample_size, total_items)
+        sorted_keys = sorted(strata.keys())
+        num_strata = len(sorted_keys)
+
+        quotas: dict[str, int] = {}
+        if effective_sample_size >= num_strata:
+            for k in sorted_keys:
+                quotas[k] = 1
+            remaining = effective_sample_size - num_strata
+            if remaining > 0:
+                props = {k: remaining * (len(strata[k]) / total_items) for k in sorted_keys}
+                floors = {k: int(props[k]) for k in sorted_keys}
+                rems = sorted(sorted_keys, key=lambda k: (props[k] - floors[k], k), reverse=True)
+                extra_needed = remaining - sum(floors.values())
+                for i in range(extra_needed):
+                    floors[rems[i]] += 1
+                for k in sorted_keys:
+                    quotas[k] += floors[k]
+        else:
+            props = {k: effective_sample_size * (len(strata[k]) / total_items) for k in sorted_keys}
+            floors = {k: int(props[k]) for k in sorted_keys}
+            rems = sorted(sorted_keys, key=lambda k: (props[k] - floors[k], len(strata[k]), k), reverse=True)
+            extra_needed = effective_sample_size - sum(floors.values())
+            for i in range(extra_needed):
+                floors[rems[i]] += 1
+            for k in sorted_keys:
+                quotas[k] = floors[k]
+
+        rng = random.Random(seed)
+        sampled_ids: list[str] = []
+        strata_summary: dict[str, dict[str, Any]] = {}
+
+        for k in sorted_keys:
+            stratum_jobs = sorted(strata[k])
+            q = min(quotas[k], len(stratum_jobs))
+            sample = rng.sample(stratum_jobs, q) if q > 0 else []
+            sampled_ids.extend(sample)
+            strata_summary[k] = {
+                "stratum_size": len(stratum_jobs),
+                "sampled_count": len(sample),
+            }
+
+        sampled_ids.sort()
+
+        if persist_path is not None:
+            p = Path(persist_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            meta = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "seed": seed,
+                "target_sample_size": sample_size,
+                "actual_sample_size": len(sampled_ids),
+                "strata_count": num_strata,
+                "sampled_job_ids": sampled_ids,
+                "strata_summary": strata_summary,
+            }
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+
+        return sampled_ids
+
     def lease_jobs(
         self,
         limit: int,
         lease_seconds: int = 120,
         max_attempts: int = 3,
         now: datetime | None = None,
+        job_ids: Sequence[str] | None = None,
     ) -> list[FetchJob]:
         """Leases up to limit jobs, reclaiming expired leases and elapsed retry_wait jobs."""
         if limit <= 0:
@@ -259,17 +360,38 @@ class SourceRegistry:
                 (now_iso, now_iso),
             )
 
-            # 3. Select pending jobs ordered by attempts ASC, rowid ASC
-            rows = self.conn.execute(
-                """
-                SELECT job_id, url, attempts
-                FROM fetch_jobs
-                WHERE state = 'pending'
-                ORDER BY attempts ASC, rowid ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            # 3. Select pending jobs (optionally restricted to job_ids)
+            if job_ids is not None:
+                self.conn.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS target_lease_jobs (jid TEXT PRIMARY KEY);"
+                )
+                self.conn.execute("DELETE FROM target_lease_jobs;")
+                self.conn.executemany(
+                    "INSERT OR IGNORE INTO target_lease_jobs (jid) VALUES (?)",
+                    [(j,) for j in job_ids],
+                )
+                rows = self.conn.execute(
+                    """
+                    SELECT j.job_id, j.url, j.attempts
+                    FROM fetch_jobs j
+                    JOIN target_lease_jobs t ON j.job_id = t.jid
+                    WHERE j.state = 'pending'
+                    ORDER BY j.attempts ASC, j.rowid ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """
+                    SELECT job_id, url, attempts
+                    FROM fetch_jobs
+                    WHERE state = 'pending'
+                    ORDER BY attempts ASC, rowid ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
 
             if not rows:
                 return []

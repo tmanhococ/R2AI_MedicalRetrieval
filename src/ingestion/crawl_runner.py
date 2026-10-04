@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 from urllib.parse import urlparse
 import urllib.robotparser
 
@@ -87,6 +88,7 @@ async def _run_crawl_with_client(
     config: CrawlConfig,
     client: httpx.AsyncClient,
     limit: int | None = None,
+    job_ids: Sequence[str] | None = None,
 ) -> CrawlReport:
     global_sem = asyncio.Semaphore(config.concurrency)
     throttler = DomainThrottler(config.per_domain_concurrency, config.min_domain_interval_seconds)
@@ -141,6 +143,7 @@ async def _run_crawl_with_client(
                 limit=available_slots,
                 lease_seconds=int(config.lease_seconds),
                 max_attempts=config.max_attempts,
+                job_ids=job_ids,
             )
             total_leased += len(new_jobs)
             for j in new_jobs:
@@ -187,10 +190,11 @@ async def run_crawl(
     config: CrawlConfig,
     limit: int | None = None,
     client: httpx.AsyncClient | None = None,
+    job_ids: Sequence[str] | None = None,
 ) -> CrawlReport:
     """Executes crawler with global/domain semaphores, domain interval throttling, and atomic checkpointing."""
     if client is not None:
-        return await _run_crawl_with_client(registry, config, client, limit)
+        return await _run_crawl_with_client(registry, config, client, limit, job_ids=job_ids)
 
     limits = httpx.Limits(
         max_connections=config.concurrency,
@@ -203,4 +207,4 @@ async def run_crawl(
         pool=10.0,
     )
     async with httpx.AsyncClient(limits=limits, timeout=timeouts) as managed_client:
-        return await _run_crawl_with_client(registry, config, managed_client, limit)
+        return await _run_crawl_with_client(registry, config, managed_client, limit, job_ids=job_ids)

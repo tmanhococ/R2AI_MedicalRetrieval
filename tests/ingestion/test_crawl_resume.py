@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
@@ -290,6 +291,119 @@ async def test_crawl_with_limit(tmp_path: Path):
     # Remaining 3 jobs should still be pending
     cursor = registry.conn.execute("SELECT count(*) FROM fetch_jobs WHERE state = 'pending'")
     assert cursor.fetchone()[0] == 3
+
+    registry.close()
+
+
+def test_sample_stratified_jobs_deterministic_and_balanced(tmp_path: Path):
+    """sample_stratified_jobs selects balanced quotas across domain::type strata with seed 42."""
+    db_file = tmp_path / "registry.sqlite"
+    registry = SourceRegistry(db_file)
+
+    # Create 3 domains with different URL structures:
+    # d1: 10 html, 5 pdf
+    # d2: 20 slug
+    # d3: 5 html, 5 dynamic
+    sources = []
+    doc_id = 1
+    for i in range(10):
+        sources.append(OfficialSource(doc_id=doc_id, url=f"https://domain1.vn/article_{i}.html"))
+        doc_id += 1
+    for i in range(5):
+        sources.append(OfficialSource(doc_id=doc_id, url=f"https://domain1.vn/doc_{i}.pdf"))
+        doc_id += 1
+    for i in range(20):
+        sources.append(OfficialSource(doc_id=doc_id, url=f"https://domain2.vn/news/{i}/"))
+        doc_id += 1
+    for i in range(5):
+        sources.append(OfficialSource(doc_id=doc_id, url=f"https://domain3.com/info_{i}.html"))
+        doc_id += 1
+    for i in range(5):
+        sources.append(OfficialSource(doc_id=doc_id, url=f"https://domain3.com/search.php?id={i}"))
+        doc_id += 1
+
+    ingest_sources(sources, registry)
+
+    persist_path = tmp_path / "pilot_sample_ids.json"
+    sampled_1 = registry.sample_stratified_jobs(sample_size=10, seed=42, persist_path=persist_path)
+    assert len(sampled_1) == 10
+    assert persist_path.exists()
+
+    with open(persist_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    assert meta["seed"] == 42
+    assert meta["target_sample_size"] == 10
+    assert meta["actual_sample_size"] == 10
+    assert len(meta["sampled_job_ids"]) == 10
+
+    # Test seed determinism: repeating with seed 42 yields exact same list
+    sampled_2 = registry.sample_stratified_jobs(sample_size=10, seed=42)
+    assert sampled_1 == sampled_2
+
+    # Verify that multiple strata are represented in the sample
+    sample_urls = [registry.get_fetch_job(jid)["url"] for jid in sampled_1]
+    domains_in_sample = {httpx.URL(u).host for u in sample_urls}
+    assert len(domains_in_sample) >= 3  # All 3 domains represented!
+
+    registry.close()
+
+
+def test_lease_jobs_with_specific_job_ids(tmp_path: Path):
+    """lease_jobs with job_ids parameter restricts leases strictly to the provided subset."""
+    db_file = tmp_path / "registry.sqlite"
+    registry = SourceRegistry(db_file)
+
+    sources = [
+        OfficialSource(doc_id=i, url=f"https://example.com/page_{i}")
+        for i in range(1, 11)
+    ]
+    ingest_sources(sources, registry)
+
+    all_jobs = [r[0] for r in registry.conn.execute("SELECT job_id FROM fetch_jobs ORDER BY rowid ASC").fetchall()]
+    target_ids = [all_jobs[1], all_jobs[4], all_jobs[7]]
+
+    leased = registry.lease_jobs(limit=10, job_ids=target_ids)
+    assert len(leased) == 3
+    leased_ids = {j.job_id for j in leased}
+    assert leased_ids == set(target_ids)
+
+    # Calling again yields empty since all target_ids are leased
+    leased_again = registry.lease_jobs(limit=10, job_ids=target_ids)
+    assert len(leased_again) == 0
+
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_crawl_with_pilot_job_ids(tmp_path: Path):
+    """run_crawl accepts job_ids and crawls only that designated subset."""
+    db_file = tmp_path / "registry.sqlite"
+    raw_root = tmp_path / "raw"
+    config = CrawlConfig(raw_root=raw_root)
+    registry = SourceRegistry(db_file)
+
+    sources = [
+        OfficialSource(doc_id=i, url=f"https://example.com/item_{i}")
+        for i in range(1, 6)
+    ]
+    ingest_sources(sources, registry)
+
+    all_jobs = [r[0] for r in registry.conn.execute("SELECT job_id FROM fetch_jobs ORDER BY rowid ASC").fetchall()]
+    chosen_ids = [all_jobs[0], all_jobs[2]]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"content", headers={"Content-Type": "text/html"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        report = await run_crawl(registry, config, job_ids=chosen_ids, client=client)
+
+    assert report.leased == 2
+    assert report.fetched == 2
+
+    # Check states in registry
+    assert registry.get_fetch_job(chosen_ids[0])["state"] == "fetched"
+    assert registry.get_fetch_job(chosen_ids[1])["state"] == "fetched"
+    assert registry.get_fetch_job(all_jobs[1])["state"] == "pending"
 
     registry.close()
 
