@@ -151,7 +151,16 @@ def load_dev_records(
                     f"Document {c_doc_id} in reference chunk for query {query_id} not found in SourceStore"
                 )
 
-            ref_chunks.append(ReferenceChunk(doc_id=c_doc_id, chunk_text=c_text))
+            c_start = c_item.get("char_start")
+            c_end = c_item.get("char_end")
+            ref_chunks.append(
+                ReferenceChunk(
+                    doc_id=c_doc_id,
+                    chunk_text=c_text,
+                    char_start=int(c_start) if c_start is not None else None,
+                    char_end=int(c_end) if c_end is not None else None,
+                )
+            )
 
         records.append(
             EvaluationRecord(

@@ -407,17 +407,17 @@ class ErrorBreakdown:
     evidence_missing_given_doc: tuple[ReferenceChunk, ...]
 
     def __post_init__(self) -> None:
-        if isinstance(self.missing_source_docs, list):
+        if not isinstance(self.missing_source_docs, tuple):
             object.__setattr__(self, "missing_source_docs", tuple(self.missing_source_docs))
-        if isinstance(self.missing_candidate_docs, list):
+        if not isinstance(self.missing_candidate_docs, tuple):
             object.__setattr__(self, "missing_candidate_docs", tuple(self.missing_candidate_docs))
-        if isinstance(self.lost_after_rerank_docs, list):
+        if not isinstance(self.lost_after_rerank_docs, tuple):
             object.__setattr__(self, "lost_after_rerank_docs", tuple(self.lost_after_rerank_docs))
-        if isinstance(self.lost_after_cutoff_docs, list):
+        if not isinstance(self.lost_after_cutoff_docs, tuple):
             object.__setattr__(self, "lost_after_cutoff_docs", tuple(self.lost_after_cutoff_docs))
-        if isinstance(self.missing_chunk_refs, list):
+        if not isinstance(self.missing_chunk_refs, tuple):
             object.__setattr__(self, "missing_chunk_refs", tuple(self.missing_chunk_refs))
-        if isinstance(self.evidence_missing_given_doc, list):
+        if not isinstance(self.evidence_missing_given_doc, tuple):
             object.__setattr__(self, "evidence_missing_given_doc", tuple(self.evidence_missing_given_doc))
 
 

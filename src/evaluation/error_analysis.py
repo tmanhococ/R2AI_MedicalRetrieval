@@ -272,10 +272,10 @@ def build_error_breakdown(
         for item in trace.metadata["predicted_chunks"]:
             if isinstance(item, dict):
                 p_doc_id = int(item["doc_id"])
-                p_text = str(item.get("chunk_text", ""))
+                p_text = str(item.get("chunk_text") if item.get("chunk_text") is not None else item.get("text", ""))
             else:
                 p_doc_id = int(getattr(item, "doc_id"))
-                p_text = str(getattr(item, "chunk_text", ""))
+                p_text = str(getattr(item, "chunk_text", getattr(item, "text", "")))
             pred_chunks.append((p_doc_id, p_text))
     elif trace.final_chunk_ids:
         for cid in trace.final_chunk_ids:
