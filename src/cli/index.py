@@ -9,6 +9,7 @@ from typing import Any
 
 from src.data.dataset_adapter import JsonlDatasetAdapter
 from src.data.validators import validate_corpus
+from src.data.vibiomir_adapter import ViBioMIRAdapter, validate_index_manifest
 from src.indexing.bm25_index import BM25Indexer
 from src.indexing.chunker import create_chunker
 from src.indexing.dense_index import DenseIndexer
@@ -19,24 +20,30 @@ logger = logging.getLogger(__name__)
 
 def run_index(
     config: dict[str, Any],
-    dataset_dir: Path | str,
+    dataset_dir: Path | str | None = None,
     output_dir: Path | str | None = None,
     encoder: Any = None,
+    snapshot_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute corpus validation, chunking, and dual BM25 + Dense vector indexing.
 
+    Supports both legacy JSONL dataset directory and frozen snapshot directory via ViBioMIRAdapter.
+
     Args:
         config: Application configuration dictionary.
-        dataset_dir: Path to the dataset directory containing corpus documents/chunks.
+        dataset_dir: Optional path to dataset directory containing JSONL documents/chunks.
         output_dir: Directory where indexes and manifests will be written.
         encoder: Optional pre-instantiated embedding encoder for testing or custom embeddings.
+        snapshot_dir: Optional path to frozen snapshot directory.
 
     Returns:
         Dictionary containing index paths and summary statistics.
     """
-    dataset_path = Path(dataset_dir)
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+    effective_snapshot = snapshot_dir
+    if effective_snapshot is None and dataset_dir is not None:
+        p = Path(dataset_dir)
+        if (p / "manifest.json").exists():
+            effective_snapshot = p
 
     # Determine index destination directory
     if output_dir is not None:
@@ -46,10 +53,33 @@ def run_index(
         out_path = Path(run_out) / "indexes"
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load corpus
-    adapter = JsonlDatasetAdapter(dataset_path)
-    documents = adapter.load_documents()
-    chunks = adapter.load_chunks()
+    snapshot_manifest = None
+    snapshot_id = None
+    source_membership_sha256 = None
+    chunker_fingerprint = None
+
+    if effective_snapshot is not None:
+        snap_path = Path(effective_snapshot)
+        if not snap_path.exists():
+            raise FileNotFoundError(f"Snapshot directory not found: {snap_path}")
+        adapter = ViBioMIRAdapter(snap_path)
+        snapshot_manifest = adapter.manifest
+        snapshot_id = adapter.manifest.snapshot_id
+        source_membership_sha256 = adapter.manifest.source_membership_sha256
+        chunker_fingerprint = adapter.manifest.chunker_fingerprint
+
+        documents = adapter.load_documents()
+        chunks = adapter.load_chunks()
+    else:
+        if dataset_dir is None:
+            raise ValueError("Either dataset_dir or snapshot_dir must be provided")
+        dataset_path = Path(dataset_dir)
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+
+        adapter = JsonlDatasetAdapter(dataset_path)
+        documents = adapter.load_documents()
+        chunks = adapter.load_chunks()
 
     # 2. Initial validation
     strict_val = config.get("indexing", {}).get("validation", {}).get("strict_foreign_keys", True)
@@ -58,7 +88,7 @@ def run_index(
     # 3. Chunking if chunks missing or mode != "prechunked"
     chunk_cfg = config.get("indexing", {}).get("chunking", {})
     mode = chunk_cfg.get("mode", "hybrid")
-    if not chunks or mode != "prechunked":
+    if not chunks or (mode != "prechunked" and effective_snapshot is None):
         chunker = create_chunker(chunk_cfg)
         chunks = chunker.chunk_documents(documents, existing_chunks=chunks)
         # Re-validate with new chunks
@@ -103,6 +133,9 @@ def run_index(
             documents=documents,
             chunks=chunks,
             output_dir=bm25_output_dir,
+            snapshot_id=snapshot_id,
+            source_membership_sha256=source_membership_sha256,
+            chunker_fingerprint=chunker_fingerprint,
         )
 
     # 5. Build Dense Index
@@ -119,7 +152,17 @@ def run_index(
         dense_manifest = dense_indexer.build_index(
             chunks=chunks,
             output_dir=dense_output_dir,
+            snapshot_id=snapshot_id,
+            source_membership_sha256=source_membership_sha256,
+            chunker_fingerprint=chunker_fingerprint,
         )
+
+    # Validate against snapshot manifest if available
+    if snapshot_manifest is not None:
+        if bm25_cfg.get("enabled", True):
+            validate_index_manifest(bm25_output_dir, snapshot_manifest)
+        if dense_cfg.get("enabled", True):
+            validate_index_manifest(dense_output_dir, snapshot_manifest)
 
     return {
         "output_dir": str(out_path),
@@ -145,8 +188,14 @@ def main(args: list[str] | None = None) -> None:
     parser.add_argument(
         "-d",
         "--dataset",
-        required=True,
+        default=None,
         help="Path to dataset directory containing documents/chunks JSONL files",
+    )
+    parser.add_argument(
+        "-s",
+        "--snapshot",
+        default=None,
+        help="Path to frozen source snapshot directory",
     )
     parser.add_argument(
         "-o",
@@ -156,11 +205,15 @@ def main(args: list[str] | None = None) -> None:
     )
 
     parsed = parser.parse_args(args)
+    if not parsed.dataset and not parsed.snapshot:
+        parser.error("At least one of --dataset or --snapshot must be specified")
+
     cfg = load_config(parsed.config)
     results = run_index(
         config=cfg,
         dataset_dir=parsed.dataset,
         output_dir=parsed.output_dir,
+        snapshot_dir=parsed.snapshot,
     )
     print(f"Indexing completed successfully:")
     print(f"  Documents indexed: {results['num_documents']}")

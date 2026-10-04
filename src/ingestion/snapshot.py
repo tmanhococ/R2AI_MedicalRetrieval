@@ -1,0 +1,478 @@
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import asdict
+from datetime import datetime, timezone
+import gzip
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Sequence
+import uuid
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from src.data.vibiomir_contracts import (
+    ChunkConfig,
+    ExtractionConfig,
+    ExtractedBlock,
+    ExtractedDocument,
+    SnapshotConfig,
+    SnapshotManifest,
+    SpanChunk,
+)
+from src.data.vibiomir_registry import SourceRegistry
+from src.indexing.chunker import chunk_source_document
+from src.ingestion.extractors import extract_document
+from src.ingestion.quality import (
+    FastTextLanguageDetector,
+    LanguageDetector,
+    classify_quality,
+)
+
+logger = logging.getLogger(__name__)
+
+DOCUMENTS_SCHEMA = pa.schema([
+    pa.field("doc_id", pa.int64(), nullable=False),
+    pa.field("source_version", pa.string(), nullable=False),
+    pa.field("source_text", pa.string(), nullable=False),
+    pa.field("source_sha256", pa.string(), nullable=False),
+    pa.field("raw_sha256", pa.string(), nullable=False),
+    pa.field("title", pa.string(), nullable=True),
+    pa.field("language", pa.string(), nullable=False),
+    pa.field("blocks_json", pa.string(), nullable=False),
+    pa.field("quality_flags_json", pa.string(), nullable=False),
+])
+
+CHUNKS_SCHEMA = pa.schema([
+    pa.field("chunk_id", pa.string(), nullable=False),
+    pa.field("doc_id", pa.int64(), nullable=False),
+    pa.field("source_version", pa.string(), nullable=False),
+    pa.field("source_sha256", pa.string(), nullable=False),
+    pa.field("start_char", pa.int64(), nullable=False),
+    pa.field("end_char", pa.int64(), nullable=False),
+    pa.field("chunk_index", pa.int64(), nullable=False),
+    pa.field("language", pa.string(), nullable=False),
+    pa.field("section", pa.string(), nullable=True),
+    pa.field("text", pa.string(), nullable=False),
+    pa.field("index_text", pa.string(), nullable=False),
+    pa.field("dense_token_count", pa.int64(), nullable=False),
+    pa.field("reranker_token_count", pa.int64(), nullable=False),
+])
+
+
+class ShardedParquetWriter:
+    """Manages sharded Parquet writing with row-group limits, byte rotation, and atomic renaming."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        prefix: str,
+        schema: pa.Schema,
+        row_group_size: int = 5000,
+        target_shard_bytes: int = 67108864,
+    ) -> None:
+        self.output_dir = output_dir
+        self.prefix = prefix
+        self.schema = schema
+        self.row_group_size = row_group_size
+        self.target_shard_bytes = target_shard_bytes
+
+        self.shard_index = 0
+        self.current_rows: list[dict[str, Any]] = []
+        self.current_tmp_path: Path | None = None
+        self.current_final_name: str | None = None
+        self.current_writer: pq.ParquetWriter | None = None
+        self.current_shard_rows = 0
+        self.completed_shards: list[dict[str, Any]] = []
+
+    def _open_new_shard(self) -> None:
+        self.current_final_name = f"{self.prefix}_{self.shard_index:05d}.parquet"
+        self.current_tmp_path = self.output_dir / f"{self.current_final_name}.tmp_{uuid.uuid4().hex}"
+        self.current_writer = pq.ParquetWriter(
+            str(self.current_tmp_path),
+            self.schema,
+            compression="SNAPPY",
+        )
+        self.current_shard_rows = 0
+
+    def add_row(self, row_dict: dict[str, Any]) -> tuple[str, int]:
+        """Appends a row. Returns (shard_filename, row_index_in_shard)."""
+        if self.current_writer is None:
+            self._open_new_shard()
+
+        row_idx = self.current_shard_rows
+        self.current_rows.append(row_dict)
+        self.current_shard_rows += 1
+
+        if len(self.current_rows) >= self.row_group_size:
+            self._flush_batch()
+
+        # Check file size for shard rotation
+        if self.current_tmp_path and self.current_tmp_path.exists():
+            if self.current_tmp_path.stat().st_size >= self.target_shard_bytes:
+                self._rotate_shard()
+
+        assert self.current_final_name is not None
+        return self.current_final_name, row_idx
+
+    def _flush_batch(self) -> None:
+        if not self.current_rows or self.current_writer is None:
+            return
+        batch = pa.RecordBatch.from_pylist(self.current_rows, schema=self.schema)
+        self.current_writer.write_batch(batch)
+        self.current_rows.clear()
+
+    def _rotate_shard(self) -> None:
+        self._flush_batch()
+        if self.current_writer is not None:
+            self.current_writer.close()
+            self.current_writer = None
+
+        if self.current_tmp_path and self.current_tmp_path.exists():
+            final_path = self.output_dir / self.current_final_name
+            # Atomically rename
+            self.current_tmp_path.replace(final_path)
+
+            file_bytes = final_path.stat().st_size
+            file_hash = hashlib.sha256(final_path.read_bytes()).hexdigest()
+            self.completed_shards.append({
+                "path": self.current_final_name,
+                "sha256": file_hash,
+                "type": self.prefix,
+                "rows": self.current_shard_rows,
+                "bytes": file_bytes,
+            })
+            self.shard_index += 1
+
+    def close(self) -> list[dict[str, Any]]:
+        self._flush_batch()
+        if self.current_writer is not None:
+            self.current_writer.close()
+            self.current_writer = None
+
+        if self.current_tmp_path and self.current_tmp_path.exists():
+            final_path = self.output_dir / self.current_final_name
+            self.current_tmp_path.replace(final_path)
+
+            file_bytes = final_path.stat().st_size
+            file_hash = hashlib.sha256(final_path.read_bytes()).hexdigest()
+            self.completed_shards.append({
+                "path": self.current_final_name,
+                "sha256": file_hash,
+                "type": self.prefix,
+                "rows": self.current_shard_rows,
+                "bytes": file_bytes,
+            })
+            self.shard_index += 1
+
+        return self.completed_shards
+
+
+class FallbackLanguageDetector:
+    """Heuristic detector when fasttext model file is not present."""
+
+    def detect(self, text: str) -> tuple[str, float]:
+        if not text.strip():
+            return ("und", 0.0)
+        # Check Chinese characters
+        if any("\u4e00" <= char <= "\u9fff" for char in text):
+            return ("zh", 0.98)
+        # Check Vietnamese diacritics
+        vi_chars = set("àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ")
+        if any(c in vi_chars for c in text.lower()):
+            return ("vi", 0.96)
+        return ("en", 0.85)
+
+
+def build_snapshot(
+    registry: SourceRegistry,
+    config: SnapshotConfig,
+    raw_root: Path | None = None,
+    extraction_config: ExtractionConfig | None = None,
+    chunk_config: ChunkConfig | None = None,
+    dense_tokenizer: Any = None,
+    reranker_tokenizer: Any = None,
+    language_detector: LanguageDetector | None = None,
+    queries_path: Path | None = None,
+) -> SnapshotManifest:
+    """Builds an immutable frozen snapshot from a SourceRegistry with atomic publication and shard rotation."""
+    snapshot_dir = config.snapshot_root / config.name
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    ext_cfg = extraction_config or ExtractionConfig()
+    chk_cfg = chunk_config or config.chunk_config or ChunkConfig()
+
+    # Determine language detector
+    if language_detector is None:
+        if ext_cfg.language_model_path.exists():
+            language_detector = FastTextLanguageDetector(ext_cfg.language_model_path)
+        else:
+            language_detector = FallbackLanguageDetector()
+
+    # Setup sharded writers
+    doc_writer = ShardedParquetWriter(
+        output_dir=snapshot_dir,
+        prefix="documents",
+        schema=DOCUMENTS_SCHEMA,
+        row_group_size=config.parquet_row_group_size,
+        target_shard_bytes=config.target_shard_bytes,
+    )
+    chunk_writer = ShardedParquetWriter(
+        output_dir=snapshot_dir,
+        prefix="chunks",
+        schema=CHUNKS_SCHEMA,
+        row_group_size=config.parquet_row_group_size,
+        target_shard_bytes=config.target_shard_bytes,
+    )
+
+    import sqlite3
+    lookup_db_path = snapshot_dir / "lookup.sqlite"
+    lookup_conn = sqlite3.connect(str(lookup_db_path))
+    with lookup_conn:
+        lookup_conn.execute("PRAGMA journal_mode = WAL;")
+        lookup_conn.execute("CREATE TABLE IF NOT EXISTS official_docs (doc_id INTEGER PRIMARY KEY);")
+        lookup_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_locations (
+                doc_id INTEGER PRIMARY KEY,
+                shard TEXT NOT NULL,
+                row_idx INTEGER NOT NULL
+            );
+            """
+        )
+        lookup_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chunk_locations (
+                chunk_id TEXT PRIMARY KEY,
+                doc_id INTEGER NOT NULL,
+                shard TEXT NOT NULL,
+                row_idx INTEGER NOT NULL
+            );
+            """
+        )
+
+    all_registered_doc_ids: list[int] = []
+    ready_doc_ids: list[int] = []
+    language_counts: dict[str, int] = Counter()
+    quarantine_counts: dict[str, int] = Counter()
+    chunk_count = 0
+
+    try:
+        # Fetch all sources and their fetch jobs from registry
+        cursor = registry.conn.execute(
+            """
+            SELECT s.doc_id, s.original_url, s.fetch_job_id,
+                   f.state, f.raw_path, f.raw_sha256, f.mime_type, f.http_status
+            FROM sources s
+            LEFT JOIN fetch_jobs f ON s.fetch_job_id = f.job_id
+            ORDER BY s.doc_id ASC
+            """
+        )
+        rows = cursor.fetchall()
+
+        official_doc_tuples = [(r[0],) for r in rows]
+        with lookup_conn:
+            lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_tuples)
+
+        doc_loc_batch: list[tuple[int, str, int]] = []
+        chunk_loc_batch: list[tuple[str, int, str, int]] = []
+
+        for doc_id, original_url, job_id, state, raw_path_str, raw_sha256, mime_type, http_status in rows:
+            all_registered_doc_ids.append(doc_id)
+
+            if state != "fetched" or not raw_path_str or not raw_sha256:
+                continue
+
+            raw_path = Path(raw_path_str)
+            if not raw_path.exists() and raw_root is not None:
+                candidate = raw_root / raw_path_str
+                if candidate.exists():
+                    raw_path = candidate
+
+            if not raw_path.exists():
+                logger.warning(f"Raw file {raw_path_str} not found for doc {doc_id}")
+                continue
+
+            # Read raw content
+            if str(raw_path).endswith(".gz"):
+                with gzip.open(raw_path, "rb") as gf:
+                    raw_bytes = gf.read()
+            else:
+                raw_bytes = raw_path.read_bytes()
+
+            # Hash verification
+            computed_raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+            if computed_raw_sha != raw_sha256:
+                raise ValueError(
+                    f"Raw SHA256 mismatch for doc {doc_id}: expected {raw_sha256}, got {computed_raw_sha}"
+                )
+
+            # Extract document
+            extracted_doc = extract_document(
+                doc_id=doc_id,
+                raw=raw_bytes,
+                mime_type=mime_type or "text/html",
+                raw_sha256=raw_sha256,
+                config=ext_cfg,
+            )
+
+            # Classify quality
+            quality = classify_quality(extracted_doc, language_detector, ext_cfg)
+
+            if quality.state == "ready":
+                # Finalize extracted document with verified language
+                ready_doc = ExtractedDocument(
+                    doc_id=extracted_doc.doc_id,
+                    source_version=extracted_doc.source_version,
+                    source_text=extracted_doc.source_text,
+                    source_sha256=extracted_doc.source_sha256,
+                    raw_sha256=extracted_doc.raw_sha256,
+                    title=extracted_doc.title,
+                    language=quality.language,
+                    blocks=extracted_doc.blocks,
+                    quality_flags=quality.flags,
+                )
+
+                # Write ready document to parquet shard
+                blocks_data = [
+                    {
+                        "block_index": b.block_index,
+                        "kind": b.kind,
+                        "start_char": b.start_char,
+                        "end_char": b.end_char,
+                        "section": b.section,
+                    }
+                    for b in ready_doc.blocks
+                ]
+                doc_row = {
+                    "doc_id": ready_doc.doc_id,
+                    "source_version": ready_doc.source_version,
+                    "source_text": ready_doc.source_text,
+                    "source_sha256": ready_doc.source_sha256,
+                    "raw_sha256": ready_doc.raw_sha256,
+                    "title": ready_doc.title,
+                    "language": ready_doc.language,
+                    "blocks_json": json.dumps(blocks_data, ensure_ascii=False),
+                    "quality_flags_json": json.dumps(list(ready_doc.quality_flags), ensure_ascii=False),
+                }
+                doc_shard_name, doc_row_idx = doc_writer.add_row(doc_row)
+                doc_loc_batch.append((ready_doc.doc_id, doc_shard_name, doc_row_idx))
+                ready_doc_ids.append(ready_doc.doc_id)
+                language_counts[ready_doc.language] += 1
+
+                # Generate SpanChunks
+                spans = list(chunk_source_document(ready_doc, dense_tokenizer, reranker_tokenizer, chk_cfg))
+                for sp in spans:
+                    chunk_row = {
+                        "chunk_id": sp.chunk_id,
+                        "doc_id": sp.doc_id,
+                        "source_version": sp.source_version,
+                        "source_sha256": sp.source_sha256,
+                        "start_char": sp.start_char,
+                        "end_char": sp.end_char,
+                        "chunk_index": sp.chunk_index,
+                        "language": sp.language,
+                        "section": sp.section,
+                        "text": sp.text,
+                        "index_text": sp.index_text,
+                        "dense_token_count": sp.dense_token_count,
+                        "reranker_token_count": sp.reranker_token_count,
+                    }
+                    chunk_shard_name, chunk_row_idx = chunk_writer.add_row(chunk_row)
+                    chunk_loc_batch.append((sp.chunk_id, sp.doc_id, chunk_shard_name, chunk_row_idx))
+                    chunk_count += 1
+            else:
+                for flg in quality.flags:
+                    quarantine_counts[flg] += 1
+
+            # Commit batches to lookup db periodically
+            if len(doc_loc_batch) >= 500:
+                with lookup_conn:
+                    lookup_conn.executemany(
+                        "INSERT OR REPLACE INTO document_locations (doc_id, shard, row_idx) VALUES (?, ?, ?)",
+                        doc_loc_batch,
+                    )
+                    lookup_conn.executemany(
+                        "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx) VALUES (?, ?, ?, ?)",
+                        chunk_loc_batch,
+                    )
+                doc_loc_batch.clear()
+                chunk_loc_batch.clear()
+
+        # Final commit to lookup db
+        if doc_loc_batch or chunk_loc_batch:
+            with lookup_conn:
+                lookup_conn.executemany(
+                    "INSERT OR REPLACE INTO document_locations (doc_id, shard, row_idx) VALUES (?, ?, ?)",
+                    doc_loc_batch,
+                )
+                lookup_conn.executemany(
+                    "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx) VALUES (?, ?, ?, ?)",
+                    chunk_loc_batch,
+                )
+            doc_loc_batch.clear()
+            chunk_loc_batch.clear()
+
+        # Close writers and finalize all shards
+        completed_doc_shards = doc_writer.close()
+        completed_chunk_shards = chunk_writer.close()
+        all_shards = completed_doc_shards + completed_chunk_shards
+
+    finally:
+        lookup_conn.close()
+
+    # Calculate fingerprints and metadata
+    created_at = datetime.now(timezone.utc).isoformat()
+    ingest_state = registry.get_ingest_state()
+    registry_sha256 = ingest_state[0] if ingest_state else hashlib.sha256(b"").hexdigest()
+
+    queries_sha256 = hashlib.sha256(b"").hexdigest()
+    if queries_path and Path(queries_path).exists():
+        queries_sha256 = hashlib.sha256(Path(queries_path).read_bytes()).hexdigest()
+
+    membership_repr = "".join(f"{doc_id}\n" for doc_id in sorted(ready_doc_ids)).encode("utf-8")
+    source_membership_sha256 = hashlib.sha256(membership_repr).hexdigest()
+
+    extractor_fingerprint = hashlib.sha256(
+        f"{ext_cfg.html_backend}:{ext_cfg.pdf_backend}:{ext_cfg.language_confidence_min}".encode("utf-8")
+    ).hexdigest()
+
+    chunker_fingerprint = hashlib.sha256(
+        f"{chk_cfg.strategy_type}:{chk_cfg.body_max_tokens}:{chk_cfg.long_block_overlap_tokens}:{chk_cfg.contextual_header_max_tokens}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+    manifest = SnapshotManifest(
+        snapshot_id=config.name,
+        created_at=created_at,
+        registry_sha256=registry_sha256,
+        queries_sha256=queries_sha256,
+        source_membership_sha256=source_membership_sha256,
+        extractor_fingerprint=extractor_fingerprint,
+        chunker_fingerprint=chunker_fingerprint,
+        source_count=len(all_registered_doc_ids),
+        ready_document_count=len(ready_doc_ids),
+        chunk_count=chunk_count,
+        language_counts=dict(language_counts),
+        quarantine_counts=dict(quarantine_counts),
+        shard_paths_and_hashes=all_shards,
+    )
+
+    # Publish manifest atomically last
+    manifest_tmp = snapshot_dir / f"manifest.json.tmp_{uuid.uuid4().hex}"
+    with open(manifest_tmp, "w", encoding="utf-8") as f:
+        json.dump(asdict(manifest), f, indent=2, ensure_ascii=False)
+    manifest_final = snapshot_dir / "manifest.json"
+    manifest_tmp.replace(manifest_final)
+
+    logger.info(
+        f"Snapshot '{config.name}' published successfully: {len(ready_doc_ids)} docs, "
+        f"{chunk_count} chunks across {len(all_shards)} shards."
+    )
+
+    return manifest

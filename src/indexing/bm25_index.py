@@ -2,7 +2,7 @@ import json
 import pickle
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from src.data.schemas import ChunkRecord, DocumentRecord
 from src.indexing.tokenizers import get_tokenizer
@@ -60,16 +60,22 @@ class BM25Indexer:
 
     def build_indexes(
         self,
-        documents: Sequence[DocumentRecord],
-        chunks: Sequence[ChunkRecord],
+        documents: Sequence[DocumentRecord] | Iterable[DocumentRecord],
+        chunks: Sequence[ChunkRecord] | Iterable[ChunkRecord],
         output_dir: Path | str,
+        snapshot_id: str | None = None,
+        source_membership_sha256: str | None = None,
+        chunker_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         """Build partitioned BM25 indexes for documents and chunks.
 
         Args:
-            documents: List/Sequence of DocumentRecord items.
-            chunks: List/Sequence of ChunkRecord items.
+            documents: List/Sequence or Iterable of DocumentRecord items.
+            chunks: List/Sequence or Iterable of ChunkRecord items.
             output_dir: Directory where indexes and metadata will be saved.
+            snapshot_id: Optional snapshot identifier for provenance tracking.
+            source_membership_sha256: Optional checksum of source documents.
+            chunker_fingerprint: Optional chunker configuration fingerprint.
 
         Returns:
             Dictionary containing the index manifest.
@@ -78,12 +84,16 @@ class BM25Indexer:
         output_path.mkdir(parents=True, exist_ok=True)
 
         docs_by_lang: dict[str, list[DocumentRecord]] = defaultdict(list)
+        total_docs = 0
         for doc in documents:
             docs_by_lang[doc.language].append(doc)
+            total_docs += 1
 
         chunks_by_lang: dict[str, list[ChunkRecord]] = defaultdict(list)
+        total_chunks = 0
         for chunk in chunks:
             chunks_by_lang[chunk.language].append(chunk)
+            total_chunks += 1
 
         # Standard languages plus any custom languages present in corpus
         languages = sorted(set(self.DEFAULT_TOKENIZERS.keys()) | set(docs_by_lang.keys()) | set(chunks_by_lang.keys()))
@@ -92,6 +102,17 @@ class BM25Indexer:
             "backend": self.backend,
             "tokenizers_config": self.tokenizers_config,
             "partitions": {},
+        }
+        if snapshot_id is not None:
+            manifest["snapshot_id"] = snapshot_id
+        if source_membership_sha256 is not None:
+            manifest["source_membership_sha256"] = source_membership_sha256
+        if chunker_fingerprint is not None:
+            manifest["chunker_fingerprint"] = chunker_fingerprint
+
+        manifest["resource_estimate"] = {
+            "total_documents": total_docs,
+            "total_chunks": total_chunks,
         }
 
         for lang in languages:

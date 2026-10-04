@@ -1,7 +1,8 @@
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
@@ -110,14 +111,23 @@ class DenseIndexer:
 
     def build_index(
         self,
-        chunks: Sequence[ChunkRecord],
+        chunks: Sequence[ChunkRecord] | Iterable[ChunkRecord],
         output_dir: Path | str,
+        snapshot_id: str | None = None,
+        source_membership_sha256: str | None = None,
+        chunker_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         """Build partitioned dense vector indexes for chunks.
 
+        Supports streaming Iterable[ChunkRecord] consuming chunks in a single pass
+        and encoding in bounded batches without materializing all texts in memory.
+
         Args:
-            chunks: Sequence of ChunkRecord items.
+            chunks: Sequence or Iterable of ChunkRecord items.
             output_dir: Directory where indexes and metadata will be saved.
+            snapshot_id: Optional snapshot identifier for provenance tracking.
+            source_membership_sha256: Optional checksum of source documents.
+            chunker_fingerprint: Optional chunker configuration fingerprint.
 
         Returns:
             Dictionary containing the index manifest.
@@ -125,13 +135,54 @@ class DenseIndexer:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        chunks_by_lang: dict[str, list[ChunkRecord]] = defaultdict(list)
-        for chunk in chunks:
-            chunks_by_lang[chunk.language].append(chunk)
-
-        languages = sorted(set(self.DEFAULT_LANGUAGES) | set(chunks_by_lang.keys()))
         encoder = self._get_encoder()
         passage_prefix = self.instruction_prefix.get("passage", "")
+
+        # Stream and accumulate in per-language buffers of batch_size
+        buffers: dict[str, list[ChunkRecord]] = defaultdict(list)
+        embeddings_by_lang: dict[str, list[np.ndarray]] = defaultdict(list)
+        metadata_by_lang: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        all_chunk_ids_ordered: list[str] = []
+
+        def flush_buffer(lang: str) -> None:
+            buf = buffers[lang]
+            if not buf:
+                return
+            texts_to_encode = [
+                f"{passage_prefix}{c.text}" if passage_prefix else c.text
+                for c in buf
+            ]
+            batch_emb = _encode_texts(
+                encoder=encoder,
+                texts=texts_to_encode,
+                batch_size=self.batch_size,
+                normalize_embeddings=self.normalize_embeddings,
+            )
+            if batch_emb.size > 0:
+                embeddings_by_lang[lang].append(batch_emb)
+            for c in buf:
+                metadata_by_lang[lang].append({
+                    "chunk_id": c.chunk_id,
+                    "doc_id": c.doc_id,
+                    "language": c.language,
+                    "chunk_index": c.chunk_index,
+                })
+            buf.clear()
+
+        for chunk in chunks:
+            all_chunk_ids_ordered.append(chunk.chunk_id)
+            lang = chunk.language
+            buffers[lang].append(chunk)
+            if len(buffers[lang]) >= self.batch_size:
+                flush_buffer(lang)
+
+        # Flush any remaining chunks in buffers
+        for lang in list(buffers.keys()):
+            flush_buffer(lang)
+
+        # Union of default languages and any seen languages
+        seen_langs = set(embeddings_by_lang.keys()) | set(metadata_by_lang.keys())
+        languages = sorted(set(self.DEFAULT_LANGUAGES) | seen_langs)
 
         manifest: dict[str, Any] = {
             "backend": self.backend,
@@ -141,29 +192,37 @@ class DenseIndexer:
             "dim": None,
             "partitions": {},
         }
+        if snapshot_id is not None:
+            manifest["snapshot_id"] = snapshot_id
+        if source_membership_sha256 is not None:
+            manifest["source_membership_sha256"] = source_membership_sha256
+        if chunker_fingerprint is not None:
+            manifest["chunker_fingerprint"] = chunker_fingerprint
+
+        mapping_repr = "".join(f"{i}:{cid}\n" for i, cid in enumerate(all_chunk_ids_ordered)).encode("utf-8")
+        manifest["vector_chunk_mapping_hash"] = hashlib.sha256(mapping_repr).hexdigest()
 
         embedding_dim: int | None = None
+        total_vectors = 0
 
         for lang in languages:
-            lang_chunks = chunks_by_lang.get(lang, [])
-            if not lang_chunks:
+            meta_records = metadata_by_lang.get(lang, [])
+            emb_batches = embeddings_by_lang.get(lang, [])
+
+            if not meta_records:
                 manifest["partitions"][lang] = {
                     "count": 0,
                     "language": lang,
                 }
                 continue
 
-            texts_to_encode = [
-                f"{passage_prefix}{c.text}" if passage_prefix else c.text
-                for c in lang_chunks
-            ]
+            if emb_batches:
+                embeddings = np.concatenate(emb_batches, axis=0)
+            else:
+                embeddings = np.empty((0, 0), dtype=np.float32)
 
-            embeddings = _encode_texts(
-                encoder=encoder,
-                texts=texts_to_encode,
-                batch_size=self.batch_size,
-                normalize_embeddings=self.normalize_embeddings,
-            )
+            count = len(meta_records)
+            total_vectors += count
 
             if embeddings.ndim == 2 and embeddings.shape[0] > 0:
                 embedding_dim = int(embeddings.shape[1])
@@ -187,19 +246,22 @@ class DenseIndexer:
             # Save metadata jsonl: chunk_id, doc_id, language, chunk_index
             metadata_file = output_path / f"metadata_{lang}.jsonl"
             with open(metadata_file, "w", encoding="utf-8") as f:
-                for c in lang_chunks:
-                    rec = {
-                        "chunk_id": c.chunk_id,
-                        "doc_id": c.doc_id,
-                        "language": c.language,
-                        "chunk_index": c.chunk_index,
-                    }
+                for rec in meta_records:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
             manifest["partitions"][lang] = {
-                "count": len(lang_chunks),
+                "count": count,
                 "language": lang,
             }
+
+        # Resource estimation
+        dim_val = embedding_dim or 0
+        manifest["resource_estimate"] = {
+            "vector_count": total_vectors,
+            "dim": dim_val,
+            "bytes_per_vector": dim_val * 4,
+            "estimated_vector_ram_bytes": total_vectors * dim_val * 4,
+        }
 
         # Write manifest.json
         manifest_file = output_path / "manifest.json"
