@@ -2,7 +2,11 @@
 
 from src.evaluation.calibrator import CalibrationState, CutoffCalibrator
 from src.evaluation.dev_records import load_dev_records
-from src.evaluation.error_analysis import generate_error_analysis_report
+from src.evaluation.error_analysis import (
+    build_error_breakdown,
+    generate_error_analysis_report,
+    generate_error_breakdown_summary,
+)
 from src.evaluation.metrics import (
     calculate_f2,
     calculate_precision_recall_fbeta,
@@ -36,6 +40,8 @@ __all__ = [
     "CutoffCalibrator",
     "CalibrationState",
     "generate_error_analysis_report",
+    "build_error_breakdown",
+    "generate_error_breakdown_summary",
     "load_dev_records",
     "normalize_eval_text",
     "tokenize_eval_text",

@@ -108,6 +108,8 @@ class ReferenceChunk:
     """Reference chunk in development qrels."""
     doc_id: int
     chunk_text: str
+    char_start: int | None = None
+    char_end: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.doc_id, bool) or not isinstance(self.doc_id, int):
@@ -116,6 +118,14 @@ class ReferenceChunk:
             raise ValueError(f"doc_id out of signed int64 range: {self.doc_id}")
         if not isinstance(self.chunk_text, str) or not self.chunk_text.strip():
             raise ValueError(f"chunk_text must be non-empty string, got {self.chunk_text!r}")
+        if self.char_start is not None:
+            if isinstance(self.char_start, bool) or not isinstance(self.char_start, int) or self.char_start < 0:
+                raise ValueError(f"char_start must be non-negative int, got {self.char_start!r}")
+        if self.char_end is not None:
+            if isinstance(self.char_end, bool) or not isinstance(self.char_end, int) or self.char_end < 0:
+                raise ValueError(f"char_end must be non-negative int, got {self.char_end!r}")
+            if self.char_start is not None and self.char_end < self.char_start:
+                raise ValueError(f"char_end ({self.char_end}) cannot be less than char_start ({self.char_start})")
 
 
 @dataclass(frozen=True)
@@ -130,6 +140,10 @@ class DevQueryMetadata:
     split: str
     pool_version: str
     judgment_coverage: float
+
+    def __post_init__(self) -> None:
+        if isinstance(self.source_doc_ids, list):
+            object.__setattr__(self, "source_doc_ids", tuple(self.source_doc_ids))
 
 
 @dataclass(frozen=True)
@@ -379,6 +393,32 @@ class RetrievalTrace:
     final_doc_ids: frozenset[int]
     final_chunk_ids: tuple[str, ...]
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ErrorBreakdown:
+    """Fine-grained retrieval and evidence error breakdown with provenance."""
+    query_id: int
+    missing_source_docs: tuple[int, ...]
+    missing_candidate_docs: tuple[int, ...]
+    lost_after_rerank_docs: tuple[int, ...]
+    lost_after_cutoff_docs: tuple[int, ...]
+    missing_chunk_refs: tuple[ReferenceChunk, ...]
+    evidence_missing_given_doc: tuple[ReferenceChunk, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.missing_source_docs, list):
+            object.__setattr__(self, "missing_source_docs", tuple(self.missing_source_docs))
+        if isinstance(self.missing_candidate_docs, list):
+            object.__setattr__(self, "missing_candidate_docs", tuple(self.missing_candidate_docs))
+        if isinstance(self.lost_after_rerank_docs, list):
+            object.__setattr__(self, "lost_after_rerank_docs", tuple(self.lost_after_rerank_docs))
+        if isinstance(self.lost_after_cutoff_docs, list):
+            object.__setattr__(self, "lost_after_cutoff_docs", tuple(self.lost_after_cutoff_docs))
+        if isinstance(self.missing_chunk_refs, list):
+            object.__setattr__(self, "missing_chunk_refs", tuple(self.missing_chunk_refs))
+        if isinstance(self.evidence_missing_given_doc, list):
+            object.__setattr__(self, "evidence_missing_given_doc", tuple(self.evidence_missing_given_doc))
 
 
 class SubmissionChunk(TypedDict):

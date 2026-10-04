@@ -6,7 +6,17 @@ from pathlib import Path
 from typing import Sequence
 
 from src.data.schemas import FinalPrediction, GroundTruthRecord, QueryRecord
+from src.data.vibiomir_contracts import (
+    ErrorBreakdown,
+    EvaluationProfile,
+    EvaluationRecord,
+    ReferenceChunk,
+    RetrievalTrace,
+    SourceStore,
+)
 from src.evaluation.metrics import calculate_precision_recall_fbeta
+from src.evaluation.vibiomir_metrics import PROVISIONAL_SPEC_V1_PROFILE
+from src.evaluation.vibiomir_text import TextMatchProfile, TextOverlapEvaluator
 
 
 def generate_error_analysis_report(
@@ -203,4 +213,161 @@ def generate_error_analysis_report(
         "per_query_metrics": per_query_path,
         "error_cases": error_cases_path,
         "summary": summary_path,
+    }
+
+
+def build_error_breakdown(
+    trace: RetrievalTrace,
+    gold: EvaluationRecord,
+    store: SourceStore,
+    profile: EvaluationProfile | None = None,
+) -> ErrorBreakdown:
+    """Build fine-grained retrieval and evidence error breakdown with provenance.
+
+    Traces each failure location:
+    - missing_source_docs: Gold doc missing from SourceStore
+    - missing_candidate_docs: Gold doc in SourceStore but not in candidate_doc_ids
+    - lost_after_rerank_docs: Gold doc in candidate_doc_ids but not in reranked_doc_ids
+    - lost_after_cutoff_docs: Gold doc in reranked_doc_ids but not in final_doc_ids
+    - missing_chunk_refs: Gold reference chunks not matched by predicted chunks
+    - evidence_missing_given_doc: Gold chunks missed where parent doc was in final_doc_ids
+
+    Args:
+        trace: Candidate score trajectory and retrieved IDs for the query.
+        gold: Evaluation record containing ground truth doc IDs and reference chunks.
+        store: SourceStore containing frozen snapshot documents and chunks.
+        profile: Evaluation profile for text matching (defaults to PROVISIONAL_SPEC_V1_PROFILE).
+
+    Returns:
+        ErrorBreakdown detailing all document drop stages and missing evidence chunks.
+    """
+    if gold.query_id != trace.query_id:
+        raise ValueError(
+            f"Gold query_id ({gold.query_id}) does not match trace query_id ({trace.query_id})"
+        )
+
+    # 1. Document Drop Funnel
+    missing_source_docs: list[int] = []
+    missing_candidate_docs: list[int] = []
+    lost_after_rerank_docs: list[int] = []
+    lost_after_cutoff_docs: list[int] = []
+
+    for doc_id in sorted(gold.relevant_doc_ids):
+        if not store.contains_official_doc(doc_id):
+            missing_source_docs.append(doc_id)
+        elif doc_id not in trace.candidate_doc_ids:
+            missing_candidate_docs.append(doc_id)
+        elif doc_id not in trace.reranked_doc_ids:
+            lost_after_rerank_docs.append(doc_id)
+        elif doc_id not in trace.final_doc_ids:
+            lost_after_cutoff_docs.append(doc_id)
+
+    # 2. Predicted Chunks Resolution
+    pred_chunks: list[tuple[int, str]] = []
+    if (
+        trace.metadata
+        and "predicted_chunks" in trace.metadata
+        and trace.metadata["predicted_chunks"] is not None
+    ):
+        for item in trace.metadata["predicted_chunks"]:
+            if isinstance(item, dict):
+                p_doc_id = int(item["doc_id"])
+                p_text = str(item.get("chunk_text", ""))
+            else:
+                p_doc_id = int(getattr(item, "doc_id"))
+                p_text = str(getattr(item, "chunk_text", ""))
+            pred_chunks.append((p_doc_id, p_text))
+    elif trace.final_chunk_ids:
+        for cid in trace.final_chunk_ids:
+            try:
+                chunk = store.get_chunk(cid)
+                pred_chunks.append((int(chunk.doc_id), str(chunk.text)))
+            except Exception:
+                pass
+
+    # 3. Text Overlap Evaluator Setup
+    if profile is None:
+        eval_profile = PROVISIONAL_SPEC_V1_PROFILE
+    else:
+        eval_profile = profile
+
+    if hasattr(eval_profile, "tokenizer_name") and hasattr(eval_profile, "threshold"):
+        text_profile = TextMatchProfile(
+            tokenizer_name=eval_profile.tokenizer_name,
+            normalization_version=eval_profile.normalization_version,
+            overlap_threshold=eval_profile.threshold,
+        )
+        evaluator = TextOverlapEvaluator(profile=text_profile)
+    elif isinstance(eval_profile, TextMatchProfile):
+        evaluator = TextOverlapEvaluator(profile=eval_profile)
+    else:
+        evaluator = TextOverlapEvaluator()
+
+    # 4. Reference Chunk Matching
+    missing_chunk_refs: list[ReferenceChunk] = []
+    evidence_missing_given_doc: list[ReferenceChunk] = []
+
+    for ref in gold.relevant_chunks:
+        matched = False
+        for p_doc_id, p_text in pred_chunks:
+            if p_doc_id == ref.doc_id and evaluator.matches(p_text, ref.chunk_text):
+                matched = True
+                break
+
+        if not matched:
+            missing_chunk_refs.append(ref)
+            if ref.doc_id in trace.final_doc_ids:
+                evidence_missing_given_doc.append(ref)
+
+    return ErrorBreakdown(
+        query_id=trace.query_id,
+        missing_source_docs=tuple(missing_source_docs),
+        missing_candidate_docs=tuple(missing_candidate_docs),
+        lost_after_rerank_docs=tuple(lost_after_rerank_docs),
+        lost_after_cutoff_docs=tuple(lost_after_cutoff_docs),
+        missing_chunk_refs=tuple(missing_chunk_refs),
+        evidence_missing_given_doc=tuple(evidence_missing_given_doc),
+    )
+
+
+def generate_error_breakdown_summary(
+    breakdowns: Sequence[ErrorBreakdown],
+) -> dict[str, Any]:
+    """Generate aggregate dataset-level summary of retrieval and evidence failures.
+
+    Args:
+        breakdowns: Sequence of ErrorBreakdown objects.
+
+    Returns:
+        Summary dict containing totals, query-level loss counts, and breakdown metrics.
+    """
+    total_queries = len(breakdowns)
+    total_missing_source = sum(len(b.missing_source_docs) for b in breakdowns)
+    total_missing_candidate = sum(len(b.missing_candidate_docs) for b in breakdowns)
+    total_lost_rerank = sum(len(b.lost_after_rerank_docs) for b in breakdowns)
+    total_lost_cutoff = sum(len(b.lost_after_cutoff_docs) for b in breakdowns)
+    total_missing_chunks = sum(len(b.missing_chunk_refs) for b in breakdowns)
+    total_evidence_missing_given_doc = sum(len(b.evidence_missing_given_doc) for b in breakdowns)
+
+    queries_missing_source = sum(1 for b in breakdowns if b.missing_source_docs)
+    queries_missing_candidate = sum(1 for b in breakdowns if b.missing_candidate_docs)
+    queries_lost_rerank = sum(1 for b in breakdowns if b.lost_after_rerank_docs)
+    queries_lost_cutoff = sum(1 for b in breakdowns if b.lost_after_cutoff_docs)
+    queries_missing_chunks = sum(1 for b in breakdowns if b.missing_chunk_refs)
+    queries_evidence_missing_given_doc = sum(1 for b in breakdowns if b.evidence_missing_given_doc)
+
+    return {
+        "total_queries": total_queries,
+        "total_missing_source_docs": total_missing_source,
+        "total_missing_candidate_docs": total_missing_candidate,
+        "total_lost_after_rerank_docs": total_lost_rerank,
+        "total_lost_after_cutoff_docs": total_lost_cutoff,
+        "total_missing_chunk_refs": total_missing_chunks,
+        "total_evidence_missing_given_doc": total_evidence_missing_given_doc,
+        "queries_with_missing_source": queries_missing_source,
+        "queries_with_missing_candidates": queries_missing_candidate,
+        "queries_with_rerank_losses": queries_lost_rerank,
+        "queries_with_cutoff_losses": queries_lost_cutoff,
+        "queries_with_missing_chunks": queries_missing_chunks,
+        "queries_with_evidence_missing_given_doc": queries_evidence_missing_given_doc,
     }
