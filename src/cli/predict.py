@@ -306,9 +306,11 @@ def run_predict(
         calibrator = CutoffCalibrator(beta=config.get("calibration", {}).get("beta", 2.0))
 
     consistency_mode = config.get("post_processing", {}).get("consistency_mode", "independent")
-    calib_bounds = config.get("calibration", {}).get("bounds", {})
-    default_doc_top_k = int(calib_bounds.get("documents", {}).get("min", 5))
-    default_chunk_top_k = int(calib_bounds.get("chunks", {}).get("min", 10))
+    calib_cfg = config.get("calibration", {})
+    fixed_k = calib_cfg.get("fixed_top_k", {})
+    calib_bounds = calib_cfg.get("bounds", {})
+    default_doc_top_k = int(fixed_k.get("documents") or calib_bounds.get("documents", {}).get("min") or 5)
+    default_chunk_top_k = int(fixed_k.get("chunks") or calib_bounds.get("chunks", {}).get("min") or 10)
 
     # 4. Compute run fingerprint
     index_manifests = []

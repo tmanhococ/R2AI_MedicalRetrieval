@@ -155,7 +155,7 @@ def main(args: list[str] | None = None) -> None:
     print(f"Snapshot ID:     {manifest.snapshot_id}")
     print(f"Ready Documents: {manifest.ready_document_count:,}")
     print(f"Total Chunks:    {manifest.chunk_count:,}")
-    print(f"Total Shards:    {len(manifest.shards)}")
+    print(f"Total Shards:    {len(manifest.shard_paths_and_hashes)}")
     print(f"Membership SHA:  {manifest.source_membership_sha256}")
     print(f"Elapsed Time:    {elapsed:.2f}s")
 

@@ -51,7 +51,16 @@ query_understanding:
     strip_clinical_boilerplate: false
     dense_strategy: full
 
+retrieval:
+  candidate_top_k: 200
+  bm25:
+    enabled: true
+    backend: bm25s
+  dense:
+    enabled: false
+
 reranker:
+  enabled: false
   max_length: 512
   query_window_tokens: 128
   query_window_overlap_tokens: 16
