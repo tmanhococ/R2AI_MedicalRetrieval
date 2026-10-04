@@ -44,19 +44,18 @@ CAPTCHA_SIGNATURES = [
     "ddos protection by cloudflare",
 ]
 
-SOFT_404_SIGNATURES = [
-    "404 not found",
-    "404 - không tìm thấy",
-    "404 không tìm thấy",
-    "không tìm thấy trang",
-    "trang không tìm thấy",
-    "trang bạn tìm kiếm không tồn tại",
-    "nội dung không tồn tại",
-    "bài viết không tồn tại",
-    "page not found",
-    "the page you are looking for does not exist",
-    "404 error",
-    "error 404",
+SOFT_404_PATTERNS = [
+    re.compile(r"\b404\s+(?:not\s+found|error)\b", re.IGNORECASE),
+    re.compile(r"\berror\s+404\b", re.IGNORECASE),
+    re.compile(r"\b404\s*-\s*không\s+tìm\s+thấy\b", re.IGNORECASE),
+    re.compile(r"\b404\s+không\s+tìm\s+thấy\b", re.IGNORECASE),
+    re.compile(r"\bpage\s+not\s+found\b", re.IGNORECASE),
+    re.compile(r"\bthe\s+page\s+you\s+are\s+looking\s+for\s+does\s+not\s+exist\b", re.IGNORECASE),
+    re.compile(r"\bkhông\s+tìm\s+thấy\s+trang(\s*(này|web|bạn yêu cầu|yêu cầu|\?|\.|$)|[.,!?:;]|$)", re.IGNORECASE),
+    re.compile(r"\btrang\s+(?:này\s+)?không\s+tìm\s+thấy\b", re.IGNORECASE),
+    re.compile(r"\btrang\s+bạn\s+tìm\s+kiếm\s+không\s+tồn\s+tại\b", re.IGNORECASE),
+    re.compile(r"\bnội\s+dung\s+không\s+tồn\s+tại\b", re.IGNORECASE),
+    re.compile(r"\bbài\s+viết\s+không\s+tồn\s+tại\b", re.IGNORECASE),
 ]
 
 
@@ -167,11 +166,24 @@ def classify_quality(
             break
 
     # 5. Check for soft-404 signatures
-    for sig in SOFT_404_SIGNATURES:
-        if sig in combined_lower:
-            flags.append("soft_404")
-            is_quarantined = True
+    headings_text = " ".join(
+        document.source_text[b.start_char : b.end_char]
+        for b in document.blocks
+        if b.kind == "heading"
+    ).lower()
+
+    is_soft_404 = False
+    for pat in SOFT_404_PATTERNS:
+        if pat.search(title_lower) or pat.search(headings_text):
+            is_soft_404 = True
             break
+        if len(clean_text) < 500 and pat.search(text_lower):
+            is_soft_404 = True
+            break
+
+    if is_soft_404:
+        flags.append("soft_404")
+        is_quarantined = True
 
     # 6. Check for short text (flag only, per plan section 5.3: not quarantined purely on brevity)
     if len(clean_text) < 150:

@@ -48,23 +48,32 @@ def _extract_html_title(tree) -> str | None:
 
 
 def _clean_non_content_tags(tree) -> None:
-    """Remove boilerplate non-content tags: nav, header, footer, scripts, etc."""
+    """Remove boilerplate non-content tags: nav, scripts, top-level site header/footer, etc."""
     tags_to_remove = (
         "script",
         "style",
         "noscript",
-        "nav",
-        "header",
-        "footer",
-        "aside",
         "svg",
         "iframe",
+        "nav",
+        "aside",
     )
     for tag in tags_to_remove:
         for el in tree.xpath(f"//{tag}"):
             parent = el.getparent()
             if parent is not None:
                 parent.remove(el)
+
+    # For header and footer: only remove site-level headers/footers,
+    # NOT semantic headers/footers nested inside <article> or <main>.
+    for tag in ("header", "footer"):
+        for el in tree.xpath(f"//{tag}"):
+            in_content = bool(el.xpath("ancestor::article | ancestor::main"))
+            is_banner_or_contentinfo = el.attrib.get("role") in ("banner", "contentinfo")
+            if not in_content or is_banner_or_contentinfo:
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
 
 
 def _parse_trafilatura_xml(xml_str: str) -> list[tuple[str, str | None, str]]:

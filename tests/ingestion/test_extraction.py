@@ -424,3 +424,74 @@ def test_build_extraction_report():
     assert report.flags_by_reason.get("captcha") == 1
     assert report.flags_by_reason.get("unsupported_language") == 1
     assert report.flags_by_reason.get("low_language_confidence") == 1
+
+
+def test_extract_html_article_with_header_inside_article():
+    """Verify that semantic <header> inside <article> is NOT pruned and its headings/leads are preserved."""
+    html_raw = b"""<!DOCTYPE html>
+<html>
+<head><title>Dieu tri HER2+</title></head>
+<body>
+  <header class="site-header">
+    <nav><a href="/">Trang chu</a></nav>
+  </header>
+  <main>
+    <article>
+      <header class="article-header">
+        <h1>Phac do dieu tri HER2+ tien xa</h1>
+        <p class="lead">Tong quan nghien cuu va danh gia hieu qua thuoc.</p>
+      </header>
+      <p>Ket qua cho thay ty le dap ung khach quan dat 68% sau lieu dau tien.</p>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <p>Ban quyen 2026</p>
+  </footer>
+</body>
+</html>"""
+    doc = extract_document(
+        doc_id=707,
+        raw=html_raw,
+        mime_type="text/html",
+        raw_sha256=hashlib.sha256(html_raw).hexdigest(),
+        config=ExtractionConfig(),
+    )
+
+    assert "Phac do dieu tri HER2+ tien xa" in doc.source_text
+    assert "Tong quan nghien cuu va danh gia hieu qua thuoc" in doc.source_text
+    assert "Ket qua cho thay ty le dap ung" in doc.source_text
+    # Ensure site-level header is stripped
+    assert "Trang chu" not in doc.source_text
+
+    for block in doc.blocks:
+        assert doc.source_text[block.start_char : block.end_char] != ""
+
+
+def test_quality_legitimate_medical_article_with_trang_thiet_bi_not_quarantined():
+    """Verify that text containing 'không tìm thấy trang thiết bị y tế' is NOT falsely quarantined as soft-404."""
+    article_html = """<!DOCTYPE html>
+<html>
+<head><title>Báo cáo khảo sát y tế tuyến cơ sở</title></head>
+<body>
+  <article>
+    <h1>Thực trạng cấp cứu và hồi sức tại các trạm y tế xã</h1>
+    <p>Trong quá trình khảo sát thực địa tại các trạm y tế vùng sâu vùng xa, đoàn kiểm tra ghi nhận tình trạng không tìm thấy trang thiết bị y tế đạt chuẩn cấp cứu hồi sức tim phổi. Tuy nhiên, việc bổ sung trang thiết bị đang được khẩn trương triển khai nhằm đảm bảo điều trị kịp thời cho các bệnh nhân suy hô hấp cấp.</p>
+    <p>Các giải pháp đồng bộ bao gồm đầu tư máy thở, máy sốc tim tự động và tập huấn kỹ năng xử trí tai biến tim mạch cho đội ngũ y bác sĩ tại chỗ.</p>
+  </article>
+</body>
+</html>""".encode("utf-8")
+
+    doc = extract_document(
+        doc_id=808,
+        raw=article_html,
+        mime_type="text/html",
+        raw_sha256=hashlib.sha256(article_html).hexdigest(),
+        config=ExtractionConfig(),
+    )
+
+    detector = StubLanguageDetector(language="vi", score=0.95)
+    qr = classify_quality(doc, detector)
+
+    assert qr.state == "ready"
+    assert "soft_404" not in qr.flags
+
