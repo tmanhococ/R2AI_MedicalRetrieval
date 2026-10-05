@@ -474,3 +474,82 @@ def test_full_hybrid_labels(tmp_path: Path):
     assert ledger_full.source_scope == "FULL_HYBRID"
     require_scope(ledger_full, "FULL_HYBRID")
     require_scope(ledger_full, "FULL_BODY_INDEX")
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Document index with empty hash rejected when full count
+# ---------------------------------------------------------------------------
+def test_doc_manifest_empty_hash_rejected_when_full_count(tmp_path: Path):
+    """Document index manifest with empty or missing membership hash MUST be rejected when count matches."""
+    db_path = tmp_path / "test_reg.db"
+    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 11)]
+    registry = _populate_registry(db_path, sources)
+
+    ready_ids = list(range(1, 11))
+    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=20)
+
+    # Empty membership_sha256 while member_count == 10
+    doc_index_empty_hash = _make_index_manifest(
+        item_type="document",
+        member_count=10,
+        membership_sha256="",
+    )
+    chunk_index = _make_index_manifest(item_type="chunk", member_count=20)
+
+    with pytest.raises(ScopeViolationError, match="membership hash mismatch"):
+        build_coverage_ledger(registry, snapshot, [doc_index_empty_hash, chunk_index])
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Registry ingest hash mismatch rejected
+# ---------------------------------------------------------------------------
+def test_registry_hash_mismatch_rejected(tmp_path: Path):
+    """Registry with divergent input_sha256 compared to snapshot MUST be rejected."""
+    mock_registry = MagicMock(spec=SourceRegistry)
+    mock_registry.conn = None
+    mock_registry.count_sources.return_value = 10
+    mock_registry.count_unique_urls.return_value = 10
+    mock_registry.get_ingest_state.return_value = ("divergent_hash_xyz", 10, True)
+
+    ready_ids = list(range(1, 11))
+    snapshot = _make_snapshot(ready_doc_ids=ready_ids, registry_sha256="expected_canonical_hash")
+
+    doc_index = _make_index_manifest(
+        item_type="document",
+        member_count=10,
+        membership_sha256=_compute_membership_sha(ready_ids),
+    )
+
+    with pytest.raises(ScopeViolationError, match="registry_sha256 mismatch"):
+        build_coverage_ledger(mock_registry, snapshot, [doc_index])
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Explicit scope check when target requires hybrid
+# ---------------------------------------------------------------------------
+def test_require_scope_explicit_scope_disallowed(tmp_path: Path):
+    """Target requiring FULL_HYBRID or FULL_HYBRID_WITH_GAPS must fail if ledger lacks hybrid."""
+    db_path = tmp_path / "test_reg.db"
+    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 11)]
+    registry = _populate_registry(db_path, sources)
+
+    ready_ids = list(range(1, 11))
+    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=20)
+    doc_index = _make_index_manifest(
+        member_count=10,
+        membership_sha256=_compute_membership_sha(ready_ids),
+    )
+    chunk_index = _make_index_manifest(item_type="chunk", member_count=20)
+
+    # Ledger is FULL_BODY_INDEX (no dense index, no reranker)
+    ledger = build_coverage_ledger(registry, snapshot, [doc_index, chunk_index])
+    assert ledger.source_scope == "FULL_BODY_INDEX"
+
+    # Requiring FULL_HYBRID must fail with explicit allowed scopes error
+    with pytest.raises(ScopeViolationError, match="requires one of"):
+        require_scope(ledger, "FULL_HYBRID")
+
+    # Requiring FULL_HYBRID_WITH_GAPS must also fail
+    with pytest.raises(ScopeViolationError, match="requires one of"):
+        require_scope(ledger, "FULL_HYBRID_WITH_GAPS")
+

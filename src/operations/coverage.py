@@ -56,6 +56,27 @@ _NORMALIZED_TARGETS = {
     "FULL_HYBRID": SCOPE_FULL_HYBRID,
 }
 
+ALLOWED_SCOPES_FOR_TARGET: dict[str, tuple[str, ...]] = {
+    SCOPE_PARTIAL_BODY_INDEX: VALID_SCOPES,
+    SCOPE_FULL_SOURCE_PASS_WITH_GAPS: (
+        SCOPE_FULL_SOURCE_PASS_WITH_GAPS,
+        SCOPE_FULL_BODY_INDEX,
+        SCOPE_FULL_HYBRID_WITH_GAPS,
+        SCOPE_FULL_HYBRID,
+    ),
+    SCOPE_FULL_BODY_INDEX: (
+        SCOPE_FULL_BODY_INDEX,
+        SCOPE_FULL_HYBRID,
+    ),
+    SCOPE_FULL_HYBRID_WITH_GAPS: (
+        SCOPE_FULL_HYBRID_WITH_GAPS,
+        SCOPE_FULL_HYBRID,
+    ),
+    SCOPE_FULL_HYBRID: (
+        SCOPE_FULL_HYBRID,
+    ),
+}
+
 
 def build_coverage_ledger(
     registry: SourceRegistry,
@@ -68,7 +89,8 @@ def build_coverage_ledger(
 
     Enforces invariants:
     1. index_manifest.snapshot_id == snapshot.snapshot_id
-    2. index_manifest (document) membership_sha256 matches snapshot.source_membership_sha256
+    2. index_manifest (document) membership_sha256 strictly non-empty and matches
+       snapshot.source_membership_sha256 when member_count >= ready_document_count
     3. official_count == ready_doc_count + terminal_gap_count + unresolved_count
     """
     # 1. Manifest invariants
@@ -81,9 +103,8 @@ def build_coverage_ledger(
         if (
             manifest.item_type == "document"
             and manifest.member_count >= snapshot.ready_document_count
-            and manifest.membership_sha256
         ):
-            if manifest.membership_sha256 != snapshot.source_membership_sha256:
+            if not manifest.membership_sha256 or manifest.membership_sha256 != snapshot.source_membership_sha256:
                 raise ScopeViolationError(
                     f"membership hash mismatch: index has '{manifest.membership_sha256}', "
                     f"expected '{snapshot.source_membership_sha256}'"
@@ -125,6 +146,16 @@ def build_coverage_ledger(
         )
         state_counts = dict(cursor.fetchall())
         terminal_gap_count = sum(cnt for st, cnt in state_counts.items() if st in TERMINAL_STATES)
+        unresolved_state_count = sum(
+            cnt for st, cnt in state_counts.items()
+            if st in UNRESOLVED_STATES or st is None or (st not in TERMINAL_STATES and st not in ("fetched", "content_ready", "ready"))
+        )
+        logger.debug(
+            "Registry state summary: terminal=%d, unresolved_db=%d, details=%s",
+            terminal_gap_count,
+            unresolved_state_count,
+            state_counts,
+        )
 
     unresolved_count = official_count - ready_doc_count - terminal_gap_count
     if unresolved_count < 0:
@@ -136,12 +167,19 @@ def build_coverage_ledger(
     # Invariant: official_count == ready_doc_count + terminal_gap_count + unresolved_count
     assert official_count == ready_doc_count + terminal_gap_count + unresolved_count
 
-    # Registry hash
+    # Registry hash verification
     reg_hash = ""
     try:
         ingest_state = registry.get_ingest_state()
         if ingest_state:
             reg_hash = ingest_state[0]
+            if snapshot.registry_sha256 and reg_hash and reg_hash != snapshot.registry_sha256:
+                raise ScopeViolationError(
+                    f"registry_sha256 mismatch: registry has '{reg_hash}', "
+                    f"expected snapshot '{snapshot.registry_sha256}'"
+                )
+    except ScopeViolationError:
+        raise
     except Exception:
         pass
     if not reg_hash:
@@ -215,17 +253,16 @@ def require_scope(ledger: CoverageLedger, target: str) -> None:
         )
 
     # Check terminal gaps requirement: FULL_BODY_INDEX and FULL_HYBRID do not allow gaps
-    if target_scope in (SCOPE_FULL_BODY_INDEX, SCOPE_FULL_HYBRID):
-        if ledger.terminal_gap_count > 0:
-            raise ScopeViolationError(
-                f"Scope violation: target '{target}' requires complete body coverage, "
-                f"but terminal gaps exist ({ledger.terminal_gap_count} gaps)."
-            )
+    if target_scope in (SCOPE_FULL_BODY_INDEX, SCOPE_FULL_HYBRID) and ledger.terminal_gap_count > 0:
+        raise ScopeViolationError(
+            f"Scope violation: target '{target}' requires complete body coverage, "
+            f"but terminal gaps exist ({ledger.terminal_gap_count} gaps)."
+        )
 
-    # Check hybrid requirement: FULL_HYBRID_WITH_GAPS and FULL_HYBRID require hybrid pipeline
-    if target_scope in (SCOPE_FULL_HYBRID_WITH_GAPS, SCOPE_FULL_HYBRID):
-        if ledger.source_scope not in (SCOPE_FULL_HYBRID_WITH_GAPS, SCOPE_FULL_HYBRID):
-            raise ScopeViolationError(
-                f"Scope violation: target '{target}' requires full hybrid pipeline (dense index and reranker), "
-                f"but actual scope is {ledger.source_scope}."
-            )
+    # Explicitly check that ledger.source_scope is in the allowed scopes for this target
+    allowed = ALLOWED_SCOPES_FOR_TARGET[target_scope]
+    if ledger.source_scope not in allowed:
+        raise ScopeViolationError(
+            f"Scope violation: target '{target}' requires one of {allowed}, "
+            f"but actual scope is '{ledger.source_scope}'."
+        )
