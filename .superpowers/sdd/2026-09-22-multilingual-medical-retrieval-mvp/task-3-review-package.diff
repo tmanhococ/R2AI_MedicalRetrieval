@@ -1,0 +1,47 @@
+commit 00a0ca2
+Author: Antigravity Subagent
+Date: 2026-09-22
+
+feat: implement dataset adapter protocol and jsonl adapter
+
+diff --stat:
+ src/data/__init__.py          |   8 +-
+ src/data/dataset_adapter.py   | 218 ++++++++++++++++++++++++++++++++++++++++++
+ tests/test_dataset_adapter.py | 196 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 420 insertions(+), 2 deletions(-)
+
+diff -U10 d01df0b..00a0ca2:
+--- a/src/data/__init__.py
++++ b/src/data/__init__.py
+@@ -1,13 +1,16 @@
+ from src.data.schemas import (
+     ChunkRecord,
+     DocumentRecord,
+     FinalPrediction,
+     FusedHit,
+     GroundTruthRecord,
+     QueryRecord,
+     ScoredHit,
+     SearchHit,
+ )
++from src.data.dataset_adapter import (
++    DatasetAdapter,
++    JsonlDatasetAdapter,
++    InMemoryDatasetAdapter,
++)
+ from src.data.validators import validate_corpus_integrity
+ 
+ __all__ = [
+     "QueryRecord",
+     "DocumentRecord",
+     "ChunkRecord",
+     "GroundTruthRecord",
+     "SearchHit",
+     "FusedHit",
+     "ScoredHit",
+     "FinalPrediction",
+     "validate_corpus_integrity",
++    "DatasetAdapter",
++    "JsonlDatasetAdapter",
++    "InMemoryDatasetAdapter",
+ ]

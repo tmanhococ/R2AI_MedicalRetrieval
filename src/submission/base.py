@@ -52,7 +52,11 @@ def create_exporter(exporter_type: str, **kwargs: Any) -> SubmissionExporter:
         from src.submission.competition_csv import CompetitionCsvExporter
 
         return CompetitionCsvExporter(**kwargs)
+    elif exporter_type == "vibiomir_json_zip":
+        from src.submission.vibiomir_json_zip import VibiomirExporter
+
+        return VibiomirExporter(**kwargs)
     else:
         raise ValueError(
-            f"Unknown exporter type: '{exporter_type}'. Supported types: 'internal_jsonl', 'competition_csv'"
+            f"Unknown exporter type: '{exporter_type}'. Supported types: 'internal_jsonl', 'competition_csv', 'vibiomir_json_zip'"
         )

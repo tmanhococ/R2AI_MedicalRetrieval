@@ -1,0 +1,942 @@
+# Review package: 6bf23a4..f816295
+
+## Commits
+f816295 fix: enforce strict provenance hashes, streaming CLI indexers, and pre-search validation (Task 5 Round 1)
+
+## Files changed
+ src/cli/index.py                    |  84 +++++++------
+ src/data/vibiomir_adapter.py        |  79 ++++++++++++-
+ src/indexing/dense_index.py         |   2 +
+ src/ingestion/snapshot.py           | 229 +++++++++++++++++++-----------------
+ src/retrieval/dense_retriever.py    |  27 +++++
+ tests/data/test_snapshot_adapter.py | 204 +++++++++++++++++++++++++++++++-
+ 6 files changed, 472 insertions(+), 153 deletions(-)
+
+## Diff
+diff --git a/src/cli/index.py b/src/cli/index.py
+index 083cd4c..5c385a3 100644
+--- a/src/cli/index.py
++++ b/src/cli/index.py
+@@ -51,132 +51,142 @@ def run_index(
+     else:
+         run_out = config.get("run", {}).get("output_dir", "artifacts")
+         out_path = Path(run_out) / "indexes"
+     out_path.mkdir(parents=True, exist_ok=True)
+ 
+     snapshot_manifest = None
+     snapshot_id = None
+     source_membership_sha256 = None
+     chunker_fingerprint = None
+ 
++    documents: list[DocumentRecord] = []
++    chunks: list[ChunkRecord] = []
++
+     if effective_snapshot is not None:
+         snap_path = Path(effective_snapshot)
+         if not snap_path.exists():
+             raise FileNotFoundError(f"Snapshot directory not found: {snap_path}")
+         adapter = ViBioMIRAdapter(snap_path)
+         snapshot_manifest = adapter.manifest
+         snapshot_id = adapter.manifest.snapshot_id
+         source_membership_sha256 = adapter.manifest.source_membership_sha256
+         chunker_fingerprint = adapter.manifest.chunker_fingerprint
+-
+-        documents = adapter.load_documents()
+-        chunks = adapter.load_chunks()
+     else:
+         if dataset_dir is None:
+             raise ValueError("Either dataset_dir or snapshot_dir must be provided")
+         dataset_path = Path(dataset_dir)
+         if not dataset_path.exists():
+             raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+ 
+         adapter = JsonlDatasetAdapter(dataset_path)
+         documents = adapter.load_documents()
+         chunks = adapter.load_chunks()
+ 
+-    # 2. Initial validation
+-    strict_val = config.get("indexing", {}).get("validation", {}).get("strict_foreign_keys", True)
+-    validate_corpus(documents, chunks, strict=strict_val)
+-
+-    # 3. Chunking if chunks missing or mode != "prechunked"
+-    chunk_cfg = config.get("indexing", {}).get("chunking", {})
+-    mode = chunk_cfg.get("mode", "hybrid")
+-    if not chunks or (mode != "prechunked" and effective_snapshot is None):
+-        chunker = create_chunker(chunk_cfg)
+-        chunks = chunker.chunk_documents(documents, existing_chunks=chunks)
+-        # Re-validate with new chunks
++        # 2. Initial validation
++        strict_val = config.get("indexing", {}).get("validation", {}).get("strict_foreign_keys", True)
+         validate_corpus(documents, chunks, strict=strict_val)
+ 
+-    # Persist generated chunks to output_dir for downstream stages if not already in dataset
+-    chunks_out = out_path / "chunks.jsonl"
+-    with open(chunks_out, "w", encoding="utf-8") as f:
+-        for c in chunks:
+-            f.write(
+-                json.dumps(
+-                    {
+-                        "chunk_id": c.chunk_id,
+-                        "doc_id": c.doc_id,
+-                        "language": c.language,
+-                        "text": c.text,
+-                        "chunk_index": c.chunk_index,
+-                        "metadata": c.metadata,
+-                    },
+-                    ensure_ascii=False,
++        # 3. Chunking if chunks missing or mode != "prechunked"
++        chunk_cfg = config.get("indexing", {}).get("chunking", {})
++        mode = chunk_cfg.get("mode", "hybrid")
++        if not chunks or mode != "prechunked":
++            chunker = create_chunker(chunk_cfg)
++            chunks = chunker.chunk_documents(documents, existing_chunks=chunks)
++            # Re-validate with new chunks
++            validate_corpus(documents, chunks, strict=strict_val)
++
++        # Persist generated chunks to output_dir for downstream stages if not already in dataset
++        chunks_out = out_path / "chunks.jsonl"
++        with open(chunks_out, "w", encoding="utf-8") as f:
++            for c in chunks:
++                f.write(
++                    json.dumps(
++                        {
++                            "chunk_id": c.chunk_id,
++                            "doc_id": c.doc_id,
++                            "language": c.language,
++                            "text": c.text,
++                            "chunk_index": c.chunk_index,
++                            "metadata": c.metadata,
++                        },
++                        ensure_ascii=False,
++                    )
++                    + "\n"
+                 )
+-                + "\n"
+-            )
+ 
+     retrieval_cfg = config.get("retrieval", {})
+     bm25_cfg = retrieval_cfg.get("bm25", {})
+     dense_cfg = retrieval_cfg.get("dense", {})
+ 
+     bm25_output_dir = out_path / "bm25"
+     dense_output_dir = out_path / "dense"
+ 
+     bm25_manifest: dict[str, Any] = {}
+     dense_manifest: dict[str, Any] = {}
+ 
+     # 4. Build BM25 Index
+     if bm25_cfg.get("enabled", True):
+         bm25_indexer = BM25Indexer(
+             backend=bm25_cfg.get("backend", "bm25s"),
+             tokenizers_config=bm25_cfg.get("tokenizers"),
+         )
++        docs_source = adapter.iter_documents() if effective_snapshot is not None else documents
++        chunks_source = adapter.iter_chunks() if effective_snapshot is not None else chunks
+         bm25_manifest = bm25_indexer.build_indexes(
+-            documents=documents,
+-            chunks=chunks,
++            documents=docs_source,
++            chunks=chunks_source,
+             output_dir=bm25_output_dir,
+             snapshot_id=snapshot_id,
+             source_membership_sha256=source_membership_sha256,
+             chunker_fingerprint=chunker_fingerprint,
+         )
+ 
+     # 5. Build Dense Index
+     if dense_cfg.get("enabled", True):
+         dense_encoder = encoder if encoder is not None else dense_cfg.get("encoder") or dense_cfg.get("model_name", "intfloat/multilingual-e5-large")
+         dense_indexer = DenseIndexer(
+             encoder=dense_encoder,
+             backend=dense_cfg.get("backend", "faiss"),
+             instruction_prefix=dense_cfg.get("instruction_prefix"),
+             device=dense_cfg.get("device", "auto"),
+             normalize_embeddings=dense_cfg.get("normalize_embeddings", True),
+             batch_size=dense_cfg.get("batch_size", 64),
+         )
++        chunks_dense_source = adapter.iter_chunks() if effective_snapshot is not None else chunks
+         dense_manifest = dense_indexer.build_index(
+-            chunks=chunks,
++            chunks=chunks_dense_source,
+             output_dir=dense_output_dir,
+             snapshot_id=snapshot_id,
+             source_membership_sha256=source_membership_sha256,
+             chunker_fingerprint=chunker_fingerprint,
+         )
+ 
+     # Validate against snapshot manifest if available
+     if snapshot_manifest is not None:
+         if bm25_cfg.get("enabled", True):
+             validate_index_manifest(bm25_output_dir, snapshot_manifest)
+         if dense_cfg.get("enabled", True):
+-            validate_index_manifest(dense_output_dir, snapshot_manifest)
++            validate_index_manifest(
++                dense_output_dir,
++                snapshot_manifest,
++                expected_mapping_hash=dense_manifest.get("vector_chunk_mapping_hash"),
++            )
++
++    num_docs = snapshot_manifest.ready_document_count if snapshot_manifest is not None else len(documents)
++    num_chunks = snapshot_manifest.chunk_count if snapshot_manifest is not None else len(chunks)
+ 
+     return {
+         "output_dir": str(out_path),
+         "bm25_index_dir": str(bm25_output_dir),
+         "dense_index_dir": str(dense_output_dir),
+-        "num_documents": len(documents),
+-        "num_chunks": len(chunks),
++        "num_documents": num_docs,
++        "num_chunks": num_chunks,
+         "bm25_manifest": bm25_manifest,
+         "dense_manifest": dense_manifest,
+     }
+ 
+ 
+ def main(args: list[str] | None = None) -> None:
+     parser = argparse.ArgumentParser(
+         description="Multilingual Medical Retrieval Indexing CLI entrypoint."
+     )
+     parser.add_argument(
+diff --git a/src/data/vibiomir_adapter.py b/src/data/vibiomir_adapter.py
+index 872f313..713de22 100644
+--- a/src/data/vibiomir_adapter.py
++++ b/src/data/vibiomir_adapter.py
+@@ -1,14 +1,14 @@
+ import hashlib
+ import json
+ from pathlib import Path
+-from typing import Iterator
++from typing import Any, Iterator
+ 
+ import pyarrow as pa
+ import pyarrow.parquet as pq
+ 
+ from src.data.dataset_adapter import _normalize_language
+ from src.data.schemas import ChunkRecord, DocumentRecord, QueryRecord
+ from src.data.vibiomir_contracts import (
+     EvaluationRecord,
+     OfficialQuery,
+     OfficialSource,
+@@ -290,43 +290,112 @@ class ViBioMIRAdapter:
+                 qid = int(data["query_id"])
+                 docs = frozenset(int(d) for d in data.get("relevant_docs", []))
+                 chunks = tuple(
+                     ReferenceChunk(doc_id=int(c["doc_id"]), chunk_text=str(c["chunk_text"]))
+                     for c in data.get("relevant_chunks", [])
+                 )
+                 results.append(EvaluationRecord(query_id=qid, relevant_doc_ids=docs, relevant_chunks=chunks))
+         return results
+ 
+ 
+-def validate_index_manifest(index_path: Path | str, snapshot: SnapshotManifest) -> None:
+-    """Validates that an index manifest aligns with the given snapshot manifest."""
++def validate_index_manifest(
++    index_path: Path | str,
++    snapshot: SnapshotManifest,
++    expected_mapping_hash: str | None = None,
++    expected_config: dict[str, Any] | None = None,
++) -> None:
++    """Validates that an index manifest strictly aligns with the given snapshot manifest and search config."""
+     path = Path(index_path)
+     if path.is_file():
+         manifest_files = [path]
+     elif path.is_dir():
+         manifest_files = list(path.rglob("manifest.json"))
+         if not manifest_files:
+             raise FileNotFoundError(f"No manifest.json found in {index_path}")
+     else:
+         raise FileNotFoundError(f"Index path does not exist: {index_path}")
+ 
+     for mf in manifest_files:
+         with open(mf, "r", encoding="utf-8") as f:
+             data = json.load(f)
+ 
++        # 1. snapshot_id is strictly required
+         if "snapshot_id" not in data:
+             raise ValueError(f"Index manifest {mf.name} missing required field 'snapshot_id'")
+ 
+         if data["snapshot_id"] != snapshot.snapshot_id:
+             raise ValueError(
+                 f"Snapshot ID mismatch in {mf}: index has '{data['snapshot_id']}', expected '{snapshot.snapshot_id}'"
+             )
+ 
+-        if "source_membership_sha256" in data and data["source_membership_sha256"] != snapshot.source_membership_sha256:
++        # 2. source_membership_sha256 is strictly required
++        if "source_membership_sha256" not in data:
++            raise ValueError(f"Index manifest {mf.name} missing required field 'source_membership_sha256'")
++
++        if data["source_membership_sha256"] != snapshot.source_membership_sha256:
+             raise ValueError(
+                 f"Source membership SHA-256 mismatch in {mf}: index has '{data['source_membership_sha256']}', expected '{snapshot.source_membership_sha256}'"
+             )
+ 
+-        if "chunker_fingerprint" in data and data["chunker_fingerprint"] != snapshot.chunker_fingerprint:
++        # 3. chunker_fingerprint is strictly required
++        if "chunker_fingerprint" not in data:
++            raise ValueError(f"Index manifest {mf.name} missing required field 'chunker_fingerprint'")
++
++        if data["chunker_fingerprint"] != snapshot.chunker_fingerprint:
+             raise ValueError(
+                 f"Chunker fingerprint mismatch in {mf}: index has '{data['chunker_fingerprint']}', expected '{snapshot.chunker_fingerprint}'"
+             )
++
++        # 4. vector_chunk_mapping_hash verification
++        if expected_mapping_hash is not None:
++            if "vector_chunk_mapping_hash" not in data:
++                raise ValueError(f"Index manifest {mf.name} missing required field 'vector_chunk_mapping_hash'")
++            if data["vector_chunk_mapping_hash"] != expected_mapping_hash:
++                raise ValueError(
++                    f"Vector-chunk mapping hash mismatch in {mf}: index has '{data['vector_chunk_mapping_hash']}', expected '{expected_mapping_hash}'"
++                )
++
++        # 5. Pre-search config checks if expected_config is provided
++        if expected_config is not None:
++            validate_search_compatibility(data, **expected_config)
++
++
++def validate_search_compatibility(
++    manifest_or_path: dict[str, Any] | Path | str,
++    expected_model_name: str | None = None,
++    expected_prefix: dict[str, str] | None = None,
++    expected_normalize: bool | None = None,
++    **kwargs: Any,
++) -> None:
++    """Pre-search check: fail before search if model_name, prefix, or normalization settings mismatch."""
++    if isinstance(manifest_or_path, (str, Path)):
++        p = Path(manifest_or_path)
++        if p.is_dir():
++            p = p / "manifest.json"
++        if not p.exists():
++            return
++        with open(p, "r", encoding="utf-8") as f:
++            data = json.load(f)
++    else:
++        data = manifest_or_path
++
++    if expected_model_name is not None and "model_name" in data and data["model_name"] is not None:
++        if data["model_name"] != expected_model_name:
++            raise ValueError(
++                f"Model mismatch: index has '{data['model_name']}', expected '{expected_model_name}'"
++            )
++
++    if expected_prefix is not None and "instruction_prefix" in data:
++        manifest_prefix = data["instruction_prefix"]
++        for key in ("passage", "query"):
++            if key in expected_prefix and key in manifest_prefix:
++                if expected_prefix[key] != manifest_prefix[key]:
++                    raise ValueError(
++                        f"Instruction prefix mismatch for '{key}': index has '{manifest_prefix[key]}', expected '{expected_prefix[key]}'"
++                    )
++
++    if expected_normalize is not None and "normalize_embeddings" in data:
++        if bool(data["normalize_embeddings"]) != bool(expected_normalize):
++            raise ValueError(
++                f"Normalization mismatch: index has '{data['normalize_embeddings']}', expected '{expected_normalize}'"
++            )
++
+diff --git a/src/indexing/dense_index.py b/src/indexing/dense_index.py
+index 051c72e..0a015c4 100644
+--- a/src/indexing/dense_index.py
++++ b/src/indexing/dense_index.py
+@@ -177,22 +177,24 @@ class DenseIndexer:
+                 flush_buffer(lang)
+ 
+         # Flush any remaining chunks in buffers
+         for lang in list(buffers.keys()):
+             flush_buffer(lang)
+ 
+         # Union of default languages and any seen languages
+         seen_langs = set(embeddings_by_lang.keys()) | set(metadata_by_lang.keys())
+         languages = sorted(set(self.DEFAULT_LANGUAGES) | seen_langs)
+ 
++        model_name = self._raw_encoder if isinstance(self._raw_encoder, str) else getattr(self._raw_encoder, "model_name", None)
+         manifest: dict[str, Any] = {
+             "backend": self.backend,
++            "model_name": model_name,
+             "instruction_prefix": self.instruction_prefix,
+             "normalize_embeddings": self.normalize_embeddings,
+             "device": self.device,
+             "dim": None,
+             "partitions": {},
+         }
+         if snapshot_id is not None:
+             manifest["snapshot_id"] = snapshot_id
+         if source_membership_sha256 is not None:
+             manifest["source_membership_sha256"] = source_membership_sha256
+diff --git a/src/ingestion/snapshot.py b/src/ingestion/snapshot.py
+index 6998206..8745c05 100644
+--- a/src/ingestion/snapshot.py
++++ b/src/ingestion/snapshot.py
+@@ -265,152 +265,163 @@ def build_snapshot(
+         # Fetch all sources and their fetch jobs from registry
+         cursor = registry.conn.execute(
+             """
+             SELECT s.doc_id, s.original_url, s.fetch_job_id,
+                    f.state, f.raw_path, f.raw_sha256, f.mime_type, f.http_status
+             FROM sources s
+             LEFT JOIN fetch_jobs f ON s.fetch_job_id = f.job_id
+             ORDER BY s.doc_id ASC
+             """
+         )
+-        rows = cursor.fetchall()
+-
+-        official_doc_tuples = [(r[0],) for r in rows]
+-        with lookup_conn:
+-            lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_tuples)
+-
+         doc_loc_batch: list[tuple[int, str, int]] = []
+         chunk_loc_batch: list[tuple[str, int, str, int]] = []
++        official_doc_batch: list[tuple[int]] = []
++
++        while True:
++            rows = cursor.fetchmany(1000)
++            if not rows:
++                break
++
++            for doc_id, original_url, job_id, state, raw_path_str, raw_sha256, mime_type, http_status in rows:
++                all_registered_doc_ids.append(doc_id)
++                official_doc_batch.append((doc_id,))
++
++                if state != "fetched" or not raw_path_str or not raw_sha256:
++                    continue
++
++                raw_path = Path(raw_path_str)
++                if not raw_path.exists() and raw_root is not None:
++                    candidate = raw_root / raw_path_str
++                    if candidate.exists():
++                        raw_path = candidate
++
++                if not raw_path.exists():
++                    logger.warning(f"Raw file {raw_path_str} not found for doc {doc_id}")
++                    continue
++
++                # Read raw content
++                if str(raw_path).endswith(".gz"):
++                    with gzip.open(raw_path, "rb") as gf:
++                        raw_bytes = gf.read()
++                else:
++                    raw_bytes = raw_path.read_bytes()
++
++                # Hash verification
++                computed_raw_sha = hashlib.sha256(raw_bytes).hexdigest()
++                if computed_raw_sha != raw_sha256:
++                    raise ValueError(
++                        f"Raw SHA256 mismatch for doc {doc_id}: expected {raw_sha256}, got {computed_raw_sha}"
++                    )
+ 
+-        for doc_id, original_url, job_id, state, raw_path_str, raw_sha256, mime_type, http_status in rows:
+-            all_registered_doc_ids.append(doc_id)
+-
+-            if state != "fetched" or not raw_path_str or not raw_sha256:
+-                continue
+-
+-            raw_path = Path(raw_path_str)
+-            if not raw_path.exists() and raw_root is not None:
+-                candidate = raw_root / raw_path_str
+-                if candidate.exists():
+-                    raw_path = candidate
+-
+-            if not raw_path.exists():
+-                logger.warning(f"Raw file {raw_path_str} not found for doc {doc_id}")
+-                continue
+-
+-            # Read raw content
+-            if str(raw_path).endswith(".gz"):
+-                with gzip.open(raw_path, "rb") as gf:
+-                    raw_bytes = gf.read()
+-            else:
+-                raw_bytes = raw_path.read_bytes()
+-
+-            # Hash verification
+-            computed_raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+-            if computed_raw_sha != raw_sha256:
+-                raise ValueError(
+-                    f"Raw SHA256 mismatch for doc {doc_id}: expected {raw_sha256}, got {computed_raw_sha}"
++                # Extract document
++                extracted_doc = extract_document(
++                    doc_id=doc_id,
++                    raw=raw_bytes,
++                    mime_type=mime_type or "text/html",
++                    raw_sha256=raw_sha256,
++                    config=ext_cfg,
+                 )
+ 
+-            # Extract document
+-            extracted_doc = extract_document(
+-                doc_id=doc_id,
+-                raw=raw_bytes,
+-                mime_type=mime_type or "text/html",
+-                raw_sha256=raw_sha256,
+-                config=ext_cfg,
+-            )
+-
+-            # Classify quality
+-            quality = classify_quality(extracted_doc, language_detector, ext_cfg)
+-
+-            if quality.state == "ready":
+-                # Finalize extracted document with verified language
+-                ready_doc = ExtractedDocument(
+-                    doc_id=extracted_doc.doc_id,
+-                    source_version=extracted_doc.source_version,
+-                    source_text=extracted_doc.source_text,
+-                    source_sha256=extracted_doc.source_sha256,
+-                    raw_sha256=extracted_doc.raw_sha256,
+-                    title=extracted_doc.title,
+-                    language=quality.language,
+-                    blocks=extracted_doc.blocks,
+-                    quality_flags=quality.flags,
+-                )
++                # Classify quality
++                quality = classify_quality(extracted_doc, language_detector, ext_cfg)
++
++                if quality.state == "ready":
++                    # Finalize extracted document with verified language
++                    ready_doc = ExtractedDocument(
++                        doc_id=extracted_doc.doc_id,
++                        source_version=extracted_doc.source_version,
++                        source_text=extracted_doc.source_text,
++                        source_sha256=extracted_doc.source_sha256,
++                        raw_sha256=extracted_doc.raw_sha256,
++                        title=extracted_doc.title,
++                        language=quality.language,
++                        blocks=extracted_doc.blocks,
++                        quality_flags=quality.flags,
++                    )
+ 
+-                # Write ready document to parquet shard
+-                blocks_data = [
+-                    {
+-                        "block_index": b.block_index,
+-                        "kind": b.kind,
+-                        "start_char": b.start_char,
+-                        "end_char": b.end_char,
+-                        "section": b.section,
++                    # Write ready document to parquet shard
++                    blocks_data = [
++                        {
++                            "block_index": b.block_index,
++                            "kind": b.kind,
++                            "start_char": b.start_char,
++                            "end_char": b.end_char,
++                            "section": b.section,
++                        }
++                        for b in ready_doc.blocks
++                    ]
++                    doc_row = {
++                        "doc_id": ready_doc.doc_id,
++                        "source_version": ready_doc.source_version,
++                        "source_text": ready_doc.source_text,
++                        "source_sha256": ready_doc.source_sha256,
++                        "raw_sha256": ready_doc.raw_sha256,
++                        "title": ready_doc.title,
++                        "language": ready_doc.language,
++                        "blocks_json": json.dumps(blocks_data, ensure_ascii=False),
++                        "quality_flags_json": json.dumps(list(ready_doc.quality_flags), ensure_ascii=False),
+                     }
+-                    for b in ready_doc.blocks
+-                ]
+-                doc_row = {
+-                    "doc_id": ready_doc.doc_id,
+-                    "source_version": ready_doc.source_version,
+-                    "source_text": ready_doc.source_text,
+-                    "source_sha256": ready_doc.source_sha256,
+-                    "raw_sha256": ready_doc.raw_sha256,
+-                    "title": ready_doc.title,
+-                    "language": ready_doc.language,
+-                    "blocks_json": json.dumps(blocks_data, ensure_ascii=False),
+-                    "quality_flags_json": json.dumps(list(ready_doc.quality_flags), ensure_ascii=False),
+-                }
+-                doc_shard_name, doc_row_idx = doc_writer.add_row(doc_row)
+-                doc_loc_batch.append((ready_doc.doc_id, doc_shard_name, doc_row_idx))
+-                ready_doc_ids.append(ready_doc.doc_id)
+-                language_counts[ready_doc.language] += 1
+-
+-                # Generate SpanChunks
+-                spans = list(chunk_source_document(ready_doc, dense_tokenizer, reranker_tokenizer, chk_cfg))
+-                for sp in spans:
+-                    chunk_row = {
+-                        "chunk_id": sp.chunk_id,
+-                        "doc_id": sp.doc_id,
+-                        "source_version": sp.source_version,
+-                        "source_sha256": sp.source_sha256,
+-                        "start_char": sp.start_char,
+-                        "end_char": sp.end_char,
+-                        "chunk_index": sp.chunk_index,
+-                        "language": sp.language,
+-                        "section": sp.section,
+-                        "text": sp.text,
+-                        "index_text": sp.index_text,
+-                        "dense_token_count": sp.dense_token_count,
+-                        "reranker_token_count": sp.reranker_token_count,
+-                    }
+-                    chunk_shard_name, chunk_row_idx = chunk_writer.add_row(chunk_row)
+-                    chunk_loc_batch.append((sp.chunk_id, sp.doc_id, chunk_shard_name, chunk_row_idx))
+-                    chunk_count += 1
+-            else:
+-                for flg in quality.flags:
+-                    quarantine_counts[flg] += 1
++                    doc_shard_name, doc_row_idx = doc_writer.add_row(doc_row)
++                    doc_loc_batch.append((ready_doc.doc_id, doc_shard_name, doc_row_idx))
++                    ready_doc_ids.append(ready_doc.doc_id)
++                    language_counts[ready_doc.language] += 1
++
++                    # Generate SpanChunks
++                    spans = list(chunk_source_document(ready_doc, dense_tokenizer, reranker_tokenizer, chk_cfg))
++                    for sp in spans:
++                        chunk_row = {
++                            "chunk_id": sp.chunk_id,
++                            "doc_id": sp.doc_id,
++                            "source_version": sp.source_version,
++                            "source_sha256": sp.source_sha256,
++                            "start_char": sp.start_char,
++                            "end_char": sp.end_char,
++                            "chunk_index": sp.chunk_index,
++                            "language": sp.language,
++                            "section": sp.section,
++                            "text": sp.text,
++                            "index_text": sp.index_text,
++                            "dense_token_count": sp.dense_token_count,
++                            "reranker_token_count": sp.reranker_token_count,
++                        }
++                        chunk_shard_name, chunk_row_idx = chunk_writer.add_row(chunk_row)
++                        chunk_loc_batch.append((sp.chunk_id, sp.doc_id, chunk_shard_name, chunk_row_idx))
++                        chunk_count += 1
++                else:
++                    for flg in quality.flags:
++                        quarantine_counts[flg] += 1
+ 
+             # Commit batches to lookup db periodically
++            if len(official_doc_batch) >= 1000:
++                with lookup_conn:
++                    lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_batch)
++                official_doc_batch.clear()
++
+             if len(doc_loc_batch) >= 500:
+                 with lookup_conn:
+                     lookup_conn.executemany(
+                         "INSERT OR REPLACE INTO document_locations (doc_id, shard, row_idx) VALUES (?, ?, ?)",
+                         doc_loc_batch,
+                     )
+                     lookup_conn.executemany(
+                         "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx) VALUES (?, ?, ?, ?)",
+                         chunk_loc_batch,
+                     )
+                 doc_loc_batch.clear()
+                 chunk_loc_batch.clear()
+ 
+         # Final commit to lookup db
++        if official_doc_batch:
++            with lookup_conn:
++                lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_batch)
++            official_doc_batch.clear()
++
+         if doc_loc_batch or chunk_loc_batch:
+             with lookup_conn:
+                 lookup_conn.executemany(
+                     "INSERT OR REPLACE INTO document_locations (doc_id, shard, row_idx) VALUES (?, ?, ?)",
+                     doc_loc_batch,
+                 )
+                 lookup_conn.executemany(
+                     "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx) VALUES (?, ?, ?, ?)",
+                     chunk_loc_batch,
+                 )
+diff --git a/src/retrieval/dense_retriever.py b/src/retrieval/dense_retriever.py
+index 548c11f..9f463c0 100644
+--- a/src/retrieval/dense_retriever.py
++++ b/src/retrieval/dense_retriever.py
+@@ -61,20 +61,47 @@ class DenseRetriever:
+             raise ImportError(
+                 "Backend 'faiss' is selected but package 'faiss' is not installed."
+             )
+ 
+         # Determine instruction prefix
+         if instruction_prefix is not None:
+             self.instruction_prefix = instruction_prefix
+         else:
+             self.instruction_prefix = self._manifest.get("instruction_prefix", {})
+ 
++        # Pre-search checks: ensure model, prefix, and normalization match index manifest
++        if self._manifest:
++            manifest_norm = self._manifest.get("normalize_embeddings")
++            if normalize_embeddings is not None and manifest_norm is not None:
++                if bool(normalize_embeddings) != bool(manifest_norm):
++                    raise ValueError(
++                        f"Normalization mismatch: retriever has normalize_embeddings={normalize_embeddings}, "
++                        f"but index manifest has {manifest_norm}"
++                    )
++
++            manifest_prefix = self._manifest.get("instruction_prefix", {})
++            if instruction_prefix is not None and manifest_prefix:
++                for k in ("passage", "query"):
++                    if k in instruction_prefix and k in manifest_prefix:
++                        if instruction_prefix[k] != manifest_prefix[k]:
++                            raise ValueError(
++                                f"Instruction prefix mismatch for '{k}': retriever has '{instruction_prefix[k]}', "
++                                f"but index manifest has '{manifest_prefix[k]}'"
++                            )
++
++            manifest_model = self._manifest.get("model_name")
++            if manifest_model and isinstance(encoder, str) and encoder != manifest_model:
++                raise ValueError(
++                    f"Model mismatch: retriever configured with '{encoder}', "
++                    f"but index manifest has '{manifest_model}'"
++                )
++
+         # Cache for loaded partitions
+         self._loaded_partitions: dict[str, dict[str, Any]] = {}
+ 
+     def _get_encoder(self) -> Any:
+         if self._encoder is not None:
+             return self._encoder
+ 
+         if isinstance(self._raw_encoder, str):
+             from sentence_transformers import SentenceTransformer  # type: ignore
+ 
+diff --git a/tests/data/test_snapshot_adapter.py b/tests/data/test_snapshot_adapter.py
+index 59961d6..42af55e 100644
+--- a/tests/data/test_snapshot_adapter.py
++++ b/tests/data/test_snapshot_adapter.py
+@@ -1,26 +1,33 @@
+ import gzip
+ import hashlib
+ import json
+ from pathlib import Path
+ import pytest
+ 
+ from src.data.dataset_adapter import DatasetAdapter
+ from src.data.schemas import ChunkRecord, DocumentRecord, QueryRecord
+ from src.data.source_store import SnapshotSourceStore
+-from src.data.vibiomir_adapter import ViBioMIRAdapter, validate_index_manifest
++from src.data.validators import validate_corpus
++from src.data.vibiomir_adapter import (
++    ViBioMIRAdapter,
++    validate_index_manifest,
++    validate_search_compatibility,
++)
+ from src.data.vibiomir_contracts import (
+     ChunkConfig,
++    EvaluationRecord,
+     ExtractionConfig,
+     ExtractedDocument,
+     OfficialQuery,
+     OfficialSource,
++    ReferenceChunk,
+     SnapshotConfig,
+     SnapshotManifest,
+     SourceStore,
+     SpanChunk,
+ )
+ from src.data.vibiomir_registry import SourceRegistry, ingest_sources
+ from src.indexing.dense_index import DenseIndexer
+ from src.ingestion.fetcher import save_raw_atomic
+ from src.ingestion.snapshot import build_snapshot
+ 
+@@ -498,14 +505,207 @@ def test_validate_index_manifest(tmp_path: Path):
+     with open(bad_chunker_dir / "manifest.json", "w", encoding="utf-8") as f:
+         json.dump({**valid_manifest_content, "chunker_fingerprint": "other_chunker"}, f)
+ 
+     with pytest.raises(ValueError, match="Chunker fingerprint mismatch"):
+         validate_index_manifest(bad_chunker_dir, snapshot_manifest)
+ 
+     # Missing snapshot_id entirely
+     missing_id_dir = tmp_path / "missing_id_index"
+     missing_id_dir.mkdir()
+     with open(missing_id_dir / "manifest.json", "w", encoding="utf-8") as f:
+-        json.dump({"backend": "faiss"}, f)
++        json.dump({"backend": "faiss", "source_membership_sha256": "membersha999", "chunker_fingerprint": "chunk_strat_v1"}, f)
+ 
+     with pytest.raises(ValueError, match="missing required field 'snapshot_id'"):
+         validate_index_manifest(missing_id_dir, snapshot_manifest)
++
++    # Missing source_membership_sha256
++    missing_mem_dir = tmp_path / "missing_mem_index"
++    missing_mem_dir.mkdir()
++    with open(missing_mem_dir / "manifest.json", "w", encoding="utf-8") as f:
++        json.dump({"snapshot_id": "snap_20261004_v1", "chunker_fingerprint": "chunk_strat_v1"}, f)
++
++    with pytest.raises(ValueError, match="missing required field 'source_membership_sha256'"):
++        validate_index_manifest(missing_mem_dir, snapshot_manifest)
++
++    # Missing chunker_fingerprint
++    missing_chk_dir = tmp_path / "missing_chk_index"
++    missing_chk_dir.mkdir()
++    with open(missing_chk_dir / "manifest.json", "w", encoding="utf-8") as f:
++        json.dump({"snapshot_id": "snap_20261004_v1", "source_membership_sha256": "membersha999"}, f)
++
++    with pytest.raises(ValueError, match="missing required field 'chunker_fingerprint'"):
++        validate_index_manifest(missing_chk_dir, snapshot_manifest)
++
++
++def test_vector_chunk_mapping_hash_and_presearch_verification(tmp_path: Path):
++    """validate_index_manifest verifies vector_chunk_mapping_hash and pre-search config compatibility."""
++    snapshot_manifest = SnapshotManifest(
++        snapshot_id="snap_20261004_v1",
++        created_at="2026-10-04T12:00:00Z",
++        registry_sha256="abc123reg",
++        queries_sha256="q123sha",
++        source_membership_sha256="membersha999",
++        extractor_fingerprint="ext_trafilatura_v1",
++        chunker_fingerprint="chunk_strat_v1",
++        source_count=100,
++        ready_document_count=95,
++        chunk_count=350,
++        language_counts={"vi": 95},
++        quarantine_counts={},
++        shard_paths_and_hashes=[],
++    )
++
++    mapping_dir = tmp_path / "mapping_test_index"
++    mapping_dir.mkdir()
++    manifest_data = {
++        "snapshot_id": "snap_20261004_v1",
++        "source_membership_sha256": "membersha999",
++        "chunker_fingerprint": "chunk_strat_v1",
++        "vector_chunk_mapping_hash": "correct_mapping_hash_abc",
++        "model_name": "bkai-foundation-models/vietnamese-bi-encoder",
++        "instruction_prefix": {"passage": "passage: ", "query": "query: "},
++        "normalize_embeddings": True,
++    }
++    with open(mapping_dir / "manifest.json", "w", encoding="utf-8") as f:
++        json.dump(manifest_data, f)
++
++    # Valid mapping hash matches
++    validate_index_manifest(
++        mapping_dir,
++        snapshot_manifest,
++        expected_mapping_hash="correct_mapping_hash_abc",
++    )
++
++    # Mismatched mapping hash raises ValueError
++    with pytest.raises(ValueError, match="Vector-chunk mapping hash mismatch"):
++        validate_index_manifest(
++            mapping_dir,
++            snapshot_manifest,
++            expected_mapping_hash="wrong_mapping_hash_xyz",
++        )
++
++    # Missing mapping hash when expected raises ValueError
++    nomap_dir = tmp_path / "nomap_index"
++    nomap_dir.mkdir()
++    with open(nomap_dir / "manifest.json", "w", encoding="utf-8") as f:
++        json.dump({
++            "snapshot_id": "snap_20261004_v1",
++            "source_membership_sha256": "membersha999",
++            "chunker_fingerprint": "chunk_strat_v1",
++        }, f)
++    with pytest.raises(ValueError, match="missing required field 'vector_chunk_mapping_hash'"):
++        validate_index_manifest(
++            nomap_dir,
++            snapshot_manifest,
++            expected_mapping_hash="expected_hash",
++        )
++
++    # Pre-search checks: model mismatch
++    with pytest.raises(ValueError, match="Model mismatch"):
++        validate_search_compatibility(
++            mapping_dir,
++            expected_model_name="different-model-name",
++        )
++
++    # Pre-search checks: prefix mismatch
++    with pytest.raises(ValueError, match="Instruction prefix mismatch"):
++        validate_search_compatibility(
++            mapping_dir,
++            expected_prefix={"query": "different_query_prefix: "},
++        )
++
++    # Pre-search checks: normalization mismatch
++    with pytest.raises(ValueError, match="Normalization mismatch"):
++        validate_search_compatibility(
++            mapping_dir,
++            expected_normalize=False,
++        )
++
++
++def test_missing_foreign_key_detection(tmp_path: Path):
++    """Resolving orphan chunks or documents not present in snapshot raises KeyError, and validator detects dangling IDs."""
++    registry, raw_root, _ = create_sample_registry_and_raw(tmp_path, num_sources=2)
++    config = SnapshotConfig(
++        snapshot_root=tmp_path / "snapshots",
++        name="snapshot_fk_test",
++    )
++    build_snapshot(
++        registry=registry,
++        config=config,
++        raw_root=raw_root,
++        language_detector=DummyLanguageDetector(),
++    )
++    store = SnapshotSourceStore(tmp_path / "snapshots" / "snapshot_fk_test")
++
++    # Valid doc resolves
++    assert store.get_document(1).doc_id == 1
++
++    # Orphan doc_id (foreign key missing from snapshot documents) raises KeyError
++    with pytest.raises(KeyError, match="Document 9999 not found"):
++        store.get_document(9999)
++
++    # Orphan chunk_id raises KeyError
++    with pytest.raises(KeyError, match="Chunk .* not found"):
++        store.get_chunk("9999:orphan_chunk_id")
++
++    # validate_corpus with strict foreign key validation flags dangling doc_ids
++    docs = [DocumentRecord(doc_id="1", language="vi", text="valid doc")]
++    orphan_chunks = [ChunkRecord(chunk_id="c_orphan", doc_id="9999", language="vi", text="orphan chunk")]
++    with pytest.raises(ValueError, match="does not exist in document table"):
++        validate_corpus(docs, orphan_chunks, strict=True)
++
++
++def test_vibiomir_adapter_load_ground_truth(tmp_path: Path):
++    """ViBioMIRAdapter loads and parses ground truth qrels with ReferenceChunks and EvaluationRecords."""
++    qrels_path = tmp_path / "test_qrels.jsonl"
++    qrels_records = [
++        {
++            "query_id": 201,
++            "relevant_docs": [1, 5],
++            "relevant_chunks": [
++                {"doc_id": 1, "chunk_text": "đoạn y tế liên quan 1"},
++                {"doc_id": 5, "chunk_text": "đoạn y tế liên quan 2"},
++            ],
++        },
++        {
++            "query_id": 202,
++            "relevant_docs": [2],
++            "relevant_chunks": [
++                {"doc_id": 2, "chunk_text": "đoạn y tế liên quan 3"},
++            ],
++        },
++    ]
++    with open(qrels_path, "w", encoding="utf-8") as f:
++        for rec in qrels_records:
++            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
++
++    registry, raw_root, _ = create_sample_registry_and_raw(tmp_path, num_sources=2)
++    config = SnapshotConfig(
++        snapshot_root=tmp_path / "snapshots",
++        name="snapshot_eval_test",
++    )
++    build_snapshot(
++        registry=registry,
++        config=config,
++        raw_root=raw_root,
++        language_detector=DummyLanguageDetector(),
++    )
++
++    adapter = ViBioMIRAdapter(
++        snapshot_path=tmp_path / "snapshots" / "snapshot_eval_test",
++        qrels_path=qrels_path,
++    )
++    eval_records = adapter.load_ground_truth("dev")
++    assert len(eval_records) == 2
++    assert isinstance(eval_records[0], EvaluationRecord)
++    assert eval_records[0].query_id == 201
++    assert eval_records[0].relevant_doc_ids == frozenset({1, 5})
++    assert len(eval_records[0].relevant_chunks) == 2
++    assert isinstance(eval_records[0].relevant_chunks[0], ReferenceChunk)
++    assert eval_records[0].relevant_chunks[0].doc_id == 1
++    assert eval_records[0].relevant_chunks[0].chunk_text == "đoạn y tế liên quan 1"
++
++    assert eval_records[1].query_id == 202
++    assert eval_records[1].relevant_doc_ids == frozenset({2})
++    assert len(eval_records[1].relevant_chunks) == 1
++    assert eval_records[1].relevant_chunks[0].doc_id == 2
++

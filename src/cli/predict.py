@@ -136,23 +136,66 @@ def _run_pipeline_single_query(
     joint_docs, joint_chunks = joint_scorer.score(scored_docs, scored_chunks)
 
     # 5. Cutoff Filtering
-    if calibrator is not None and calib_data is not None:
+    output_cfg = config.get("output", {})
+    fallback_policy = (
+        output_cfg.get("fallback_policy")
+        or config.get("calibration", {}).get("fallback_policy")
+    )
+
+    if fallback_policy == "sparse_rank_caps":
+        doc_cap = int(output_cfg.get("document_cap", 10))
+        chunk_cap = int(output_cfg.get("evidence_cap", 20))
+        chunk_per_doc_cap = int(output_cfg.get("evidence_cap_per_doc", 2))
+
+        # 1. Filter chunks with score > 0
+        pos_chunks = [
+            c for c in joint_chunks
+            if getattr(c, "raw_fusion_score", getattr(c, "rerank_score", getattr(c, "normalized_score", 0.0))) > 0.0
+        ]
+        selected_chunks = []
+        chunks_per_doc: dict[str, int] = {}
+        for c in pos_chunks:
+            c_did = str(c.doc_id)
+            if chunks_per_doc.get(c_did, 0) < chunk_per_doc_cap:
+                selected_chunks.append(c)
+                chunks_per_doc[c_did] = chunks_per_doc.get(c_did, 0) + 1
+                if len(selected_chunks) >= chunk_cap:
+                    break
+
+        # 2. Filter docs with score > 0, prioritizing docs with evidence
+        pos_docs = [
+            d for d in joint_docs
+            if getattr(d, "raw_fusion_score", getattr(d, "rerank_score", getattr(d, "normalized_score", 0.0))) > 0.0
+        ]
+        evidence_doc_ids = set(chunks_per_doc.keys())
+        docs_with_evidence = [d for d in pos_docs if str(d.doc_id) in evidence_doc_ids]
+        other_docs = [d for d in pos_docs if str(d.doc_id) not in evidence_doc_ids]
+        selected_docs = (docs_with_evidence + other_docs)[:doc_cap]
+
+        final_docs = selected_docs
+        final_chunks = selected_chunks
+    elif calibrator is not None and calib_data is not None:
         doc_state = calib_data.get("documents", calib_data)
         chunk_state = calib_data.get("chunks", calib_data)
         selected_docs = calibrator.filter_items(joint_docs, doc_state)
         selected_chunks = calibrator.filter_items(joint_chunks, chunk_state)
+        final_docs, final_chunks = apply_structural_consistency(
+            selected_docs=selected_docs,
+            selected_chunks=selected_chunks,
+            chunk_to_doc=chunk_to_doc,
+            mode=consistency_mode,
+            available_docs=joint_docs,
+        )
     else:
         selected_docs = joint_docs[:default_doc_top_k]
         selected_chunks = joint_chunks[:default_chunk_top_k]
-
-    # 6. Structural Consistency
-    final_docs, final_chunks = apply_structural_consistency(
-        selected_docs=selected_docs,
-        selected_chunks=selected_chunks,
-        chunk_to_doc=chunk_to_doc,
-        mode=consistency_mode,
-        available_docs=joint_docs,
-    )
+        final_docs, final_chunks = apply_structural_consistency(
+            selected_docs=selected_docs,
+            selected_chunks=selected_chunks,
+            chunk_to_doc=chunk_to_doc,
+            mode=consistency_mode,
+            available_docs=joint_docs,
+        )
 
     pred = FinalPrediction(
         query_id=qid,

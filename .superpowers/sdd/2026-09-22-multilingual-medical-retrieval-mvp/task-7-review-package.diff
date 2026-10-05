@@ -1,0 +1,40 @@
+commit e866927
+Author: Antigravity Subagent
+Date: 2026-09-22
+
+feat: implement multilingual tokenizers and bm25 indexing and retrieval
+
+diff --stat:
+ src/indexing/__init__.py           |   4 +-
+ src/indexing/bm25_index.py         | 258 +++++++++++++++++++++++++++++++++++++++
+ src/indexing/tokenizers.py         | 112 ++++++++++++++++++
+ src/retrieval/__init__.py          |   5 +
+ src/retrieval/bm25_retriever.py    | 188 +++++++++++++++++++++++++++++
+ tests/test_bm25_retriever.py       | 204 +++++++++++++++++++++++++++++++
+ 6 files changed, 769 insertions(+), 2 deletions(-)
+
+diff -U10 7bca314..e866927:
+--- a/src/indexing/__init__.py
++++ b/src/indexing/__init__.py
+@@ -1,18 +1,22 @@
+ from src.indexing.chunker import (
+     Chunker,
+     AutoChunker,
+     HybridChunker,
+     PrechunkedChunker,
+     PrechunkedAdapter,
+     create_chunker,
+ )
++from src.indexing.tokenizers import get_tokenizer
++from src.indexing.bm25_index import BM25Indexer
+ 
+ __all__ = [
+     "Chunker",
+     "AutoChunker",
+     "HybridChunker",
+     "PrechunkedChunker",
+     "PrechunkedAdapter",
+     "create_chunker",
++    "get_tokenizer",
++    "BM25Indexer",
+ ]

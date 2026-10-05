@@ -1,0 +1,1026 @@
+# Review package: 6726f1f..6a2a23e
+
+## Commits
+6a2a23e feat: add dev annotation guide and provenance error breakdown (Task 10)
+
+## Files changed
+ docs/vibiomir/dev_annotation_guide.md    | 207 +++++++++++++++
+ src/data/vibiomir_contracts.py           |  40 +++
+ src/evaluation/__init__.py               |   8 +-
+ src/evaluation/error_analysis.py         | 167 ++++++++++++
+ tests/evaluation/test_error_breakdown.py | 434 +++++++++++++++++++++++++++++++
+ 5 files changed, 855 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/docs/vibiomir/dev_annotation_guide.md b/docs/vibiomir/dev_annotation_guide.md
+new file mode 100644
+index 0000000..8ca391c
+--- /dev/null
++++ b/docs/vibiomir/dev_annotation_guide.md
+@@ -0,0 +1,207 @@
++# ViBioMIR Development Set Annotation and Error Analysis Guide
++
++This guide establishes the official annotation protocol, data schema, quality standards, and provenance-based error analysis workflows for the ViBioMIR evaluation and development sets.
++
++---
++
++## 1. Objectives & Principles
++
++In the ViBioMIR benchmark, ground truth relevance labels for the official 1,200 test queries are withheld by the organizers. To systematically develop, debug, and tune the retrieval pipeline, we curate a high-fidelity internal development set (`data/dev/`).
++
++### Core Principles
++1. **No Synthetic Shortcuts**: Queries generated solely by automated prompting from extracted articles do not reflect real clinical information-seeking behavior. Development queries must reflect authentic clinical questions, symptom inquiries, and medical guidelines.
++2. **Strict Provenance**: Every query, document judgment, and reference passage chunk must trace back to its origin, annotator/reviewer, and source character span.
++3. **Conservative Evaluation**: Unjudged documents in a pool are **never** assumed to be negative. Missing labels must be tracked via `judgment_coverage`.
++
++---
++
++## 2. Namespace Separation & Anti-Leakage
++
++To prevent catastrophic evaluation leakage and collisions between internal development benchmarks and official competition sets:
++
++### Namespace Allocation
++- **Official Query IDs**: Reserved exclusively for competition test queries ($1 \dots 1{,}200$).
++- **Development Query IDs**: Must reside in a distinct, non-overlapping integer range starting at `9001` (e.g., $9001, 9002, \dots$).
++- **Enforcement**: `load_dev_records()` rejects any query ID present in the official query ID set with a `ValueError`.
++
++### Split Protection
++- Development records must declare `split: "dev"` (or `"fit"` / `"holdout"`).
++- Any record labeled with forbidden splits (`"test"`, `"public"`, `"private"`, `"official_test"`, `"test_set"`) is rejected immediately by the loader to prevent accidental ingestion of submission artifacts as training data.
++
++---
++
++## 3. Data Schema & Metadata Contract
++
++Development qrels are stored as JSONL lines adhering to `EvaluationRecord` and `DevQueryMetadata`:
++
++```json
++{
++  "query_id": 9001,
++  "relevant_doc_ids": [1042, 5819],
++  "relevant_chunks": [
++    {
++      "doc_id": 1042,
++      "chunk_text": "Triệu chứng suy tim sung huyết thường gặp bao gồm khó thở khi gắng sức...",
++      "char_start": 340,
++      "char_end": 425
++    }
++  ],
++  "metadata": {
++    "query_id": 9001,
++    "query_text": "Dấu hiệu nhận biết và chẩn đoán suy tim sung huyết?",
++    "origin": "clinical_case_hospital_k",
++    "source_doc_ids": [1042, 5819],
++    "topic": "cardiology",
++    "question_style": "symptom_diagnosis",
++    "split": "dev",
++    "pool_version": "pool_v1",
++    "judgment_coverage": 0.85
++  }
++}
++```
++
++### Field Definitions
++
++| Field | Type | Description |
++|---|---|---|
++| `query_id` | `int` | Integer ID strictly $\ge 9001$. |
++| `query_text` | `str` | Full natural query string in Vietnamese or English. |
++| `origin` | `str` | Provenance source identifier (annotator ID, hospital clinical log, guideline QA). |
++| `source_doc_ids` | `tuple[int, ...]` | List of document IDs consulted during query creation. |
++| `topic` | `str` | Medical specialty (e.g., `cardiology`, `oncology`, `pharmacology`, `pediatrics`, `infectious_disease`). |
++| `question_style` | `str` | Structural query type (`factoid`, `symptom_diagnosis`, `treatment_guideline`, `drug_interaction`, `complex_clinical`). |
++| `split` | `str` | Sub-split name (`dev`, `fit`, or `holdout`). Never `test`. |
++| `pool_version` | `str` | Identifier of retriever pool from which judgments were elicited. |
++| `judgment_coverage` | `float` | Fraction of candidate pool documents that were reviewed ($0.0 \dots 1.0$). |
++
++---
++
++## 4. Multi-Retriever Pooling Protocol
++
++Evaluating retrieval solely against documents retrieved by a single system produces massive systemic bias: documents found by that system are judged, while documents only found by other architectures are unjudged and penalized.
++
++### Pooling Procedure
++1. **Candidate Pool Assembly**:
++   - For each query, execute first-stage retrieval with multiple heterogeneous systems:
++     - Sparse: BM25S (lexical match on titles + bodies)
++     - Dense: Multilingual-E5-large (bi-encoder semantic embedding)
++     - Fusion: Weighted RRF candidate union ($K = 20$ from each retriever).
++2. **De-biasing & Shuffling**:
++   - Merge candidates into a pool (typically 20–40 unique document IDs).
++   - Randomize presentation order before presenting to annotators to eliminate rank bias.
++3. **Tri-State Relevance Judgments**:
++   - **Judged Positive**: Document contains direct, verifiable answers or clinical guidance relevant to the query.
++   - **Judged Negative**: Document was examined and determined to be non-relevant.
++   - **Unjudged**: Documents in the corpus outside the pool, or pool documents not inspected due to time budget.
++4. **Golden Rule for Unjudged Documents**:
++   > [!IMPORTANT]
++   > **Never convert unjudged into negative by default.**
++   > Incomplete pools undercount relevant documents. Treating unjudged as negative distorts cutoff calibration and under-estimates system recall.
++
++---
++
++## 5. Exact Reference Chunk Span Extraction
++
++ViBioMIR evaluation penalizes rewritten, hallucinated, or synthesized passages. All reference chunks must originate strictly from the verified source document.
++
++### Guidelines for Chunk Annotation:
++1. **Exact Verbatim Extraction**:
++   - The annotator identifies the exact minimal span in the document's cleaned `source_text` that directly answers or substantiates the query.
++   - Copy the exact characters from `ExtractedDocument.source_text`.
++   - Record `char_start` and `char_end` character offsets.
++2. **No Text Synthesis**:
++   - Never paraphrase, summarize, fix typos, or translate the source text.
++   - The string must match character-for-character with `source_text[char_start:char_end]`.
++3. **Matching Verification**:
++   - Ground truth chunks will be evaluated using the ViBioMIR specification:
++     - Normalization order: NFKC $\rightarrow$ `html.unescape` $\rightarrow$ lowercase $\rightarrow$ collapse whitespace $\rightarrow$ strip.
++     - LCS token ratio $\ge 40\%$ ($\frac{2}{5}$) between candidate and reference chunk under the same `doc_id`.
++     - Chunk matching requires exact document ID identity: chunk text matching across differing document IDs is considered a false positive.
++
++---
++
++## 6. Progressive Annotation Rollout & Stratification
++
++Annotation progresses in two strictly sequenced phases:
++
++### Phase A: Pilot Annotation (30 Queries)
++- **Goal**: Calibrate guideline clarity, establish Inter-Annotator Agreement (Cohen's $\kappa > 0.80$ on document relevance), and validate loader/pipeline scripts.
++- Two annotators independently annotate the 30 queries.
++- Discrepancies are adjudicated by a senior medical reviewer.
++- Confirm that `build_error_breakdown()` runs cleanly on all 30 pilot traces.
++
++### Phase B: Production Scale (100–200 Queries)
++- **Goal**: Build a robust, statistically significant offline evaluation benchmark.
++- **Stratification Requirements**:
++  1. **Topic Distribution**:
++     - $\ge 25\%$ Cardiology & Cardiovascular
++     - $\ge 20\%$ Oncology & Hematology
++     - $\ge 20\%$ Infectious Diseases & Immunology
++     - $\ge 15\%$ Pharmacology & Therapeutics
++     - $\ge 20\%$ General Medicine & Pediatrics
++  2. **Query Language Distribution**:
++     - $\ge 70\%$ Vietnamese (primary focus)
++     - $\le 30\%$ English or mixed biomedical nomenclature
++  3. **Query Length / Complexity**:
++     - Short search keyword style (2–5 words): 30%
++     - Question style (6–15 words): 40%
++     - Clinical vignette / scenario (16+ words): 30%
++
++---
++
++## 7. Anti-Leakage Group Splitting (Fit vs. Holdout)
++
++When splitting the development set into `fit` (used for tuning cutoff thresholds $K_{\text{docs}}$ and $K_{\text{chunks}}$) and `holdout` (used for final unbiased validation):
++
++1. **Source Group Clustering**:
++   - Documents originating from identical domains, URL subdirectories, or near-duplicate source clusters must not be split across `fit` and `holdout`.
++   - All queries whose positive documents touch cluster $C_i$ are assigned entirely to either `fit` or `holdout`.
++2. **Partition Proportions**:
++   - 60% `fit` (parameter calibration)
++   - 40% `holdout` (frozen validation)
++3. **Validation Lock**:
++   - The calibrator must never fit on the holdout split. `CutoffCalibrator` verifies split provenance prior to tuning.
++
++---
++
++## 8. Error Analysis & Failure Breakdown with Provenance
++
++To understand retrieval degradation and prioritize engineering improvements, each query trace is analyzed via `build_error_breakdown()`.
++
++### The Retrieval Drop Funnel
++
++```
++               [ Gold Documents in EvaluationRecord ]
++                                 |
++           Does doc exist in SourceStore snapshot?
++                  /                              \
++               [NO]                              [YES]
++                 |                                 |
++         missing_source_docs              Is doc in candidate_doc_ids?
++     (Crawl / Ingestion failure)                 /             \
++                                              [NO]             [YES]
++                                                |                |
++                                     missing_candidate_docs    Is doc in reranked_doc_ids?
++                                    (1st-stage BM25/E5 drop)     /              \
++                                                              [NO]              [YES]
++                                                                |                 |
++                                                      lost_after_rerank    Is doc in final_doc_ids?
++                                                     (Reranker inversion)     /          \
++                                                                            [NO]         [YES]
++                                                                              |            |
++                                                                     lost_after_cutoff   SUCCESS
++                                                                     (Cutoff policy)  (Doc Retrieved)
++```
++
++### Evidence Funnel (Chunk Level)
++- When a gold reference chunk is not matched by any predicted chunk:
++  - If its parent `doc_id` was **not** retrieved in `final_doc_ids`: Document retrieval failure cascade.
++  - If its parent `doc_id` **was** retrieved in `final_doc_ids`: True evidence extraction failure (`evidence_missing_given_doc`).
++
++### Aggregate Diagnostics
++Using `generate_error_breakdown_summary(breakdowns)`:
++- High `total_missing_source_docs` $\rightarrow$ Expand crawler queue and crawl coverage.
++- High `total_missing_candidate_docs` $\rightarrow$ Increase initial candidate depth $K_{\text{candidate}}$ or enrich sparse index tokens.
++- High `total_lost_after_rerank_docs` $\rightarrow$ Investigate cross-encoder context truncation or score scale compression.
++- High `total_lost_after_cutoff_docs` $\rightarrow$ Relax cutoff threshold $K_{\text{docs}}$.
++- High `total_evidence_missing_given_doc` $\rightarrow$ Adjust chunk splitting boundaries or increase passage extraction budget.
+diff --git a/src/data/vibiomir_contracts.py b/src/data/vibiomir_contracts.py
+index 85ffda3..afdc00f 100644
+--- a/src/data/vibiomir_contracts.py
++++ b/src/data/vibiomir_contracts.py
+@@ -101,43 +101,57 @@ class SpanChunk:
+     index_text: str
+     dense_token_count: int
+     reranker_token_count: int
+ 
+ 
+ @dataclass(frozen=True)
+ class ReferenceChunk:
+     """Reference chunk in development qrels."""
+     doc_id: int
+     chunk_text: str
++    char_start: int | None = None
++    char_end: int | None = None
+ 
+     def __post_init__(self) -> None:
+         if isinstance(self.doc_id, bool) or not isinstance(self.doc_id, int):
+             raise ValueError(f"doc_id must be integer, got {type(self.doc_id).__name__}: {self.doc_id}")
+         if not (-9223372036854775808 <= self.doc_id <= 9223372036854775807):
+             raise ValueError(f"doc_id out of signed int64 range: {self.doc_id}")
+         if not isinstance(self.chunk_text, str) or not self.chunk_text.strip():
+             raise ValueError(f"chunk_text must be non-empty string, got {self.chunk_text!r}")
++        if self.char_start is not None:
++            if isinstance(self.char_start, bool) or not isinstance(self.char_start, int) or self.char_start < 0:
++                raise ValueError(f"char_start must be non-negative int, got {self.char_start!r}")
++        if self.char_end is not None:
++            if isinstance(self.char_end, bool) or not isinstance(self.char_end, int) or self.char_end < 0:
++                raise ValueError(f"char_end must be non-negative int, got {self.char_end!r}")
++            if self.char_start is not None and self.char_end < self.char_start:
++                raise ValueError(f"char_end ({self.char_end}) cannot be less than char_start ({self.char_start})")
+ 
+ 
+ @dataclass(frozen=True)
+ class DevQueryMetadata:
+     """Metadata describing development split query origin and coverage."""
+     query_id: int
+     query_text: str
+     origin: str
+     source_doc_ids: tuple[int, ...]
+     topic: str
+     question_style: str
+     split: str
+     pool_version: str
+     judgment_coverage: float
+ 
++    def __post_init__(self) -> None:
++        if isinstance(self.source_doc_ids, list):
++            object.__setattr__(self, "source_doc_ids", tuple(self.source_doc_ids))
++
+ 
+ @dataclass(frozen=True)
+ class EvaluationRecord:
+     """Ground truth relevance judgments for an evaluation query."""
+     query_id: int
+     relevant_doc_ids: frozenset[int]
+     relevant_chunks: tuple[ReferenceChunk, ...]
+     metadata: DevQueryMetadata | None = None
+ 
+     def __post_init__(self) -> None:
+@@ -374,20 +388,46 @@ class EvaluationSummary:
+ class RetrievalTrace:
+     """Complete candidate score trajectory and filtering trace for a query."""
+     query_id: int
+     candidate_doc_ids: frozenset[int]
+     reranked_doc_ids: frozenset[int]
+     final_doc_ids: frozenset[int]
+     final_chunk_ids: tuple[str, ...]
+     metadata: dict[str, Any] = field(default_factory=dict)
+ 
+ 
++@dataclass(frozen=True)
++class ErrorBreakdown:
++    """Fine-grained retrieval and evidence error breakdown with provenance."""
++    query_id: int
++    missing_source_docs: tuple[int, ...]
++    missing_candidate_docs: tuple[int, ...]
++    lost_after_rerank_docs: tuple[int, ...]
++    lost_after_cutoff_docs: tuple[int, ...]
++    missing_chunk_refs: tuple[ReferenceChunk, ...]
++    evidence_missing_given_doc: tuple[ReferenceChunk, ...]
++
++    def __post_init__(self) -> None:
++        if isinstance(self.missing_source_docs, list):
++            object.__setattr__(self, "missing_source_docs", tuple(self.missing_source_docs))
++        if isinstance(self.missing_candidate_docs, list):
++            object.__setattr__(self, "missing_candidate_docs", tuple(self.missing_candidate_docs))
++        if isinstance(self.lost_after_rerank_docs, list):
++            object.__setattr__(self, "lost_after_rerank_docs", tuple(self.lost_after_rerank_docs))
++        if isinstance(self.lost_after_cutoff_docs, list):
++            object.__setattr__(self, "lost_after_cutoff_docs", tuple(self.lost_after_cutoff_docs))
++        if isinstance(self.missing_chunk_refs, list):
++            object.__setattr__(self, "missing_chunk_refs", tuple(self.missing_chunk_refs))
++        if isinstance(self.evidence_missing_given_doc, list):
++            object.__setattr__(self, "evidence_missing_given_doc", tuple(self.evidence_missing_given_doc))
++
++
+ class SubmissionChunk(TypedDict):
+     """Chunk element in official results.json submission schema."""
+     doc_id: int
+     chunk_text: str
+     chunk_order: NotRequired[int]
+ 
+ 
+ class SubmissionRow(TypedDict):
+     """Query row in official results.json submission schema."""
+     id: int
+diff --git a/src/evaluation/__init__.py b/src/evaluation/__init__.py
+index a33d6c7..7463b66 100644
+--- a/src/evaluation/__init__.py
++++ b/src/evaluation/__init__.py
+@@ -1,15 +1,19 @@
+ """Evaluation package for Multilingual Medical Retrieval MVP."""
+ 
+ from src.evaluation.calibrator import CalibrationState, CutoffCalibrator
+ from src.evaluation.dev_records import load_dev_records
+-from src.evaluation.error_analysis import generate_error_analysis_report
++from src.evaluation.error_analysis import (
++    build_error_breakdown,
++    generate_error_analysis_report,
++    generate_error_breakdown_summary,
++)
+ from src.evaluation.metrics import (
+     calculate_f2,
+     calculate_precision_recall_fbeta,
+     evaluate_predictions,
+     evaluate_query,
+ )
+ from src.evaluation.vibiomir_metrics import (
+     EMPTY_BOTH_ZERO_PROFILE,
+     PROVISIONAL_SPEC_V1_PROFILE,
+     evaluate_dataset,
+@@ -29,20 +33,22 @@ from src.evaluation.vibiomir_text import (
+ __all__ = [
+     "calculate_f2",
+     "calculate_precision_recall_fbeta",
+     "evaluate_query",
+     "evaluate_predictions",
+     "evaluate_vibiomir_query",
+     "evaluate_dataset",
+     "CutoffCalibrator",
+     "CalibrationState",
+     "generate_error_analysis_report",
++    "build_error_breakdown",
++    "generate_error_breakdown_summary",
+     "load_dev_records",
+     "normalize_eval_text",
+     "tokenize_eval_text",
+     "lcs_length",
+     "overlap_matches",
+     "TextMatchProfile",
+     "TextOverlapEvaluator",
+     "PROVISIONAL_SPEC_V1",
+     "PROVISIONAL_SPEC_V1_PROFILE",
+     "EMPTY_BOTH_ZERO_PROFILE",
+diff --git a/src/evaluation/error_analysis.py b/src/evaluation/error_analysis.py
+index 0322426..e8f9d3e 100644
+--- a/src/evaluation/error_analysis.py
++++ b/src/evaluation/error_analysis.py
+@@ -1,19 +1,29 @@
+ from __future__ import annotations
+ 
+ import csv
+ import json
+ from pathlib import Path
+ from typing import Sequence
+ 
+ from src.data.schemas import FinalPrediction, GroundTruthRecord, QueryRecord
++from src.data.vibiomir_contracts import (
++    ErrorBreakdown,
++    EvaluationProfile,
++    EvaluationRecord,
++    ReferenceChunk,
++    RetrievalTrace,
++    SourceStore,
++)
+ from src.evaluation.metrics import calculate_precision_recall_fbeta
++from src.evaluation.vibiomir_metrics import PROVISIONAL_SPEC_V1_PROFILE
++from src.evaluation.vibiomir_text import TextMatchProfile, TextOverlapEvaluator
+ 
+ 
+ def generate_error_analysis_report(
+     predictions: Sequence[FinalPrediction],
+     ground_truths: Sequence[GroundTruthRecord],
+     output_dir: Path | str,
+     queries: Sequence[QueryRecord] | None = None,
+     beta: float = 2.0,
+ ) -> dict[str, Path]:
+     """Generate detailed error analysis reports and metrics artifacts.
+@@ -197,10 +207,167 @@ def generate_error_analysis_report(
+         "total_queries": total_q,
+     }
+     with open(summary_path, "w", encoding="utf-8") as f:
+         json.dump(summary_data, f, indent=2, ensure_ascii=False)
+ 
+     return {
+         "per_query_metrics": per_query_path,
+         "error_cases": error_cases_path,
+         "summary": summary_path,
+     }
++
++
++def build_error_breakdown(
++    trace: RetrievalTrace,
++    gold: EvaluationRecord,
++    store: SourceStore,
++    profile: EvaluationProfile | None = None,
++) -> ErrorBreakdown:
++    """Build fine-grained retrieval and evidence error breakdown with provenance.
++
++    Traces each failure location:
++    - missing_source_docs: Gold doc missing from SourceStore
++    - missing_candidate_docs: Gold doc in SourceStore but not in candidate_doc_ids
++    - lost_after_rerank_docs: Gold doc in candidate_doc_ids but not in reranked_doc_ids
++    - lost_after_cutoff_docs: Gold doc in reranked_doc_ids but not in final_doc_ids
++    - missing_chunk_refs: Gold reference chunks not matched by predicted chunks
++    - evidence_missing_given_doc: Gold chunks missed where parent doc was in final_doc_ids
++
++    Args:
++        trace: Candidate score trajectory and retrieved IDs for the query.
++        gold: Evaluation record containing ground truth doc IDs and reference chunks.
++        store: SourceStore containing frozen snapshot documents and chunks.
++        profile: Evaluation profile for text matching (defaults to PROVISIONAL_SPEC_V1_PROFILE).
++
++    Returns:
++        ErrorBreakdown detailing all document drop stages and missing evidence chunks.
++    """
++    if gold.query_id != trace.query_id:
++        raise ValueError(
++            f"Gold query_id ({gold.query_id}) does not match trace query_id ({trace.query_id})"
++        )
++
++    # 1. Document Drop Funnel
++    missing_source_docs: list[int] = []
++    missing_candidate_docs: list[int] = []
++    lost_after_rerank_docs: list[int] = []
++    lost_after_cutoff_docs: list[int] = []
++
++    for doc_id in sorted(gold.relevant_doc_ids):
++        if not store.contains_official_doc(doc_id):
++            missing_source_docs.append(doc_id)
++        elif doc_id not in trace.candidate_doc_ids:
++            missing_candidate_docs.append(doc_id)
++        elif doc_id not in trace.reranked_doc_ids:
++            lost_after_rerank_docs.append(doc_id)
++        elif doc_id not in trace.final_doc_ids:
++            lost_after_cutoff_docs.append(doc_id)
++
++    # 2. Predicted Chunks Resolution
++    pred_chunks: list[tuple[int, str]] = []
++    if (
++        trace.metadata
++        and "predicted_chunks" in trace.metadata
++        and trace.metadata["predicted_chunks"] is not None
++    ):
++        for item in trace.metadata["predicted_chunks"]:
++            if isinstance(item, dict):
++                p_doc_id = int(item["doc_id"])
++                p_text = str(item.get("chunk_text", ""))
++            else:
++                p_doc_id = int(getattr(item, "doc_id"))
++                p_text = str(getattr(item, "chunk_text", ""))
++            pred_chunks.append((p_doc_id, p_text))
++    elif trace.final_chunk_ids:
++        for cid in trace.final_chunk_ids:
++            try:
++                chunk = store.get_chunk(cid)
++                pred_chunks.append((int(chunk.doc_id), str(chunk.text)))
++            except Exception:
++                pass
++
++    # 3. Text Overlap Evaluator Setup
++    if profile is None:
++        eval_profile = PROVISIONAL_SPEC_V1_PROFILE
++    else:
++        eval_profile = profile
++
++    if hasattr(eval_profile, "tokenizer_name") and hasattr(eval_profile, "threshold"):
++        text_profile = TextMatchProfile(
++            tokenizer_name=eval_profile.tokenizer_name,
++            normalization_version=eval_profile.normalization_version,
++            overlap_threshold=eval_profile.threshold,
++        )
++        evaluator = TextOverlapEvaluator(profile=text_profile)
++    elif isinstance(eval_profile, TextMatchProfile):
++        evaluator = TextOverlapEvaluator(profile=eval_profile)
++    else:
++        evaluator = TextOverlapEvaluator()
++
++    # 4. Reference Chunk Matching
++    missing_chunk_refs: list[ReferenceChunk] = []
++    evidence_missing_given_doc: list[ReferenceChunk] = []
++
++    for ref in gold.relevant_chunks:
++        matched = False
++        for p_doc_id, p_text in pred_chunks:
++            if p_doc_id == ref.doc_id and evaluator.matches(p_text, ref.chunk_text):
++                matched = True
++                break
++
++        if not matched:
++            missing_chunk_refs.append(ref)
++            if ref.doc_id in trace.final_doc_ids:
++                evidence_missing_given_doc.append(ref)
++
++    return ErrorBreakdown(
++        query_id=trace.query_id,
++        missing_source_docs=tuple(missing_source_docs),
++        missing_candidate_docs=tuple(missing_candidate_docs),
++        lost_after_rerank_docs=tuple(lost_after_rerank_docs),
++        lost_after_cutoff_docs=tuple(lost_after_cutoff_docs),
++        missing_chunk_refs=tuple(missing_chunk_refs),
++        evidence_missing_given_doc=tuple(evidence_missing_given_doc),
++    )
++
++
++def generate_error_breakdown_summary(
++    breakdowns: Sequence[ErrorBreakdown],
++) -> dict[str, Any]:
++    """Generate aggregate dataset-level summary of retrieval and evidence failures.
++
++    Args:
++        breakdowns: Sequence of ErrorBreakdown objects.
++
++    Returns:
++        Summary dict containing totals, query-level loss counts, and breakdown metrics.
++    """
++    total_queries = len(breakdowns)
++    total_missing_source = sum(len(b.missing_source_docs) for b in breakdowns)
++    total_missing_candidate = sum(len(b.missing_candidate_docs) for b in breakdowns)
++    total_lost_rerank = sum(len(b.lost_after_rerank_docs) for b in breakdowns)
++    total_lost_cutoff = sum(len(b.lost_after_cutoff_docs) for b in breakdowns)
++    total_missing_chunks = sum(len(b.missing_chunk_refs) for b in breakdowns)
++    total_evidence_missing_given_doc = sum(len(b.evidence_missing_given_doc) for b in breakdowns)
++
++    queries_missing_source = sum(1 for b in breakdowns if b.missing_source_docs)
++    queries_missing_candidate = sum(1 for b in breakdowns if b.missing_candidate_docs)
++    queries_lost_rerank = sum(1 for b in breakdowns if b.lost_after_rerank_docs)
++    queries_lost_cutoff = sum(1 for b in breakdowns if b.lost_after_cutoff_docs)
++    queries_missing_chunks = sum(1 for b in breakdowns if b.missing_chunk_refs)
++    queries_evidence_missing_given_doc = sum(1 for b in breakdowns if b.evidence_missing_given_doc)
++
++    return {
++        "total_queries": total_queries,
++        "total_missing_source_docs": total_missing_source,
++        "total_missing_candidate_docs": total_missing_candidate,
++        "total_lost_after_rerank_docs": total_lost_rerank,
++        "total_lost_after_cutoff_docs": total_lost_cutoff,
++        "total_missing_chunk_refs": total_missing_chunks,
++        "total_evidence_missing_given_doc": total_evidence_missing_given_doc,
++        "queries_with_missing_source": queries_missing_source,
++        "queries_with_missing_candidates": queries_missing_candidate,
++        "queries_with_rerank_losses": queries_lost_rerank,
++        "queries_with_cutoff_losses": queries_lost_cutoff,
++        "queries_with_missing_chunks": queries_missing_chunks,
++        "queries_with_evidence_missing_given_doc": queries_evidence_missing_given_doc,
++    }
+diff --git a/tests/evaluation/test_error_breakdown.py b/tests/evaluation/test_error_breakdown.py
+new file mode 100644
+index 0000000..81e86c8
+--- /dev/null
++++ b/tests/evaluation/test_error_breakdown.py
+@@ -0,0 +1,434 @@
++"""Unit tests for error breakdown and failure funnel analysis with provenance.
++
++Tests each failure drop location:
++- missing_source_docs (gold doc missing from SourceStore)
++- missing_candidate_docs (gold doc in SourceStore but not in candidate_doc_ids)
++- lost_after_rerank_docs (gold doc in candidate_doc_ids but not in reranked_doc_ids)
++- lost_after_cutoff_docs (gold doc in reranked_doc_ids but not in final_doc_ids)
++- missing_chunk_refs & evidence_missing_given_doc (chunk evidence missing given/not given parent doc)
++- generate_error_breakdown_summary (dataset-level aggregation of failure stages)
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from src.data.vibiomir_contracts import (
++    ErrorBreakdown,
++    EvaluationRecord,
++    ExtractedDocument,
++    ReferenceChunk,
++    RetrievalTrace,
++    SpanChunk,
++)
++from src.evaluation.error_analysis import (
++    build_error_breakdown,
++    generate_error_breakdown_summary,
++)
++from src.evaluation.vibiomir_metrics import (
++    EMPTY_BOTH_ZERO_PROFILE,
++    PROVISIONAL_SPEC_V1_PROFILE,
++)
++
++
++class MockSourceStore:
++    """Mock SourceStore for testing error breakdown."""
++
++    def __init__(
++        self,
++        docs: dict[int, ExtractedDocument] | None = None,
++        chunks: dict[str, SpanChunk] | None = None,
++    ) -> None:
++        self._docs = docs or {}
++        self._chunks = chunks or {}
++
++    def contains_official_doc(self, doc_id: int) -> bool:
++        return doc_id in self._docs
++
++    def get_document(self, doc_id: int) -> ExtractedDocument:
++        if doc_id not in self._docs:
++            raise KeyError(f"Doc {doc_id} not found")
++        return self._docs[doc_id]
++
++    def get_chunk(self, chunk_id: str) -> SpanChunk:
++        if chunk_id not in self._chunks:
++            raise KeyError(f"Chunk {chunk_id} not found")
++        return self._chunks[chunk_id]
++
++
++def _make_dummy_doc(doc_id: int, text: str = "Dummy text") -> ExtractedDocument:
++    return ExtractedDocument(
++        doc_id=doc_id,
++        source_version="v1",
++        source_text=text,
++        source_sha256="abc",
++        raw_sha256="raw_abc",
++        title=f"Doc {doc_id}",
++        language="vi",
++        blocks=(),
++        quality_flags=(),
++    )
++
++
++def _make_dummy_chunk(chunk_id: str, doc_id: int, text: str) -> SpanChunk:
++    return SpanChunk(
++        chunk_id=chunk_id,
++        doc_id=doc_id,
++        source_version="v1",
++        source_sha256="abc",
++        start_char=0,
++        end_char=len(text),
++        chunk_index=0,
++        language="vi",
++        section=None,
++        text=text,
++        index_text=text,
++        dense_token_count=len(text.split()),
++        reranker_token_count=len(text.split()),
++    )
++
++
++def test_missing_source_docs_when_not_in_store():
++    """Gold doc not present in SourceStore drops into missing_source_docs."""
++    # Doc 100 is NOT in store
++    store = MockSourceStore(docs={200: _make_dummy_doc(200)})
++    gold = EvaluationRecord(
++        query_id=1,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(),
++    )
++    trace = RetrievalTrace(
++        query_id=1,
++        candidate_doc_ids=frozenset(),
++        reranked_doc_ids=frozenset(),
++        final_doc_ids=frozenset(),
++        final_chunk_ids=(),
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.query_id == 1
++    assert breakdown.missing_source_docs == (100,)
++    assert breakdown.missing_candidate_docs == ()
++    assert breakdown.lost_after_rerank_docs == ()
++    assert breakdown.lost_after_cutoff_docs == ()
++    assert breakdown.missing_chunk_refs == ()
++    assert breakdown.evidence_missing_given_doc == ()
++
++
++def test_missing_candidate_docs_when_in_store_but_not_retrieved():
++    """Gold doc in SourceStore but missing from candidate_doc_ids drops into missing_candidate_docs."""
++    store = MockSourceStore(docs={100: _make_dummy_doc(100)})
++    gold = EvaluationRecord(
++        query_id=1,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(),
++    )
++    trace = RetrievalTrace(
++        query_id=1,
++        candidate_doc_ids=frozenset({200, 300}),  # 100 not in candidate pool
++        reranked_doc_ids=frozenset({200}),
++        final_doc_ids=frozenset({200}),
++        final_chunk_ids=(),
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_source_docs == ()
++    assert breakdown.missing_candidate_docs == (100,)
++    assert breakdown.lost_after_rerank_docs == ()
++    assert breakdown.lost_after_cutoff_docs == ()
++
++
++def test_lost_after_rerank_docs():
++    """Gold doc in candidate_doc_ids but filtered out before reranked_doc_ids."""
++    store = MockSourceStore(docs={100: _make_dummy_doc(100)})
++    gold = EvaluationRecord(
++        query_id=1,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(),
++    )
++    trace = RetrievalTrace(
++        query_id=1,
++        candidate_doc_ids=frozenset({100, 200}),
++        reranked_doc_ids=frozenset({200}),  # 100 lost during/after rerank
++        final_doc_ids=frozenset({200}),
++        final_chunk_ids=(),
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_source_docs == ()
++    assert breakdown.missing_candidate_docs == ()
++    assert breakdown.lost_after_rerank_docs == (100,)
++    assert breakdown.lost_after_cutoff_docs == ()
++
++
++def test_lost_after_cutoff_docs():
++    """Gold doc in reranked_doc_ids but excluded from final_doc_ids by cutoff."""
++    store = MockSourceStore(docs={100: _make_dummy_doc(100)})
++    gold = EvaluationRecord(
++        query_id=1,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(),
++    )
++    trace = RetrievalTrace(
++        query_id=1,
++        candidate_doc_ids=frozenset({100}),
++        reranked_doc_ids=frozenset({100}),
++        final_doc_ids=frozenset(),  # cutoff dropped doc 100
++        final_chunk_ids=(),
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_source_docs == ()
++    assert breakdown.missing_candidate_docs == ()
++    assert breakdown.lost_after_rerank_docs == ()
++    assert breakdown.lost_after_cutoff_docs == (100,)
++
++
++def test_funnel_with_multiple_gold_docs():
++    """Multiple gold docs failing at distinct stages are separated cleanly."""
++    # 10: missing source
++    # 20: missing candidate
++    # 30: lost after rerank
++    # 40: lost after cutoff
++    # 50: successfully retrieved in final
++    store = MockSourceStore(
++        docs={
++            20: _make_dummy_doc(20),
++            30: _make_dummy_doc(30),
++            40: _make_dummy_doc(40),
++            50: _make_dummy_doc(50),
++        }
++    )
++    gold = EvaluationRecord(
++        query_id=42,
++        relevant_doc_ids=frozenset({10, 20, 30, 40, 50}),
++        relevant_chunks=(),
++    )
++    trace = RetrievalTrace(
++        query_id=42,
++        candidate_doc_ids=frozenset({30, 40, 50}),
++        reranked_doc_ids=frozenset({40, 50}),
++        final_doc_ids=frozenset({50}),
++        final_chunk_ids=(),
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_source_docs == (10,)
++    assert breakdown.missing_candidate_docs == (20,)
++    assert breakdown.lost_after_rerank_docs == (30,)
++    assert breakdown.lost_after_cutoff_docs == (40,)
++
++
++def test_chunk_evidence_missing_when_parent_doc_not_retrieved():
++    """Gold chunk missed when parent doc was never retrieved is in missing_chunk_refs,
++
++    but NOT in evidence_missing_given_doc.
++    """
++    store = MockSourceStore(docs={100: _make_dummy_doc(100)})
++    ref_chunk = ReferenceChunk(doc_id=100, chunk_text="bệnh nhân suy tim độ 2")
++    gold = EvaluationRecord(
++        query_id=1,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(ref_chunk,),
++    )
++    trace = RetrievalTrace(
++        query_id=1,
++        candidate_doc_ids=frozenset(),
++        reranked_doc_ids=frozenset(),
++        final_doc_ids=frozenset(),  # Doc 100 never retrieved
++        final_chunk_ids=(),
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_chunk_refs == (ref_chunk,)
++    assert breakdown.evidence_missing_given_doc == ()
++
++
++def test_chunk_evidence_missing_when_parent_doc_was_retrieved():
++    """Gold chunk missed when parent doc WAS retrieved in final_doc_ids
++
++    appears in both missing_chunk_refs AND evidence_missing_given_doc.
++    """
++    store = MockSourceStore(docs={100: _make_dummy_doc(100)})
++    ref_chunk = ReferenceChunk(doc_id=100, chunk_text="triệu chứng suy tim sung huyết")
++    gold = EvaluationRecord(
++        query_id=1,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(ref_chunk,),
++    )
++    trace = RetrievalTrace(
++        query_id=1,
++        candidate_doc_ids=frozenset({100}),
++        reranked_doc_ids=frozenset({100}),
++        final_doc_ids=frozenset({100}),  # Doc 100 retrieved!
++        final_chunk_ids=(),  # But no chunks retrieved
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_chunk_refs == (ref_chunk,)
++    assert breakdown.evidence_missing_given_doc == (ref_chunk,)
++
++
++def test_chunk_correctly_matched_via_store_lookup():
++    """Predicted chunk retrieved via store.get_chunk matching gold chunk prevents missing error."""
++    chunk = _make_dummy_chunk("c1", 100, "triệu chứng suy tim cấp và mạn tính")
++    store = MockSourceStore(
++        docs={100: _make_dummy_doc(100)},
++        chunks={"c1": chunk},
++    )
++    ref_chunk = ReferenceChunk(doc_id=100, chunk_text="triệu chứng suy tim cấp")
++    gold = EvaluationRecord(
++        query_id=1,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(ref_chunk,),
++    )
++    trace = RetrievalTrace(
++        query_id=1,
++        candidate_doc_ids=frozenset({100}),
++        reranked_doc_ids=frozenset({100}),
++        final_doc_ids=frozenset({100}),
++        final_chunk_ids=("c1",),
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_chunk_refs == ()
++    assert breakdown.evidence_missing_given_doc == ()
++
++
++def test_chunk_correctly_matched_via_trace_metadata_predicted_chunks():
++    """Predicted chunk supplied via trace.metadata['predicted_chunks'] correctly matches."""
++    store = MockSourceStore(docs={100: _make_dummy_doc(100)})
++    ref_chunk = ReferenceChunk(doc_id=100, chunk_text="tăng huyết áp vô căn")
++    gold = EvaluationRecord(
++        query_id=2,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(ref_chunk,),
++    )
++    trace = RetrievalTrace(
++        query_id=2,
++        candidate_doc_ids=frozenset({100}),
++        reranked_doc_ids=frozenset({100}),
++        final_doc_ids=frozenset({100}),
++        final_chunk_ids=(),
++        metadata={
++            "predicted_chunks": [
++                {"doc_id": 100, "chunk_text": "chẩn đoán tăng huyết áp vô căn thường gặp"}
++            ]
++        },
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    assert breakdown.missing_chunk_refs == ()
++    assert breakdown.evidence_missing_given_doc == ()
++
++
++def test_predicted_chunk_different_doc_id_does_not_match():
++    """Predicted chunk with different doc_id does not match even with identical text."""
++    store = MockSourceStore(
++        docs={100: _make_dummy_doc(100), 200: _make_dummy_doc(200)}
++    )
++    ref_chunk = ReferenceChunk(doc_id=100, chunk_text="viêm phổi thùy phải")
++    gold = EvaluationRecord(
++        query_id=3,
++        relevant_doc_ids=frozenset({100}),
++        relevant_chunks=(ref_chunk,),
++    )
++    trace = RetrievalTrace(
++        query_id=3,
++        candidate_doc_ids=frozenset({100, 200}),
++        reranked_doc_ids=frozenset({100, 200}),
++        final_doc_ids=frozenset({100, 200}),  # doc 100 retrieved
++        final_chunk_ids=(),
++        metadata={
++            "predicted_chunks": [
++                {"doc_id": 200, "chunk_text": "viêm phổi thùy phải"}  # Different doc_id!
++            ]
++        },
++    )
++
++    breakdown = build_error_breakdown(trace=trace, gold=gold, store=store)
++
++    # Missed because doc_id differs, and since parent doc 100 was retrieved, it is also in evidence_missing_given_doc
++    assert breakdown.missing_chunk_refs == (ref_chunk,)
++    assert breakdown.evidence_missing_given_doc == (ref_chunk,)
++
++
++def test_build_error_breakdown_mismatched_query_id_raises():
++    """Mismatched query_id between trace and gold record raises ValueError."""
++    store = MockSourceStore()
++    gold = EvaluationRecord(query_id=1, relevant_doc_ids=frozenset(), relevant_chunks=())
++    trace = RetrievalTrace(
++        query_id=2,
++        candidate_doc_ids=frozenset(),
++        reranked_doc_ids=frozenset(),
++        final_doc_ids=frozenset(),
++        final_chunk_ids=(),
++    )
++    with pytest.raises(ValueError, match="query_id.*does not match"):
++        build_error_breakdown(trace=trace, gold=gold, store=store)
++
++
++def test_generate_error_breakdown_summary():
++    """Aggregate summary correctly computes totals, affected queries, and rates."""
++    b1 = ErrorBreakdown(
++        query_id=1,
++        missing_source_docs=(10,),
++        missing_candidate_docs=(20, 21),
++        lost_after_rerank_docs=(),
++        lost_after_cutoff_docs=(30,),
++        missing_chunk_refs=(ReferenceChunk(doc_id=20, chunk_text="chunk 20"),),
++        evidence_missing_given_doc=(),
++    )
++    b2 = ErrorBreakdown(
++        query_id=2,
++        missing_source_docs=(),
++        missing_candidate_docs=(),
++        lost_after_rerank_docs=(40,),
++        lost_after_cutoff_docs=(),
++        missing_chunk_refs=(
++            ReferenceChunk(doc_id=50, chunk_text="chunk 50a"),
++            ReferenceChunk(doc_id=50, chunk_text="chunk 50b"),
++        ),
++        evidence_missing_given_doc=(
++            ReferenceChunk(doc_id=50, chunk_text="chunk 50a"),
++        ),
++    )
++
++    summary = generate_error_breakdown_summary([b1, b2])
++
++    assert summary["total_queries"] == 2
++    assert summary["total_missing_source_docs"] == 1
++    assert summary["total_missing_candidate_docs"] == 2
++    assert summary["total_lost_after_rerank_docs"] == 1
++    assert summary["total_lost_after_cutoff_docs"] == 1
++    assert summary["total_missing_chunk_refs"] == 3
++    assert summary["total_evidence_missing_given_doc"] == 1
++
++    # Affected query counts
++    assert summary["queries_with_missing_source"] == 1
++    assert summary["queries_with_missing_candidates"] == 1
++    assert summary["queries_with_rerank_losses"] == 1
++    assert summary["queries_with_cutoff_losses"] == 1
++    assert summary["queries_with_missing_chunks"] == 2
++    assert summary["queries_with_evidence_missing_given_doc"] == 1
++
++
++def test_generate_error_breakdown_summary_empty():
++    """Empty breakdowns sequence returns zeroed summary."""
++    summary = generate_error_breakdown_summary([])
++    assert summary["total_queries"] == 0
++    assert summary["total_missing_source_docs"] == 0
++    assert summary["total_missing_candidate_docs"] == 0
++    assert summary["total_lost_after_rerank_docs"] == 0
++    assert summary["total_lost_after_cutoff_docs"] == 0
++    assert summary["total_missing_chunk_refs"] == 0
++    assert summary["total_evidence_missing_given_doc"] == 0

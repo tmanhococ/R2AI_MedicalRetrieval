@@ -1,0 +1,1209 @@
+# Review package: ca62aa0..61e6719
+
+## Commits
+61e6719 feat: add ViBioMIR official inputs and source registry (Task 1)
+
+## Files changed
+ configs/vibiomir_phase1.yaml       |  87 ++++++++++
+ src/data/vibiomir_adapter.py       | 149 +++++++++++++++++
+ src/data/vibiomir_contracts.py     | 319 +++++++++++++++++++++++++++++++++++++
+ src/data/vibiomir_registry.py      | 295 ++++++++++++++++++++++++++++++++++
+ tests/data/test_vibiomir_inputs.py | 315 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 1165 insertions(+)
+
+## Diff
+diff --git a/configs/vibiomir_phase1.yaml b/configs/vibiomir_phase1.yaml
+new file mode 100644
+index 0000000..a6644d5
+--- /dev/null
++++ b/configs/vibiomir_phase1.yaml
+@@ -0,0 +1,87 @@
++run:
++  experiment_name: vibiomir_phase1_A
++  seed: 42
++
++dataset:
++  adapter: vibiomir
++  query_path: data/official/query.parquet
++  source_path: data/official/links_corpus.parquet
++  expected_query_count: 1200
++  registry_path: artifacts/vibiomir/registry.sqlite
++
++crawl:
++  concurrency: 16
++  per_domain_concurrency: 2
++  min_domain_interval_seconds: 1
++  connect_timeout_seconds: 10
++  read_timeout_seconds: 30
++  total_deadline_seconds: 60
++  max_attempts: 3
++  base_backoff_seconds: 2
++  lease_seconds: 120
++  max_redirects: 5
++  max_html_bytes: 10485760
++  max_pdf_bytes: 31457280
++  respect_robots: true
++  raw_root: artifacts/vibiomir/raw
++
++extraction:
++  html_backend: trafilatura
++  pdf_backend: pymupdf
++  language_model_path: artifacts/models/lid.176.ftz
++  language_confidence_min: 0.70
++  accepted_languages: [vi, en, zh]
++  quarantine_unknown_language: true
++
++indexing:
++  snapshot_root: artifacts/vibiomir/snapshots
++  parquet_row_group_size: 5000
++  target_shard_bytes: 67108864
++  chunking:
++    mode: auto
++    auto_strategy:
++      type: paragraph_token_spans
++      body_max_tokens: 320
++      long_block_overlap_tokens: 64
++      contextual_header_max_tokens: 32
++      drop_short_blocks: false
++
++query_understanding:
++  adaptive_routing:
++    strip_clinical_boilerplate: false
++    dense_strategy: full
++
++reranker:
++  max_length: 512
++  query_window_tokens: 128
++  query_window_overlap_tokens: 16
++  query_window_aggregation: max
++  body_truncation: reject
++
++post_processing:
++  consistency_mode: independent
++
++evaluation:
++  profile: provisional_spec_v1
++  normalization: btc_order_v1
++  tokenizer: whitespace_v1
++  overlap_threshold: "2/5"
++  undefined_pr: 0
++  empty_both_f2: 1
++  scorer_parity_verified: false
++
++calibration:
++  fit_enabled: false
++  fallback_policy: fixed_top_k
++  fixed_top_k: {documents: 5, chunks: 10}
++  bounds:
++    documents: {min: 0, max: 50}
++    chunks: {min: 0, max: 100}
++
++submission:
++  exporter: vibiomir_json_zip
++  doc_id_type: integer
++  emit_chunk_order: true
++  json_filename: results.json
++  zip_filename: submission_A.zip
++  provenance_check: strict
+diff --git a/src/data/vibiomir_adapter.py b/src/data/vibiomir_adapter.py
+new file mode 100644
+index 0000000..1423147
+--- /dev/null
++++ b/src/data/vibiomir_adapter.py
+@@ -0,0 +1,149 @@
++import hashlib
++from pathlib import Path
++from typing import Iterator
++
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++from src.data.vibiomir_contracts import (
++    OfficialQuery,
++    OfficialSource,
++)
++
++
++def compute_file_sha256(path: Path | str, chunk_size: int = 65536) -> str:
++    """Computes the SHA-256 hex digest of a file."""
++    path = Path(path)
++    hasher = hashlib.sha256()
++    with path.open("rb") as f:
++        while chunk := f.read(chunk_size):
++            hasher.update(chunk)
++    return hasher.hexdigest()
++
++
++class OfficialSourceIterator:
++    """Streaming iterator over official sources in Parquet with lazy SHA256 computation."""
++
++    def __init__(self, path: Path | str, batch_size: int = 10000) -> None:
++        self.path = Path(path)
++        if not self.path.exists():
++            raise FileNotFoundError(f"Corpus file not found: {self.path}")
++        self.batch_size = batch_size
++        self._sha256: str | None = None
++
++    @property
++    def input_sha256(self) -> str:
++        if self._sha256 is None:
++            self._sha256 = compute_file_sha256(self.path)
++        return self._sha256
++
++    def __iter__(self) -> Iterator[OfficialSource]:
++        parquet_file = pq.ParquetFile(self.path)
++        schema = parquet_file.schema_arrow
++
++        if "id" not in schema.names or "url" not in schema.names:
++            raise ValueError(
++                f"Parquet file must contain 'id' and 'url' columns, got {schema.names}"
++            )
++
++        id_field = schema.field("id")
++        url_field = schema.field("url")
++
++        if not pa.types.is_integer(id_field.type):
++            raise ValueError(
++                f"Column 'id' must be integer type (signed int64), got {id_field.type}"
++            )
++        if not (pa.types.is_string(url_field.type) or pa.types.is_large_string(url_field.type)):
++            raise ValueError(
++                f"Column 'url' must be string type, got {url_field.type}"
++            )
++
++        for batch in parquet_file.iter_batches(
++            batch_size=self.batch_size, columns=["id", "url"]
++        ):
++            id_col = batch.column("id")
++            url_col = batch.column("url")
++
++            if id_col.null_count > 0:
++                raise ValueError("Column 'id' contains null values")
++            if url_col.null_count > 0:
++                raise ValueError("Column 'url' contains null values")
++
++            for raw_id, raw_url in zip(id_col.to_pylist(), url_col.to_pylist()):
++                if isinstance(raw_id, bool) or not isinstance(raw_id, int):
++                    raise ValueError(f"doc_id must be integer, got {type(raw_id).__name__}: {raw_id}")
++                if not (-9223372036854775808 <= raw_id <= 9223372036854775807):
++                    raise ValueError(f"doc_id out of signed int64 range: {raw_id}")
++                if not isinstance(raw_url, str) or not raw_url.strip():
++                    raise ValueError(f"url must be non-empty string, got {raw_url!r}")
++
++                yield OfficialSource(doc_id=raw_id, url=raw_url.strip())
++
++
++def iter_official_sources(
++    path: Path | str, batch_size: int = 10000
++) -> OfficialSourceIterator:
++    """Returns a streaming iterator over official sources in Parquet."""
++    return OfficialSourceIterator(path=path, batch_size=batch_size)
++
++
++def load_official_queries(
++    path: Path | str, expected_count: int | None = None
++) -> tuple[OfficialQuery, ...]:
++    """Loads and validates official queries from query.parquet."""
++    path = Path(path)
++    if not path.exists():
++        raise FileNotFoundError(f"Query file not found: {path}")
++
++    parquet_file = pq.ParquetFile(path)
++    schema = parquet_file.schema_arrow
++
++    if "id" not in schema.names or "query" not in schema.names:
++        raise ValueError(
++            f"Parquet file must contain 'id' and 'query' columns, got {schema.names}"
++        )
++
++    id_field = schema.field("id")
++    query_field = schema.field("query")
++
++    if not pa.types.is_integer(id_field.type):
++        raise ValueError(
++            f"Column 'id' must be integer type (signed int64), got {id_field.type}"
++        )
++    if not (pa.types.is_string(query_field.type) or pa.types.is_large_string(query_field.type)):
++        raise ValueError(
++            f"Column 'query' must be string type, got {query_field.type}"
++        )
++
++    table = parquet_file.read(columns=["id", "query"])
++    id_col = table.column("id")
++    query_col = table.column("query")
++
++    if id_col.null_count > 0:
++        raise ValueError("Column 'id' contains null values")
++    if query_col.null_count > 0:
++        raise ValueError("Column 'query' contains null values")
++
++    queries: list[OfficialQuery] = []
++    seen_ids: set[int] = set()
++
++    for raw_id, raw_query in zip(id_col.to_pylist(), query_col.to_pylist()):
++        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
++            raise ValueError(f"query_id must be integer, got {type(raw_id).__name__}: {raw_id}")
++        if not (-9223372036854775808 <= raw_id <= 9223372036854775807):
++            raise ValueError(f"query_id out of signed int64 range: {raw_id}")
++        if not isinstance(raw_query, str) or not raw_query.strip():
++            raise ValueError(f"query must be non-empty string, got {raw_query!r}")
++
++        if raw_id in seen_ids:
++            raise ValueError(f"Duplicate query_id found: {raw_id}")
++        seen_ids.add(raw_id)
++
++        queries.append(OfficialQuery(query_id=raw_id, query=raw_query.strip()))
++
++    if expected_count is not None and len(queries) != expected_count:
++        raise ValueError(
++            f"Expected {expected_count} queries, but found {len(queries)} in {path}"
++        )
++
++    return tuple(queries)
+diff --git a/src/data/vibiomir_contracts.py b/src/data/vibiomir_contracts.py
+new file mode 100644
+index 0000000..e50ca60
+--- /dev/null
++++ b/src/data/vibiomir_contracts.py
+@@ -0,0 +1,319 @@
++from dataclasses import dataclass, field
++from fractions import Fraction
++from pathlib import Path
++from typing import Any, NotRequired, Protocol, TypedDict, runtime_checkable
++
++
++@dataclass(frozen=True)
++class OfficialSource:
++    """Official source document representation from links_corpus.parquet."""
++    doc_id: int
++    url: str
++
++    def __post_init__(self) -> None:
++        if isinstance(self.doc_id, bool) or not isinstance(self.doc_id, int):
++            raise ValueError(f"doc_id must be integer, got {type(self.doc_id).__name__}: {self.doc_id}")
++        if not (-9223372036854775808 <= self.doc_id <= 9223372036854775807):
++            raise ValueError(f"doc_id out of signed int64 range: {self.doc_id}")
++        if not isinstance(self.url, str) or not self.url.strip():
++            raise ValueError(f"url must be non-empty string, got {self.url!r}")
++
++
++@dataclass(frozen=True)
++class OfficialQuery:
++    """Official query representation from query.parquet."""
++    query_id: int
++    query: str
++
++    def __post_init__(self) -> None:
++        if isinstance(self.query_id, bool) or not isinstance(self.query_id, int):
++            raise ValueError(f"query_id must be integer, got {type(self.query_id).__name__}: {self.query_id}")
++        if not (-9223372036854775808 <= self.query_id <= 9223372036854775807):
++            raise ValueError(f"query_id out of signed int64 range: {self.query_id}")
++        if not isinstance(self.query, str) or not self.query.strip():
++            raise ValueError(f"query must be non-empty string, got {self.query!r}")
++
++
++@dataclass(frozen=True)
++class FetchJob:
++    """Fetch job scheduled for crawler worker."""
++    job_id: str
++    url: str
++    attempt: int
++
++
++@dataclass(frozen=True)
++class FetchResult:
++    """Outcome of fetching an official source URL."""
++    job_id: str
++    state: str
++    raw_path: str | None
++    raw_sha256: str | None
++    final_url: str | None
++    mime_type: str | None
++    http_status: int | None
++    fetched_at: str
++    error_code: str | None
++
++
++@dataclass(frozen=True)
++class ExtractedBlock:
++    """Contiguous block of extracted text with reading order and character span."""
++    block_index: int
++    kind: str
++    start_char: int
++    end_char: int
++    section: str | None
++
++
++@dataclass(frozen=True)
++class ExtractedDocument:
++    """Structured extraction of an official source document."""
++    doc_id: int
++    source_version: str
++    source_text: str
++    source_sha256: str
++    raw_sha256: str
++    title: str | None
++    language: str
++    blocks: tuple[ExtractedBlock, ...]
++    quality_flags: tuple[str, ...]
++
++
++@dataclass(frozen=True)
++class SpanChunk:
++    """Passage chunk with strict character span provenance within source_text."""
++    chunk_id: str
++    doc_id: int
++    source_version: str
++    source_sha256: str
++    start_char: int
++    end_char: int
++    chunk_index: int
++    language: str
++    section: str | None
++    text: str
++    index_text: str
++    dense_token_count: int
++    reranker_token_count: int
++
++
++@dataclass(frozen=True)
++class ReferenceChunk:
++    """Reference chunk in development qrels."""
++    doc_id: int
++    chunk_text: str
++
++
++@dataclass(frozen=True)
++class DevQueryMetadata:
++    """Metadata describing development split query origin and coverage."""
++    query_id: int
++    query_text: str
++    origin: str
++    source_doc_ids: tuple[int, ...]
++    topic: str
++    question_style: str
++    split: str
++    pool_version: str
++    judgment_coverage: float
++
++
++@dataclass(frozen=True)
++class EvaluationRecord:
++    """Ground truth relevance judgments for an evaluation query."""
++    query_id: int
++    relevant_doc_ids: frozenset[int]
++    relevant_chunks: tuple[ReferenceChunk, ...]
++    metadata: DevQueryMetadata | None = None
++
++
++@dataclass(frozen=True)
++class LevelMetrics:
++    """Precision, recall, and Macro F2 metrics at document or chunk level."""
++    precision: float
++    recall: float
++    f2: float
++    prediction_count: int
++    reference_count: int
++    correct_prediction_count: int
++    found_reference_count: int
++
++
++@dataclass(frozen=True)
++class QueryMetrics:
++    """Evaluation metrics for a single query across document and chunk levels."""
++    query_id: int
++    documents: LevelMetrics
++    chunks: LevelMetrics
++
++
++@dataclass(frozen=True)
++class IngestReport:
++    """Report produced after importing official corpus rows into registry."""
++    input_rows: int
++    inserted_sources: int
++    unique_urls: int
++    rejected_rows: int
++    input_sha256: str
++
++
++@dataclass(frozen=True)
++class CrawlReport:
++    """Summary of crawler execution."""
++    total_jobs: int
++    succeeded: int
++    failed: int
++    retried: int
++    skipped: int
++
++
++@dataclass(frozen=True)
++class ExtractionReport:
++    """Summary of document extraction execution."""
++    attempted: int
++    ready: int
++    quarantined: int
++    failed: int
++    flags_by_reason: dict[str, int] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class SnapshotManifest:
++    """Immutable manifest pinning all artifacts and hashes of a frozen snapshot."""
++    snapshot_id: str
++    created_at: str
++    registry_sha256: str
++    queries_sha256: str
++    source_membership_sha256: str
++    extractor_fingerprint: str
++    chunker_fingerprint: str
++    source_count: int
++    ready_document_count: int
++    chunk_count: int
++    language_counts: dict[str, int]
++    quarantine_counts: dict[str, int]
++    shard_paths_and_hashes: list[dict[str, str]]
++
++
++@dataclass(frozen=True)
++class ValidationReport:
++    """Offline validation verdict for submission file."""
++    is_valid: bool
++    query_count: int
++    errors: tuple[str, ...] = ()
++    warnings: tuple[str, ...] = ()
++
++
++@dataclass(frozen=True)
++class EvaluationSummary:
++    """Overall dataset-level macro evaluation report."""
++    profile_name: str
++    macro_f2_documents: float
++    macro_f2_chunks: float
++    total_queries: int
++
++
++@dataclass(frozen=True)
++class RetrievalTrace:
++    """Complete candidate score trajectory and filtering trace for a query."""
++    query_id: int
++    candidate_doc_ids: frozenset[int]
++    reranked_doc_ids: frozenset[int]
++    final_doc_ids: frozenset[int]
++    final_chunk_ids: tuple[str, ...]
++    metadata: dict[str, Any] = field(default_factory=dict)
++
++
++class SubmissionChunk(TypedDict):
++    """Chunk element in official results.json submission schema."""
++    doc_id: int
++    chunk_text: str
++    chunk_order: NotRequired[int]
++
++
++class SubmissionRow(TypedDict):
++    """Query row in official results.json submission schema."""
++    id: int
++    relevant_docs: list[int]
++    relevant_chunks: list[SubmissionChunk]
++
++
++# Validated configuration dataclasses
++
++@dataclass(frozen=True)
++class CrawlConfig:
++    concurrency: int = 16
++    per_domain_concurrency: int = 2
++    min_domain_interval_seconds: float = 1.0
++    connect_timeout_seconds: float = 10.0
++    read_timeout_seconds: float = 30.0
++    total_deadline_seconds: float = 60.0
++    max_attempts: int = 3
++    base_backoff_seconds: float = 2.0
++    lease_seconds: float = 120.0
++    max_redirects: int = 5
++    max_html_bytes: int = 10 * 1024 * 1024
++    max_pdf_bytes: int = 30 * 1024 * 1024
++    respect_robots: bool = True
++    raw_root: Path = Path("artifacts/vibiomir/raw")
++
++
++@dataclass(frozen=True)
++class ExtractionConfig:
++    html_backend: str = "trafilatura"
++    pdf_backend: str = "pymupdf"
++    language_model_path: Path = Path("artifacts/models/lid.176.ftz")
++    language_confidence_min: float = 0.70
++    accepted_languages: tuple[str, ...] = ("vi", "en", "zh")
++    quarantine_unknown_language: bool = True
++
++
++@dataclass(frozen=True)
++class ChunkConfig:
++    mode: str = "auto"
++    strategy_type: str = "paragraph_token_spans"
++    body_max_tokens: int = 320
++    long_block_overlap_tokens: int = 64
++    contextual_header_max_tokens: int = 32
++    drop_short_blocks: bool = False
++
++
++@dataclass(frozen=True)
++class PairPackingConfig:
++    max_length: int = 512
++    query_window_tokens: int = 128
++    query_window_overlap_tokens: int = 16
++    query_window_aggregation: str = "max"
++    body_truncation: str = "reject"
++
++
++@dataclass(frozen=True)
++class SnapshotConfig:
++    snapshot_root: Path
++    name: str
++    parquet_row_group_size: int = 5000
++    target_shard_bytes: int = 67108864
++    chunk_config: ChunkConfig = field(default_factory=ChunkConfig)
++
++
++@dataclass(frozen=True)
++class EvaluationProfile:
++    name: str
++    normalization_version: str
++    tokenizer_name: str
++    threshold: Fraction
++    undefined_pr: int
++    empty_both_f2: int
++    scorer_parity_verified: bool
++
++
++@runtime_checkable
++class SourceStore(Protocol):
++    """Reader protocol providing random lookup over frozen snapshot documents and chunks."""
++
++    def get_document(self, doc_id: int) -> ExtractedDocument: ...
++
++    def get_chunk(self, chunk_id: str) -> SpanChunk: ...
++
++    def contains_official_doc(self, doc_id: int) -> bool: ...
+diff --git a/src/data/vibiomir_registry.py b/src/data/vibiomir_registry.py
+new file mode 100644
+index 0000000..b16e564
+--- /dev/null
++++ b/src/data/vibiomir_registry.py
+@@ -0,0 +1,295 @@
++from datetime import datetime, timezone
++import hashlib
++from pathlib import Path
++import sqlite3
++from typing import Iterable
++
++from src.data.vibiomir_contracts import (
++    IngestReport,
++    OfficialSource,
++)
++
++
++class SourceRegistry:
++    """SQLite-backed registry managing sources, fetch_jobs, and transactional ingest state."""
++
++    def __init__(self, db_path: Path | str) -> None:
++        self.db_path = Path(db_path)
++        self.db_path.parent.mkdir(parents=True, exist_ok=True)
++        self.conn = sqlite3.connect(str(self.db_path))
++        self._init_db()
++
++    def _init_db(self) -> None:
++        self.conn.execute("PRAGMA journal_mode = WAL;")
++        self.conn.execute("PRAGMA synchronous = NORMAL;")
++        self.conn.execute("PRAGMA foreign_keys = ON;")
++
++        with self.conn:
++            self.conn.execute(
++                """
++                CREATE TABLE IF NOT EXISTS sources (
++                    doc_id INTEGER PRIMARY KEY,
++                    original_url TEXT NOT NULL,
++                    fetch_job_id TEXT NOT NULL
++                );
++                """
++            )
++            self.conn.execute(
++                """
++                CREATE INDEX IF NOT EXISTS idx_sources_fetch_job_id
++                ON sources(fetch_job_id);
++                """
++            )
++            self.conn.execute(
++                """
++                CREATE TABLE IF NOT EXISTS fetch_jobs (
++                    job_id TEXT PRIMARY KEY,
++                    url TEXT NOT NULL,
++                    state TEXT NOT NULL DEFAULT 'pending',
++                    attempts INTEGER NOT NULL DEFAULT 0,
++                    lease_until TEXT,
++                    raw_path TEXT,
++                    raw_sha256 TEXT,
++                    http_status INTEGER,
++                    error_code TEXT,
++                    created_at TEXT NOT NULL,
++                    updated_at TEXT NOT NULL
++                );
++                """
++            )
++            self.conn.execute(
++                """
++                CREATE TABLE IF NOT EXISTS ingest_state (
++                    input_sha256 TEXT PRIMARY KEY,
++                    last_committed_row INTEGER NOT NULL,
++                    complete INTEGER NOT NULL DEFAULT 0,
++                    updated_at TEXT NOT NULL
++                );
++                """
++            )
++
++    def get_ingest_state(
++        self, input_sha256: str | None = None
++    ) -> tuple[str, int, bool] | None:
++        """Returns (input_sha256, last_committed_row, is_complete) or None."""
++        if input_sha256 is not None:
++            row = self.conn.execute(
++                """
++                SELECT input_sha256, last_committed_row, complete
++                FROM ingest_state
++                WHERE input_sha256 = ?
++                """,
++                (input_sha256,),
++            ).fetchone()
++        else:
++            row = self.conn.execute(
++                """
++                SELECT input_sha256, last_committed_row, complete
++                FROM ingest_state
++                ORDER BY updated_at DESC LIMIT 1
++                """
++            ).fetchone()
++
++        if row:
++            return (row[0], row[1], bool(row[2]))
++        return None
++
++    def init_ingest_state(self, input_sha256: str) -> None:
++        now_utc = datetime.now(timezone.utc).isoformat()
++        with self.conn:
++            self.conn.execute(
++                """
++                INSERT OR IGNORE INTO ingest_state (
++                    input_sha256, last_committed_row, complete, updated_at
++                ) VALUES (?, 0, 0, ?)
++                """,
++                (input_sha256, now_utc),
++            )
++
++    def commit_ingest_batch(
++        self,
++        input_sha256: str,
++        sources: list[tuple[int, str, str]],
++        jobs: list[tuple[str, str]],
++        last_committed_row: int,
++    ) -> None:
++        """Atomically inserts batch of sources and fetch_jobs, updating cursor.
++
++        Rolls back transactionally if any duplicate doc_id is encountered.
++        """
++        now_utc = datetime.now(timezone.utc).isoformat()
++
++        # Check for duplicates within this batch
++        seen_batch_ids: set[int] = set()
++        for doc_id, _, _ in sources:
++            if doc_id in seen_batch_ids:
++                raise ValueError(f"Duplicate doc_id {doc_id} detected in input batch")
++            seen_batch_ids.add(doc_id)
++
++        try:
++            with self.conn:
++                self.conn.executemany(
++                    "INSERT INTO sources (doc_id, original_url, fetch_job_id) VALUES (?, ?, ?)",
++                    sources,
++                )
++                job_rows = [
++                    (job_id, url, "pending", 0, now_utc, now_utc)
++                    for job_id, url in jobs
++                ]
++                self.conn.executemany(
++                    """
++                    INSERT OR IGNORE INTO fetch_jobs (
++                        job_id, url, state, attempts, created_at, updated_at
++                    ) VALUES (?, ?, ?, ?, ?, ?)
++                    """,
++                    job_rows,
++                )
++                self.conn.execute(
++                    """
++                    UPDATE ingest_state
++                    SET last_committed_row = ?, updated_at = ?
++                    WHERE input_sha256 = ?
++                    """,
++                    (last_committed_row, now_utc, input_sha256),
++                )
++        except sqlite3.IntegrityError as exc:
++            raise ValueError(f"Duplicate doc_id or integrity error during batch ingest: {exc}") from exc
++
++    def mark_ingest_complete(self, input_sha256: str, total_rows: int) -> None:
++        now_utc = datetime.now(timezone.utc).isoformat()
++        with self.conn:
++            self.conn.execute(
++                """
++                UPDATE ingest_state
++                SET complete = 1, last_committed_row = ?, updated_at = ?
++                WHERE input_sha256 = ?
++                """,
++                (total_rows, now_utc, input_sha256),
++            )
++
++    def is_complete(self, input_sha256: str | None = None) -> bool:
++        state = self.get_ingest_state(input_sha256)
++        return state is not None and state[2]
++
++    def contains_doc(self, doc_id: int) -> bool:
++        row = self.conn.execute(
++            "SELECT 1 FROM sources WHERE doc_id = ?", (doc_id,)
++        ).fetchone()
++        return row is not None
++
++    def get_source(self, doc_id: int) -> OfficialSource | None:
++        row = self.conn.execute(
++            "SELECT doc_id, original_url FROM sources WHERE doc_id = ?", (doc_id,)
++        ).fetchone()
++        if row:
++            return OfficialSource(doc_id=row[0], url=row[1])
++        return None
++
++    def count_sources(self) -> int:
++        return self.conn.execute("SELECT count(*) FROM sources").fetchone()[0]
++
++    def count_unique_urls(self) -> int:
++        return self.conn.execute("SELECT count(DISTINCT original_url) FROM sources").fetchone()[0]
++
++    def close(self) -> None:
++        self.conn.close()
++
++    def __enter__(self) -> "SourceRegistry":
++        return self
++
++    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
++        self.close()
++
++
++def ingest_sources(
++    rows: Iterable[OfficialSource],
++    registry: SourceRegistry,
++    input_sha256: str | None = None,
++    batch_size: int = 500,
++) -> IngestReport:
++    """Imports official source rows into SQLite SourceRegistry with transactional batch commits and resume cursor."""
++    if input_sha256 is None:
++        if hasattr(rows, "input_sha256"):
++            input_sha256 = getattr(rows, "input_sha256")
++        elif hasattr(rows, "path"):
++            path = Path(getattr(rows, "path"))
++            h = hashlib.sha256()
++            with path.open("rb") as f:
++                while chunk := f.read(65536):
++                    h.update(chunk)
++            input_sha256 = h.hexdigest()
++        elif isinstance(rows, (list, tuple)):
++            h = hashlib.sha256()
++            for r in rows:
++                h.update(f"{r.doc_id}:{r.url}\n".encode("utf-8"))
++            input_sha256 = h.hexdigest()
++        else:
++            raise ValueError(
++                "input_sha256 must be provided when rows does not expose input_sha256 or path"
++            )
++
++    existing_state = registry.get_ingest_state()
++    if existing_state is not None:
++        existing_sha, last_row, is_complete = existing_state
++        if existing_sha != input_sha256:
++            raise ValueError(
++                f"Registry already contains ingest state for different checksum {existing_sha}, "
++                f"got {input_sha256}. Use a separate registry or explicit migration."
++            )
++        if is_complete:
++            return IngestReport(
++                input_rows=last_row,
++                inserted_sources=registry.count_sources(),
++                unique_urls=registry.count_unique_urls(),
++                rejected_rows=0,
++                input_sha256=input_sha256,
++            )
++        cursor = last_row
++    else:
++        cursor = 0
++        registry.init_ingest_state(input_sha256)
++
++    batch_sources: list[tuple[int, str, str]] = []
++    batch_jobs: list[tuple[str, str]] = []
++    current_row_idx = 0
++
++    for row in rows:
++        if not isinstance(row, OfficialSource):
++            if not hasattr(row, "doc_id") or not hasattr(row, "url"):
++                raise ValueError(f"Expected OfficialSource, got {type(row).__name__}: {row}")
++            row = OfficialSource(doc_id=row.doc_id, url=row.url)
++
++        if current_row_idx < cursor:
++            current_row_idx += 1
++            continue
++
++        clean_url = row.url.strip()
++        job_id = hashlib.sha256(clean_url.encode("utf-8")).hexdigest()
++
++        batch_sources.append((row.doc_id, clean_url, job_id))
++        batch_jobs.append((job_id, clean_url))
++        current_row_idx += 1
++
++        if len(batch_sources) >= batch_size:
++            registry.commit_ingest_batch(
++                input_sha256, batch_sources, batch_jobs, current_row_idx
++            )
++            batch_sources.clear()
++            batch_jobs.clear()
++
++    if batch_sources:
++        registry.commit_ingest_batch(
++            input_sha256, batch_sources, batch_jobs, current_row_idx
++        )
++        batch_sources.clear()
++        batch_jobs.clear()
++
++    registry.mark_ingest_complete(input_sha256, current_row_idx)
++
++    return IngestReport(
++        input_rows=current_row_idx,
++        inserted_sources=registry.count_sources(),
++        unique_urls=registry.count_unique_urls(),
++        rejected_rows=0,
++        input_sha256=input_sha256,
++    )
+diff --git a/tests/data/test_vibiomir_inputs.py b/tests/data/test_vibiomir_inputs.py
+new file mode 100644
+index 0000000..019e875
+--- /dev/null
++++ b/tests/data/test_vibiomir_inputs.py
+@@ -0,0 +1,315 @@
++from pathlib import Path
++import sqlite3
++import pytest
++import pyarrow as pa
++import pyarrow.parquet as pq
++
++from src.data.vibiomir_contracts import (
++    OfficialSource,
++    OfficialQuery,
++    IngestReport,
++    SubmissionChunk,
++    SubmissionRow,
++)
++from src.data.vibiomir_adapter import (
++    iter_official_sources,
++    load_official_queries,
++)
++from src.data.vibiomir_registry import (
++    SourceRegistry,
++    ingest_sources,
++)
++
++
++def _create_synthetic_corpus_parquet(
++    path: Path,
++    ids: list[int | float | bool | None],
++    urls: list[str | None],
++    id_type: pa.DataType = pa.int64(),
++) -> Path:
++    arrays = [
++        pa.array(ids, type=id_type),
++        pa.array(urls, type=pa.string()),
++    ]
++    schema = pa.schema([
++        ("id", id_type),
++        ("url", pa.string()),
++    ])
++    table = pa.Table.from_arrays(arrays, schema=schema)
++    pq.write_table(table, path)
++    return path
++
++
++def _create_synthetic_query_parquet(
++    path: Path,
++    ids: list[int | float | bool | None],
++    queries: list[str | None],
++    id_type: pa.DataType = pa.int64(),
++) -> Path:
++    arrays = [
++        pa.array(ids, type=id_type),
++        pa.array(queries, type=pa.string()),
++    ]
++    schema = pa.schema([
++        ("id", id_type),
++        ("query", pa.string()),
++    ])
++    table = pa.Table.from_arrays(arrays, schema=schema)
++    pq.write_table(table, path)
++    return path
++
++
++def test_sparse_int64_ids_and_alias_urls(tmp_path: Path):
++    """IDs 583 and 4294967297 are preserved; alias URLs sharing same URL produce two rows in sources and one fetch job."""
++    corpus_file = tmp_path / "corpus.parquet"
++    db_file = tmp_path / "registry.sqlite"
++
++    # ID 4294967297 is 2^32 + 1, exceeding signed 32-bit int
++    doc_ids = [583, 4294967297]
++    shared_url = "https://example.com/medical/guideline-covid"
++    urls = [shared_url, shared_url]
++
++    _create_synthetic_corpus_parquet(corpus_file, doc_ids, urls)
++
++    # 1. Test iter_official_sources
++    source_iterator = iter_official_sources(corpus_file, batch_size=10)
++    sources = list(source_iterator)
++    assert len(sources) == 2
++    assert sources[0] == OfficialSource(doc_id=583, url=shared_url)
++    assert sources[1] == OfficialSource(doc_id=4294967297, url=shared_url)
++
++    # 2. Test ingestion into SourceRegistry
++    registry = SourceRegistry(db_file)
++    report = ingest_sources(iter_official_sources(corpus_file), registry)
++
++    assert isinstance(report, IngestReport)
++    assert report.input_rows == 2
++    assert report.inserted_sources == 2
++    assert report.unique_urls == 1
++    assert report.rejected_rows == 0
++    assert report.input_sha256 != ""
++
++    # 3. Assert direct DB table state
++    with sqlite3.connect(str(db_file)) as conn:
++        sources_rows = conn.execute(
++            "SELECT doc_id, original_url, fetch_job_id FROM sources ORDER BY doc_id ASC"
++        ).fetchall()
++        assert len(sources_rows) == 2
++        assert sources_rows[0][0] == 583
++        assert sources_rows[0][1] == shared_url
++        assert sources_rows[1][0] == 4294967297
++        assert sources_rows[1][1] == shared_url
++        # Both must share the same fetch_job_id
++        assert sources_rows[0][2] == sources_rows[1][2]
++
++        jobs = conn.execute(
++            "SELECT job_id, url, state, attempts FROM fetch_jobs"
++        ).fetchall()
++        assert len(jobs) == 1
++        assert jobs[0][0] == sources_rows[0][2]
++        assert jobs[0][1] == shared_url
++        assert jobs[0][2] == "pending"
++        assert jobs[0][3] == 0
++
++    assert registry.is_complete() is True
++    registry.close()
++
++
++def test_reject_bool_float_null_and_duplicate_ids(tmp_path: Path):
++    """Rejects bool, float, null, and duplicate IDs transactionally without masking via upsert."""
++    db_file = tmp_path / "registry.sqlite"
++
++    # A. Float ID in parquet schema should be rejected by iter_official_sources
++    float_file = tmp_path / "float_corpus.parquet"
++    arrays = [pa.array([1.5, 2.0], type=pa.float64()), pa.array(["http://a.com", "http://b.com"])]
++    pq.write_table(pa.Table.from_arrays(arrays, names=["id", "url"]), float_file)
++    with pytest.raises(ValueError, match="integer"):
++        list(iter_official_sources(float_file))
++
++    # B. Bool ID in parquet schema should be rejected
++    bool_file = tmp_path / "bool_corpus.parquet"
++    arrays = [pa.array([True, False], type=pa.bool_()), pa.array(["http://a.com", "http://b.com"])]
++    pq.write_table(pa.Table.from_arrays(arrays, names=["id", "url"]), bool_file)
++    with pytest.raises(ValueError, match="integer"):
++        list(iter_official_sources(bool_file))
++
++    # C. Null ID in parquet should be rejected
++    null_id_file = tmp_path / "null_id_corpus.parquet"
++    _create_synthetic_corpus_parquet(null_id_file, [1, None], ["http://a.com", "http://b.com"])
++    with pytest.raises(ValueError, match="null"):
++        list(iter_official_sources(null_id_file))
++
++    # D. Null/empty URL should be rejected
++    null_url_file = tmp_path / "null_url_corpus.parquet"
++    arrays = [pa.array([1, 2], type=pa.int64()), pa.array(["http://a.com", "   "])]
++    pq.write_table(pa.Table.from_arrays(arrays, names=["id", "url"]), null_url_file)
++    with pytest.raises(ValueError, match="[Uu]rl"):
++        list(iter_official_sources(null_url_file))
++
++    # E. Duplicate IDs in input must fail transactionally and not be masked by upsert
++    dup_file = tmp_path / "dup_corpus.parquet"
++    _create_synthetic_corpus_parquet(
++        dup_file,
++        [583, 100, 583],  # Duplicate doc_id 583
++        ["http://a.com", "http://b.com", "http://c.com"],
++    )
++
++    registry = SourceRegistry(db_file)
++    with pytest.raises(ValueError, match="[Dd]uplicate.*doc_id"):
++        ingest_sources(iter_official_sources(dup_file), registry)
++
++    # Ingest must fail transactionally: registry is not complete
++    assert registry.is_complete() is False
++
++    # F. Cross-batch duplicate rejection: batch 1 committed, batch 2 has a duplicate doc_id
++    cross_file = tmp_path / "cross_batch_dup.parquet"
++    _create_synthetic_corpus_parquet(
++        cross_file,
++        [1, 2, 3, 4, 2, 6],  # doc_id 2 repeated across batch boundary (batch_size=3)
++        [f"http://example.com/{i}" for i in [1, 2, 3, 4, 2, 6]],
++    )
++    cross_db = tmp_path / "cross_registry.sqlite"
++    cross_reg = SourceRegistry(cross_db)
++    with pytest.raises(ValueError, match="[Dd]uplicate.*doc_id"):
++        ingest_sources(iter_official_sources(cross_file, batch_size=3), cross_reg, batch_size=3)
++
++    assert cross_reg.is_complete() is False
++    # Batch 1 (1, 2, 3) was committed, batch 2 was rolled back, so only 3 rows exist
++    assert cross_reg.count_sources() == 3
++    cross_reg.close()
++    registry.close()
++
++
++def test_query_exact_set_and_count(tmp_path: Path):
++    """Tests exact set, signed int64, and expected_count validation for queries."""
++    query_file = tmp_path / "query.parquet"
++    ids = [101, 102, 103]
++    queries = ["Triệu chứng sốt xuất huyết", "Điều trị cúm mùa", "Chỉ số đường huyết bình thường"]
++    _create_synthetic_query_parquet(query_file, ids, queries)
++
++    # Matching expected_count
++    loaded = load_official_queries(query_file, expected_count=3)
++    assert len(loaded) == 3
++    assert loaded[0] == OfficialQuery(query_id=101, query=queries[0])
++    assert loaded[1] == OfficialQuery(query_id=102, query=queries[1])
++    assert loaded[2] == OfficialQuery(query_id=103, query=queries[2])
++
++    # No expected_count specified
++    loaded_none = load_official_queries(query_file, expected_count=None)
++    assert len(loaded_none) == 3
++
++    # Mismatched expected_count raises ValueError
++    with pytest.raises(ValueError, match="Expected 1200 queries, but found 3"):
++        load_official_queries(query_file, expected_count=1200)
++
++    # Query with duplicate ID raises ValueError
++    dup_query_file = tmp_path / "dup_query.parquet"
++    _create_synthetic_query_parquet(dup_query_file, [101, 101], ["query 1", "query 2"])
++    with pytest.raises(ValueError, match="[Dd]uplicate"):
++        load_official_queries(dup_query_file)
++
++    # Query with empty text raises ValueError
++    empty_query_file = tmp_path / "empty_query.parquet"
++    _create_synthetic_query_parquet(empty_query_file, [101], ["   "])
++    with pytest.raises(ValueError, match="empty"):
++        load_official_queries(empty_query_file)
++
++
++def test_ingest_resume_idempotent(tmp_path: Path):
++    """Resume from checkpoint and idempotent re-run on completed input."""
++    corpus_file = tmp_path / "corpus_10.parquet"
++    db_file = tmp_path / "registry.sqlite"
++
++    ids = list(range(1, 11))
++    urls = [f"https://example.com/doc/{i}" for i in ids]
++    _create_synthetic_corpus_parquet(corpus_file, ids, urls)
++
++    registry = SourceRegistry(db_file)
++    source_iter = iter_official_sources(corpus_file, batch_size=4)
++    file_sha = source_iter.input_sha256
++
++    # 1. Simulate an interrupted ingestion: commit first batch of 4 rows, leaving complete=0
++    first_4 = list(iter_official_sources(corpus_file))[:4]
++    first_sources = [(s.doc_id, s.url, "job_" + str(s.doc_id)) for s in first_4]
++    first_jobs = [("job_" + str(s.doc_id), s.url) for s in first_4]
++    registry.init_ingest_state(file_sha)
++    registry.commit_ingest_batch(file_sha, first_sources, first_jobs, last_committed_row=4)
++
++    assert registry.count_sources() == 4
++    assert registry.is_complete() is False
++    ingest_state = registry.get_ingest_state(file_sha)
++    assert ingest_state is not None
++    assert ingest_state[1] == 4  # last_committed_row == 4
++    assert ingest_state[2] is False  # complete == 0
++
++    # 2. Resume ingestion on the same file: skips first 4 rows and completes remaining 6 rows
++    report1 = ingest_sources(
++        iter_official_sources(corpus_file, batch_size=4),
++        registry,
++        batch_size=4,
++    )
++    assert report1.input_rows == 10
++    assert report1.inserted_sources == 10
++    assert registry.count_sources() == 10
++    assert registry.is_complete() is True
++
++    # 3. Re-running on completed registry is idempotent: returns IngestReport without errors
++    report2 = ingest_sources(
++        iter_official_sources(corpus_file, batch_size=4),
++        registry,
++        batch_size=4,
++    )
++    assert report2.input_rows == 10
++    assert report2.inserted_sources == 10
++    assert report2.input_sha256 == report1.input_sha256
++    assert registry.count_sources() == 10
++
++    # 4. Attempting to ingest a different file with a different checksum into same registry raises ValueError
++    diff_file = tmp_path / "different_corpus.parquet"
++    _create_synthetic_corpus_parquet(diff_file, [100, 101], ["http://x.com", "http://y.com"])
++    with pytest.raises(ValueError, match="[Cc]hecksum"):
++        ingest_sources(
++            iter_official_sources(diff_file),
++            registry,
++        )
++
++    registry.close()
++
++
++def test_contracts_and_unit_validations(tmp_path: Path):
++    """Directly tests contract invariants, bounds checking, and registry query helpers."""
++    # OfficialSource contract validations
++    with pytest.raises(ValueError, match="integer"):
++        OfficialSource(doc_id=True, url="https://example.com")  # type: ignore
++
++    with pytest.raises(ValueError, match="integer"):
++        OfficialSource(doc_id=1.5, url="https://example.com")  # type: ignore
++
++    with pytest.raises(ValueError, match="range"):
++        OfficialSource(doc_id=2**63, url="https://example.com")
++
++    with pytest.raises(ValueError, match="range"):
++        OfficialSource(doc_id=-(2**63) - 1, url="https://example.com")
++
++    with pytest.raises(ValueError, match="url"):
++        OfficialSource(doc_id=1, url="   ")
++
++    # OfficialQuery contract validations
++    with pytest.raises(ValueError, match="integer"):
++        OfficialQuery(query_id=False, query="test")  # type: ignore
++
++    with pytest.raises(ValueError, match="range"):
++        OfficialQuery(query_id=2**63, query="test")
++
++    with pytest.raises(ValueError, match="query"):
++        OfficialQuery(query_id=1, query="")
++
++    # SourceRegistry query helpers
++    db_file = tmp_path / "test_helpers.sqlite"
++    with SourceRegistry(db_file) as reg:
++        assert reg.count_sources() == 0
++        assert reg.count_unique_urls() == 0
++        assert reg.contains_doc(1) is False
++        assert reg.get_source(1) is None
++        assert reg.is_complete() is False
++

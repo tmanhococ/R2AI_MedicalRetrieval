@@ -1,0 +1,616 @@
+# Review package: b4e1b039bdd02e16284a0a49f433989e8748282f..788c27648bde9024821339aab142609de063b88e
+
+## Commits
+788c276 fix: validate token budgets, thread-safe LRU cache, and span bounds
+
+## Files changed
+ src/data/source_store.py         | 132 +++++++++++++++++++++---------------
+ src/ingestion/snapshot.py        | 141 ++++++++++++++++++++++++++++++++++++++-
+ tests/data/test_full_snapshot.py | 129 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 345 insertions(+), 57 deletions(-)
+
+## Diff
+diff --git a/src/data/source_store.py b/src/data/source_store.py
+index c1c65ef..d64a847 100644
+--- a/src/data/source_store.py
++++ b/src/data/source_store.py
+@@ -1,17 +1,18 @@
+ from __future__ import annotations
+ 
+ from collections import OrderedDict, defaultdict
+ import json
+ import logging
+ from pathlib import Path
+ import sqlite3
++import threading
+ from typing import Any, Callable, Generic, Iterator, Sequence, TypeVar
+ 
+ import pyarrow.parquet as pq
+ 
+ from src.data.phase2_contracts import EvidenceSpan
+ from src.data.vibiomir_contracts import (
+     ExtractedBlock,
+     ExtractedDocument,
+     SourceStore,
+     SpanChunk,
+@@ -30,82 +31,92 @@ class LRUCache(Generic[K, V]):
+         self,
+         max_entries: int = 2048,
+         max_bytes: int = 256 * 1024 * 1024,
+         size_fn: Callable[[V], int] | None = None,
+     ) -> None:
+         self.max_entries = max(1, max_entries)
+         self.max_bytes = max(1, max_bytes)
+         self.size_fn = size_fn or (lambda _: 1)
+         self._cache: OrderedDict[K, tuple[V, int]] = OrderedDict()
+         self._current_bytes = 0
++        self._lock = threading.RLock()
+ 
+     def get(self, key: K, default: V | None = None) -> V | None:
+-        if key not in self._cache:
+-            return default
+-        self._cache.move_to_end(key)
+-        val, _ = self._cache[key]
+-        return val
++        with self._lock:
++            if key not in self._cache:
++                return default
++            self._cache.move_to_end(key)
++            val, _ = self._cache[key]
++            return val
+ 
+     def __contains__(self, key: K) -> bool:
+-        return key in self._cache
++        with self._lock:
++            return key in self._cache
+ 
+     def __getitem__(self, key: K) -> V:
+-        if key not in self._cache:
+-            raise KeyError(key)
+-        self._cache.move_to_end(key)
+-        val, _ = self._cache[key]
+-        return val
++        with self._lock:
++            if key not in self._cache:
++                raise KeyError(key)
++            self._cache.move_to_end(key)
++            val, _ = self._cache[key]
++            return val
+ 
+     def __setitem__(self, key: K, value: V) -> None:
+-        size = self.size_fn(value)
+-        if key in self._cache:
+-            _, old_size = self._cache[key]
+-            self._current_bytes -= old_size
+-            del self._cache[key]
+-
+-        self._cache[key] = (value, size)
+-        self._current_bytes += size
+-        self._cache.move_to_end(key)
+-        self._evict()
++        with self._lock:
++            size = self.size_fn(value)
++            if key in self._cache:
++                _, old_size = self._cache[key]
++                self._current_bytes -= old_size
++                del self._cache[key]
++
++            self._cache[key] = (value, size)
++            self._current_bytes += size
++            self._cache.move_to_end(key)
++            self._evict()
+ 
+     def pop(self, key: K, default: V | None = None) -> V | None:
+-        if key not in self._cache:
+-            return default
+-        val, size = self._cache.pop(key)
+-        self._current_bytes -= size
+-        return val
++        with self._lock:
++            if key not in self._cache:
++                return default
++            val, size = self._cache.pop(key)
++            self._current_bytes -= size
++            return val
+ 
+     def _evict(self) -> None:
++        # Called within self._lock
+         while self._cache and (
+             len(self._cache) > self.max_entries or self._current_bytes > self.max_bytes
+         ):
+             _, (_, size) = self._cache.popitem(last=False)
+             self._current_bytes -= size
+ 
+     def clear(self) -> None:
+-        self._cache.clear()
+-        self._current_bytes = 0
++        with self._lock:
++            self._cache.clear()
++            self._current_bytes = 0
+ 
+     def __len__(self) -> int:
+-        return len(self._cache)
++        with self._lock:
++            return len(self._cache)
+ 
+     @property
+     def current_bytes(self) -> int:
+-        return self._current_bytes
++        with self._lock:
++            return self._current_bytes
+ 
+ 
+ def _doc_size(doc: ExtractedDocument) -> int:
+-    return len(doc.source_text.encode("utf-8")) + len(doc.blocks) * 64 + 512
++    return len(doc.source_text) * 2 + len(doc.blocks) * 64 + 512
+ 
+ 
+ def _chunk_size(chunk: SpanChunk) -> int:
+-    return len(chunk.text.encode("utf-8")) + len(chunk.index_text.encode("utf-8")) + 256
++    return len(chunk.text) * 2 + len(chunk.index_text) * 2 + 256
+ 
+ 
+ def _row_to_document(row_dict: dict[str, Any]) -> ExtractedDocument:
+     blocks_data = json.loads(row_dict["blocks_json"])
+     blocks = tuple(
+         ExtractedBlock(
+             block_index=b["block_index"],
+             kind=b["kind"],
+             start_char=b["start_char"],
+             end_char=b["end_char"],
+@@ -446,67 +457,80 @@ class EvidenceSourceStore:
+             return self.underlying.iter_chunks_for_doc(doc_id)
+         raise NotImplementedError("Underlying store does not support iter_chunks_for_doc")
+ 
+     def _resolve_evidence_span(self, chunk_id: str) -> SpanChunk | None:
+         if chunk_id in self._span_chunk_cache:
+             return self._span_chunk_cache[chunk_id]
+ 
+         if chunk_id in self._registered_spans:
+             span = self._registered_spans[chunk_id]
+             doc = self.get_document(span.doc_id)
++            if not (0 <= span.start_char < span.end_char <= len(doc.source_text)):
++                raise ValueError(
++                    f"Invalid span bounds for {chunk_id}: [{span.start_char}:{span.end_char}] "
++                    f"in document of length {len(doc.source_text)}"
++                )
+             text = doc.source_text[span.start_char : span.end_char]
++            tok_count = text.count(" ") + 1 if text.strip() else 0
+             chunk = SpanChunk(
+                 chunk_id=span.span_id,
+                 doc_id=span.doc_id,
+                 source_version=span.source_version,
+                 source_sha256=span.source_sha256,
+                 start_char=span.start_char,
+                 end_char=span.end_char,
+                 chunk_index=-1,
+                 language=doc.language,
+                 section=None,
+                 text=text,
+                 index_text=text,
+-                dense_token_count=len(text.split()),
+-                reranker_token_count=len(text.split()),
++                dense_token_count=tok_count,
++                reranker_token_count=tok_count,
+             )
+             self._span_chunk_cache[chunk_id] = chunk
+             return chunk
+ 
+         if chunk_id.startswith("span:"):
+             parts = chunk_id.split(":")
+             if len(parts) >= 4:
+                 try:
+                     doc_id = int(parts[1])
+                     start_c = int(parts[2])
+                     end_c = int(parts[3])
+-                    doc = self.get_document(doc_id)
+-                    text = doc.source_text[start_c:end_c]
+-                    chunk = SpanChunk(
+-                        chunk_id=chunk_id,
+-                        doc_id=doc.doc_id,
+-                        source_version=doc.source_version,
+-                        source_sha256=doc.source_sha256,
+-                        start_char=start_c,
+-                        end_char=end_c,
+-                        chunk_index=-1,
+-                        language=doc.language,
+-                        section=None,
+-                        text=text,
+-                        index_text=text,
+-                        dense_token_count=len(text.split()),
+-                        reranker_token_count=len(text.split()),
+-                    )
+-                    self._span_chunk_cache[chunk_id] = chunk
+-                    return chunk
+                 except (ValueError, IndexError):
+-                    pass
++                    return None
++
++                doc = self.get_document(doc_id)
++                if not (0 <= start_c < end_c <= len(doc.source_text)):
++                    raise ValueError(
++                        f"Invalid span bounds for {chunk_id}: [{start_c}:{end_c}] "
++                        f"in document of length {len(doc.source_text)}"
++                    )
++                text = doc.source_text[start_c:end_c]
++                tok_count = text.count(" ") + 1 if text.strip() else 0
++                chunk = SpanChunk(
++                    chunk_id=chunk_id,
++                    doc_id=doc.doc_id,
++                    source_version=doc.source_version,
++                    source_sha256=doc.source_sha256,
++                    start_char=start_c,
++                    end_char=end_c,
++                    chunk_index=-1,
++                    language=doc.language,
++                    section=None,
++                    text=text,
++                    index_text=text,
++                    dense_token_count=tok_count,
++                    reranker_token_count=tok_count,
++                )
++                self._span_chunk_cache[chunk_id] = chunk
++                return chunk
+ 
+         return None
+ 
+     def get_chunk(self, chunk_id: str) -> SpanChunk:
+         """Retrieves chunk by resolving evidence span or querying underlying store."""
+         span_chunk = self._resolve_evidence_span(chunk_id)
+         if span_chunk is not None:
+             return span_chunk
+         return self.underlying.get_chunk(chunk_id)
+ 
+diff --git a/src/ingestion/snapshot.py b/src/ingestion/snapshot.py
+index 465636d..f8b76cb 100644
+--- a/src/ingestion/snapshot.py
++++ b/src/ingestion/snapshot.py
+@@ -23,21 +23,26 @@ from src.data.phase2_contracts import (
+ from src.data.vibiomir_contracts import (
+     ChunkConfig,
+     ExtractionConfig,
+     ExtractedBlock,
+     ExtractedDocument,
+     SnapshotConfig,
+     SnapshotManifest,
+     SpanChunk,
+ )
+ from src.data.vibiomir_registry import SourceRegistry
+-from src.indexing.chunker import chunk_source_document
++from src.indexing.chunker import (
++    _build_contextual_header,
++    _count_tokens,
++    _get_token_offsets,
++    chunk_source_document,
++)
+ from src.ingestion.extractors import extract_document
+ from src.ingestion.quality import (
+     FastTextLanguageDetector,
+     LanguageDetector,
+     classify_quality,
+ )
+ 
+ logger = logging.getLogger(__name__)
+ 
+ DOCUMENTS_SCHEMA = pa.schema([
+@@ -193,20 +198,143 @@ class FallbackLanguageDetector:
+         # Check Chinese characters
+         if any("\u4e00" <= char <= "\u9fff" for char in text):
+             return ("zh", 0.98)
+         # Check Vietnamese diacritics
+         vi_chars = set("àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ")
+         if any(c in vi_chars for c in text.lower()):
+             return ("vi", 0.96)
+         return ("en", 0.85)
+ 
+ 
++def _rechunk_oversized_span(
++    sp: SpanChunk,
++    doc: ExtractedDocument,
++    dense_tokenizer: Any,
++    reranker_tokenizer: Any,
++    config: ChunkConfig,
++) -> list[SpanChunk]:
++    """Subdivides an oversized span deterministically to meet model token budget."""
++    body_max = config.body_max_tokens
++    long_overlap = config.long_block_overlap_tokens
++    header_max = config.contextual_header_max_tokens
++
++    span_text = sp.text
++    offsets = _get_token_offsets(dense_tokenizer, span_text)
++    if not offsets:
++        step = max(50, len(span_text) // 2)
++        offsets = [(i, min(i + step, len(span_text))) for i in range(0, len(span_text), step)]
++
++    total_toks = len(offsets)
++    token_pos = 0
++    sub_chunks: list[SpanChunk] = []
++
++    while token_pos < total_toks:
++        end_pos = min(token_pos + body_max, total_toks)
++        while end_pos > token_pos + 1:
++            cand_s = offsets[token_pos][0]
++            cand_e = offsets[end_pos - 1][1]
++            cand_t = span_text[cand_s:cand_e]
++            d_tok = _count_tokens(dense_tokenizer, cand_t)
++            r_tok = _count_tokens(reranker_tokenizer, cand_t)
++            if d_tok <= body_max and r_tok <= body_max:
++                break
++            end_pos -= 1
++
++        sub_s = sp.start_char + offsets[token_pos][0]
++        if token_pos == 0:
++            sub_s = sp.start_char
++        if end_pos >= total_toks:
++            sub_e = sp.end_char
++        else:
++            sub_e = sp.start_char + offsets[end_pos - 1][1]
++
++        sub_text = doc.source_text[sub_s:sub_e]
++        header = _build_contextual_header(
++            title=doc.title,
++            section=sp.section,
++            dense_tokenizer=dense_tokenizer,
++            reranker_tokenizer=reranker_tokenizer,
++            max_tokens=header_max,
++        )
++        idx_text = f"{header}\n\n{sub_text}" if header else sub_text
++        sub_chunks.append(
++            SpanChunk(
++                chunk_id="",
++                doc_id=doc.doc_id,
++                source_version=doc.source_version,
++                source_sha256=doc.source_sha256,
++                start_char=sub_s,
++                end_char=sub_e,
++                chunk_index=0,
++                language=doc.language,
++                section=sp.section,
++                text=sub_text,
++                index_text=idx_text,
++                dense_token_count=_count_tokens(dense_tokenizer, sub_text),
++                reranker_token_count=_count_tokens(reranker_tokenizer, sub_text),
++            )
++        )
++
++        if end_pos >= total_toks:
++            break
++        step_overlap = min(long_overlap, max(1, body_max // 2))
++        step = max(1, (end_pos - token_pos) - step_overlap)
++        token_pos += step
++
++    return sub_chunks
++
++
++def _validate_and_rechunk_spans(
++    spans: Sequence[SpanChunk],
++    doc: ExtractedDocument,
++    dense_tokenizer: Any,
++    reranker_tokenizer: Any,
++    config: ChunkConfig,
++) -> list[SpanChunk]:
++    """Validates each chunk against token budgets and re-chunks any oversized spans prior to freeze."""
++    body_max = config.body_max_tokens
++    validated: list[SpanChunk] = []
++
++    for sp in spans:
++        d_cnt = _count_tokens(dense_tokenizer, sp.text)
++        r_cnt = _count_tokens(reranker_tokenizer, sp.text)
++        if d_cnt <= body_max and r_cnt <= body_max:
++            validated.append(sp)
++        else:
++            logger.info(
++                f"Re-chunking oversized span in doc {doc.doc_id}: tokens ({d_cnt}, {r_cnt}) > budget {body_max}"
++            )
++            sub_spans = _rechunk_oversized_span(sp, doc, dense_tokenizer, reranker_tokenizer, config)
++            validated.extend(sub_spans)
++
++    final_spans: list[SpanChunk] = []
++    for idx, sp in enumerate(validated):
++        final_spans.append(
++            SpanChunk(
++                chunk_id=f"{doc.doc_id}:{doc.source_sha256}:{idx:06d}",
++                doc_id=doc.doc_id,
++                source_version=sp.source_version,
++                source_sha256=sp.source_sha256,
++                start_char=sp.start_char,
++                end_char=sp.end_char,
++                chunk_index=idx,
++                language=sp.language,
++                section=sp.section,
++                text=sp.text,
++                index_text=sp.index_text,
++                dense_token_count=_count_tokens(dense_tokenizer, sp.text),
++                reranker_token_count=_count_tokens(reranker_tokenizer, sp.text),
++            )
++        )
++    return final_spans
++
++
+ def build_snapshot(
+     registry: SourceRegistry,
+     config: SnapshotConfig,
+     raw_root: Path | None = None,
+     extraction_config: ExtractionConfig | None = None,
+     chunk_config: ChunkConfig | None = None,
+     dense_tokenizer: Any = None,
+     reranker_tokenizer: Any = None,
+     language_detector: LanguageDetector | None = None,
+     queries_path: Path | None = None,
+@@ -441,23 +569,30 @@ def build_snapshot(
+                         "blocks_json": json.dumps(blocks_data, ensure_ascii=False),
+                         "quality_flags_json": json.dumps(list(ready_doc.quality_flags), ensure_ascii=False),
+                     }
+                     doc_shard_name, doc_row_idx = doc_writer.add_row(doc_row)
+                     doc_loc_batch.append((ready_doc.doc_id, doc_shard_name, doc_row_idx))
+ 
+                     membership_hasher.update(f"{ready_doc.doc_id}\n".encode("utf-8"))
+                     ready_document_count += 1
+                     language_counts[ready_doc.language] += 1
+ 
+-                    # Generate SpanChunks
++                    # Generate SpanChunks and validate model token budget prior to freeze
+                     spans = list(chunk_source_document(ready_doc, dense_tokenizer, reranker_tokenizer, chk_cfg))
+-                    for sp in spans:
++                    validated_spans = _validate_and_rechunk_spans(
++                        spans=spans,
++                        doc=ready_doc,
++                        dense_tokenizer=dense_tokenizer,
++                        reranker_tokenizer=reranker_tokenizer,
++                        config=chk_cfg,
++                    )
++                    for sp in validated_spans:
+                         chunk_row = {
+                             "chunk_id": sp.chunk_id,
+                             "doc_id": sp.doc_id,
+                             "source_version": sp.source_version,
+                             "source_sha256": sp.source_sha256,
+                             "start_char": sp.start_char,
+                             "end_char": sp.end_char,
+                             "chunk_index": sp.chunk_index,
+                             "language": sp.language,
+                             "section": sp.section,
+diff --git a/tests/data/test_full_snapshot.py b/tests/data/test_full_snapshot.py
+index 3ca7827..7407c2f 100644
+--- a/tests/data/test_full_snapshot.py
++++ b/tests/data/test_full_snapshot.py
+@@ -471,10 +471,139 @@ def test_lru_cache_bounds_and_eviction():
+     byte_cache["k2"] = "67890"  # 5 bytes -> total 10 bytes
+     assert byte_cache.current_bytes == 10
+     assert len(byte_cache) == 2
+ 
+     # Insert k3 with 4 bytes -> total 14 > 10, evicts k1
+     byte_cache["k3"] = "abcd"
+     assert "k1" not in byte_cache
+     assert "k2" in byte_cache
+     assert "k3" in byte_cache
+     assert byte_cache.current_bytes == 9  # 5 + 4
++
++
++def test_snapshot_rechunks_oversized_spans_to_fit_budget(tmp_path: Path):
++    """build_snapshot validates token budgets and re-chunks any oversized spans prior to freeze."""
++    db_path = tmp_path / "registry.db"
++    raw_root = tmp_path / "raw"
++    raw_root.mkdir(parents=True, exist_ok=True)
++    registry = SourceRegistry(db_path)
++
++    sources = [OfficialSource(doc_id=1, url="https://example.com/long_article")]
++    ingest_sources(sources, registry)
++
++    long_paragraph = "Bệnh nhân cần được điều trị bằng kháng sinh phổ rộng theo đúng phác đồ của Bộ Y tế và theo dõi sát các chỉ số sinh tồn."
++    html = f"<html><body><article><p>{long_paragraph}</p></article></body></html>".encode("utf-8")
++    raw_p, raw_hash, _ = save_raw_atomic(raw_root, html)
++    cursor = registry.conn.execute("SELECT fetch_job_id FROM sources WHERE doc_id = 1")
++    job_id = cursor.fetchone()[0]
++    registry.finish_fetch(
++        FetchResult(
++            job_id=job_id,
++            state="fetched",
++            raw_path=str(raw_p),
++            raw_sha256=raw_hash,
++            final_url="https://example.com/long_article",
++            mime_type="text/html",
++            http_status=200,
++            fetched_at="2026-10-05T00:00:00Z",
++            error_code=None,
++            bytes_written=len(html),
++        )
++    )
++
++    # Impose a strict budget of max 8 tokens per chunk
++    config = SnapshotConfig(
++        snapshot_root=tmp_path / "snapshots",
++        name="snap_budget_test",
++        chunk_config=ChunkConfig(body_max_tokens=8, contextual_header_max_tokens=4),
++    )
++    manifest = build_snapshot(
++        registry=registry,
++        config=config,
++        raw_root=raw_root,
++        language_detector=DummyLanguageDetector(),
++    )
++
++    store = SnapshotSourceStore(tmp_path / "snapshots" / "snap_budget_test")
++    doc = store.get_document(1)
++    chunks = list(store.iter_chunks_for_doc(1))
++
++    assert len(chunks) > 1, "Oversized paragraph must be re-chunked into multiple spans"
++    for c in chunks:
++        assert c.dense_token_count <= 8, f"Chunk {c.chunk_id} exceeds dense token budget"
++        assert c.reranker_token_count <= 8, f"Chunk {c.chunk_id} exceeds reranker token budget"
++        # Exact character slice identity check
++        assert c.text == doc.source_text[c.start_char : c.end_char]
++    store.close()
++
++
++def test_lru_cache_thread_safety():
++    """LRUCache supports concurrent multi-threaded reads, writes, and evictions without race conditions."""
++    import concurrent.futures
++
++    cache = LRUCache[int, str](max_entries=50, max_bytes=10000)
++
++    def worker(worker_id: int):
++        for i in range(100):
++            key = (worker_id * 100 + i) % 75
++            cache[key] = f"val_{key}_{worker_id}"
++            _ = cache.get(key)
++            if i % 10 == 0:
++                _ = len(cache)
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
++        futures = [executor.submit(worker, wid) for wid in range(8)]
++        for f in concurrent.futures.as_completed(futures):
++            f.result()  # Will re-raise if an exception occurred
++
++    assert len(cache) <= 50
++
++
++def test_evidence_source_store_rejects_invalid_slice_bounds(tmp_path: Path):
++    """EvidenceSourceStore rejects out-of-bounds or inverted slice coordinates."""
++    snap_dir = _setup_multi_shard_snapshot(tmp_path)
++    raw_store = SnapshotSourceStore(snap_dir)
++    evidence_store = EvidenceSourceStore(raw_store)
++
++    doc1 = evidence_store.get_document(1)
++    doc_len = len(doc1.source_text)
++
++    # 1. Inverted bounds: start >= end
++    inv_span = EvidenceSpan(
++        span_id="inv_span",
++        doc_id=1,
++        source_version=doc1.source_version,
++        source_sha256=doc1.source_sha256,
++        start_char=20,
++        end_char=10,
++        seed_chunk_ids=(),
++        variant_kind="base",
++    )
++    evidence_store.register_evidence_span(inv_span)
++    with pytest.raises(ValueError, match="Invalid span bounds"):
++        evidence_store.get_chunk("inv_span")
++
++    # 2. Out of bounds: end > len(doc.source_text)
++    oob_span = EvidenceSpan(
++        span_id="oob_span",
++        doc_id=1,
++        source_version=doc1.source_version,
++        source_sha256=doc1.source_sha256,
++        start_char=0,
++        end_char=doc_len + 100,
++        seed_chunk_ids=(),
++        variant_kind="base",
++    )
++    evidence_store.register_evidence_span(oob_span)
++    with pytest.raises(ValueError, match="Invalid span bounds"):
++        evidence_store.get_chunk("oob_span")
++
++    # 3. Dynamic pattern with inverted bounds
++    with pytest.raises(ValueError, match="Invalid span bounds"):
++        evidence_store.get_chunk("span:1:50:20")
++
++    # 4. Dynamic pattern with out-of-bounds end
++    with pytest.raises(ValueError, match="Invalid span bounds"):
++        evidence_store.get_chunk(f"span:1:0:{doc_len + 500}")
++
++    evidence_store.close()
++

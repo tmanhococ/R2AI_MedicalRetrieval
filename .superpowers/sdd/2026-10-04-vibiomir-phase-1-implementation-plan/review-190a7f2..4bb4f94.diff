@@ -1,0 +1,334 @@
+# Review package: 190a7f2..4bb4f94
+
+## Commits
+4bb4f94 fix: resolve final code review findings on boolean IDs, reranker clamp, robots User-Agent, max_redirects, and strict schema allowlist
+
+## Files changed
+ src/data/vibiomir_adapter.py             | 11 +++++-
+ src/ingestion/crawl_runner.py            | 12 +++++-
+ src/reranking/reranker.py                |  5 +++
+ src/submission/validators.py             | 12 ++++++
+ src/submission/vibiomir_json_zip.py      |  8 ++++
+ tests/submission/test_vibiomir_export.py | 66 ++++++++++++++++++++++++++++++++
+ 6 files changed, 111 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/src/data/vibiomir_adapter.py b/src/data/vibiomir_adapter.py
+index 713de22..256941a 100644
+--- a/src/data/vibiomir_adapter.py
++++ b/src/data/vibiomir_adapter.py
+@@ -36,21 +36,21 @@ class OfficialSourceIterator:
+             raise FileNotFoundError(f"Corpus file not found: {self.path}")
+         self.batch_size = batch_size
+         self._sha256: str | None = None
+ 
+     @property
+     def input_sha256(self) -> str:
+         if self._sha256 is None:
+             self._sha256 = compute_file_sha256(self.path)
+         return self._sha256
+ 
+-    def __iter__(self) -> Iterator[OfficialSource]:
++    def _generate_sources(self) -> Iterator[OfficialSource]:
+         parquet_file = pq.ParquetFile(self.path)
+         schema = parquet_file.schema_arrow
+ 
+         if "id" not in schema.names or "url" not in schema.names:
+             raise ValueError(
+                 f"Parquet file must contain 'id' and 'url' columns, got {schema.names}"
+             )
+ 
+         id_field = schema.field("id")
+         url_field = schema.field("url")
+@@ -78,20 +78,29 @@ class OfficialSourceIterator:
+             for raw_id, raw_url in zip(id_col.to_pylist(), url_col.to_pylist()):
+                 if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+                     raise ValueError(f"doc_id must be integer, got {type(raw_id).__name__}: {raw_id}")
+                 if not (-9223372036854775808 <= raw_id <= 9223372036854775807):
+                     raise ValueError(f"doc_id out of signed int64 range: {raw_id}")
+                 if not isinstance(raw_url, str) or not raw_url.strip():
+                     raise ValueError(f"url must be non-empty string, got {raw_url!r}")
+ 
+                 yield OfficialSource(doc_id=raw_id, url=raw_url.strip())
+ 
++    def __iter__(self) -> Iterator[OfficialSource]:
++        self._active_iter = self._generate_sources()
++        return self
++
++    def __next__(self) -> OfficialSource:
++        if not hasattr(self, "_active_iter") or self._active_iter is None:
++            self._active_iter = self._generate_sources()
++        return next(self._active_iter)
++
+ 
+ def iter_official_sources(
+     path: Path | str, batch_size: int = 10000
+ ) -> OfficialSourceIterator:
+     """Returns a streaming iterator over official sources in Parquet."""
+     return OfficialSourceIterator(path=path, batch_size=batch_size)
+ 
+ 
+ def load_official_queries(
+     path: Path | str, expected_count: int | None = None
+diff --git a/src/ingestion/crawl_runner.py b/src/ingestion/crawl_runner.py
+index b8622c0..9f490d3 100644
+--- a/src/ingestion/crawl_runner.py
++++ b/src/ingestion/crawl_runner.py
+@@ -28,21 +28,25 @@ class RobotsManager:
+             if origin in self._parsers:
+                 rp = self._parsers[origin]
+                 if rp is None:
+                     return True
+                 return rp.can_fetch(self.user_agent, url)
+ 
+         # Fetch robots.txt
+         robots_url = f"{origin}/robots.txt"
+         rp: urllib.robotparser.RobotFileParser | None = None
+         try:
+-            resp = await client.get(robots_url, follow_redirects=True)
++            resp = await client.get(
++                robots_url,
++                headers={"User-Agent": self.user_agent},
++                follow_redirects=True,
++            )
+             if resp.status_code == 200:
+                 rp = urllib.robotparser.RobotFileParser()
+                 rp.parse(resp.text.splitlines())
+         except Exception:
+             rp = None
+ 
+         async with self._lock:
+             self._parsers[origin] = rp
+ 
+         if rp is None:
+@@ -199,12 +203,16 @@ async def run_crawl(
+     limits = httpx.Limits(
+         max_connections=config.concurrency,
+         max_keepalive_connections=config.concurrency,
+     )
+     timeouts = httpx.Timeout(
+         connect=config.connect_timeout_seconds,
+         read=config.read_timeout_seconds,
+         write=10.0,
+         pool=10.0,
+     )
+-    async with httpx.AsyncClient(limits=limits, timeout=timeouts) as managed_client:
++    async with httpx.AsyncClient(
++        limits=limits,
++        timeout=timeouts,
++        max_redirects=config.max_redirects,
++    ) as managed_client:
+         return await _run_crawl_with_client(registry, config, managed_client, limit, job_ids=job_ids)
+diff --git a/src/reranking/reranker.py b/src/reranking/reranker.py
+index 9d5b25c..ab76483 100644
+--- a/src/reranking/reranker.py
++++ b/src/reranking/reranker.py
+@@ -230,20 +230,25 @@ def pack_reranker_inputs(
+                 if isinstance(enc, dict):
+                     input_ids = enc.get("input_ids", [])
+                     attention_mask = enc.get("attention_mask", [1] * len(input_ids))
+             except Exception:
+                 pass
+         if not input_ids:
+             toks = [1] + q_tokens[w_start:w_end] + [2] + b_tokens + [2]
+             input_ids = toks
+             attention_mask = [1] * len(toks)
+ 
++        # Strict clamp guard: guarantee input_ids and attention_mask never exceed max_length
++        if len(input_ids) > max_length:
++            input_ids = input_ids[:max_length]
++            attention_mask = attention_mask[:max_length]
++
+         packed_pairs.append(
+             PackedPair(
+                 query_text=w_text,
+                 passage_text=passage_text,
+                 input_ids=input_ids,
+                 attention_mask=attention_mask,
+                 query_window_index=win_idx,
+             )
+         )
+ 
+diff --git a/src/submission/validators.py b/src/submission/validators.py
+index d5c540a..bb5e36d 100644
+--- a/src/submission/validators.py
++++ b/src/submission/validators.py
+@@ -86,20 +86,26 @@ def validate_predictions(
+     for idx, row in enumerate(rows):
+         if not isinstance(row, dict):
+             errors.append(f"Row at index {idx} is not a dictionary: {type(row).__name__}")
+             continue
+ 
+         # Validate Query ID
+         if "id" not in row:
+             errors.append(f"Row at index {idx} missing required key 'id'")
+             continue
+ 
++        extra_row_keys = set(row.keys()) - {"id", "relevant_docs", "relevant_chunks"}
++        if extra_row_keys:
++            errors.append(
++                f"Row at index {idx} (query ID {row.get('id')!r}): unauthorized extra keys {sorted(extra_row_keys)}"
++            )
++
+         raw_id = row["id"]
+         if not _is_int64(raw_id):
+             errors.append(
+                 f"Row at index {idx}: query ID must be signed int64, got {type(raw_id).__name__} ({raw_id!r})"
+             )
+             continue
+ 
+         query_id = int(raw_id)
+         if query_id in seen_query_ids:
+             duplicate_query_ids.add(query_id)
+@@ -144,20 +150,26 @@ def validate_predictions(
+             total_chunks += len(rel_chunks)
+             seen_chunks: set[tuple[int, str]] = set()
+ 
+             for chunk_idx, chunk in enumerate(rel_chunks):
+                 if not isinstance(chunk, dict):
+                     errors.append(
+                         f"Query {query_id}: relevant_chunks[{chunk_idx}] must be dict, got {type(chunk).__name__}"
+                     )
+                     continue
+ 
++                extra_chunk_keys = set(chunk.keys()) - {"doc_id", "chunk_text", "chunk_order"}
++                if extra_chunk_keys:
++                    errors.append(
++                        f"Query {query_id}: relevant_chunks[{chunk_idx}] contains unauthorized extra keys {sorted(extra_chunk_keys)}"
++                    )
++
+                 # doc_id in chunk
+                 if "doc_id" not in chunk:
+                     errors.append(f"Query {query_id}: relevant_chunks[{chunk_idx}] missing 'doc_id'")
+                     continue
+                 raw_chunk_doc_id = chunk["doc_id"]
+                 if not _is_int64(raw_chunk_doc_id):
+                     errors.append(
+                         f"Query {query_id}: relevant_chunks[{chunk_idx}] doc_id must be integer (signed int64), "
+                         f"got {type(raw_chunk_doc_id).__name__} ({raw_chunk_doc_id!r})"
+                     )
+diff --git a/src/submission/vibiomir_json_zip.py b/src/submission/vibiomir_json_zip.py
+index 6ff6aac..4d59193 100644
+--- a/src/submission/vibiomir_json_zip.py
++++ b/src/submission/vibiomir_json_zip.py
+@@ -81,31 +81,39 @@ class VibiomirExporter:
+         target_dir.mkdir(parents=True, exist_ok=True)
+         eff_expected_count = expected_count if expected_count is not None else self.expected_count
+         snapshot_id = _extract_snapshot_id(store)
+ 
+         pre_errors: list[str] = []
+         rows: list[SubmissionRow] = []
+ 
+         # Index predictions and validate internal to official mapping
+         for fp in predictions:
+             # 1. Resolve query ID to signed int64
++            if isinstance(fp.query_id, bool):
++                pre_errors.append(f"Prediction query_id cannot be boolean: {fp.query_id!r}")
++                continue
+             try:
+                 qid_val = int(fp.query_id)
+                 if not (INT64_MIN <= qid_val <= INT64_MAX):
+                     pre_errors.append(f"Prediction query_id {fp.query_id!r} out of signed int64 range")
+             except (ValueError, TypeError):
+                 pre_errors.append(f"Cannot resolve internal query_id {fp.query_id!r} to integer")
+                 continue
+ 
+             # 2. Resolve document IDs to signed int64
+             rel_docs: list[int] = []
+             for raw_doc_id in fp.document_ids:
++                if isinstance(raw_doc_id, bool):
++                    pre_errors.append(
++                        f"Query {qid_val}: doc_id cannot be boolean: {raw_doc_id!r}"
++                    )
++                    continue
+                 try:
+                     did_val = int(raw_doc_id)
+                     if not (INT64_MIN <= did_val <= INT64_MAX):
+                         pre_errors.append(
+                             f"Query {qid_val}: doc_id {raw_doc_id!r} out of signed int64 range"
+                         )
+                         continue
+                     rel_docs.append(did_val)
+                 except (ValueError, TypeError):
+                     pre_errors.append(
+diff --git a/tests/submission/test_vibiomir_export.py b/tests/submission/test_vibiomir_export.py
+index a8faf75..1f03e57 100644
+--- a/tests/submission/test_vibiomir_export.py
++++ b/tests/submission/test_vibiomir_export.py
+@@ -596,10 +596,76 @@ def test_exporter_rejects_tampered_chunk_provenance(tmp_path: Path, store_and_qu
+             document_scores={"583": 0.9},
+             chunk_scores={chunk1.chunk_id: 0.9},
+         ),
+         FinalPrediction(query_id="2", document_ids=[], chunk_ids=[], document_scores={}, chunk_scores={}),
+     ]
+     exporter = VibiomirExporter()
+     with pytest.raises(SubmissionValidationError) as exc_info:
+         exporter.export(predictions, queries, store, tmp_path / "export_fail2")
+     assert exc_info.value.report.valid is False
+     assert any("provenance" in err.lower() or "mismatch" in err.lower() or "source" in err.lower() for err in exc_info.value.report.errors)
++
++
++def test_exporter_rejects_boolean_query_id_and_doc_id(tmp_path: Path, store_and_queries):
++    store, queries, chunk1, _ = store_and_queries
++    # Boolean query_id
++    predictions_bool_qid = [
++        FinalPrediction(
++            query_id=True,
++            document_ids=["583"],
++            chunk_ids=[chunk1.chunk_id],
++            document_scores={"583": 0.9},
++            chunk_scores={chunk1.chunk_id: 0.9},
++        ),
++        FinalPrediction(query_id="2", document_ids=[], chunk_ids=[], document_scores={}, chunk_scores={}),
++    ]
++    exporter = VibiomirExporter()
++    with pytest.raises(SubmissionValidationError) as exc:
++        exporter.export(predictions_bool_qid, queries, store, tmp_path / "exp_bool_q")
++    assert any("boolean" in err.lower() for err in exc.value.report.errors)
++
++    # Boolean doc_id
++    predictions_bool_did = [
++        FinalPrediction(
++            query_id="1",
++            document_ids=[True],
++            chunk_ids=[chunk1.chunk_id],
++            document_scores={"True": 0.9},
++            chunk_scores={chunk1.chunk_id: 0.9},
++        ),
++        FinalPrediction(query_id="2", document_ids=[], chunk_ids=[], document_scores={}, chunk_scores={}),
++    ]
++    with pytest.raises(SubmissionValidationError) as exc:
++        exporter.export(predictions_bool_did, queries, store, tmp_path / "exp_bool_d")
++    assert any("boolean" in err.lower() for err in exc.value.report.errors)
++
++
++def test_validator_rejects_unauthorized_extra_keys_in_row_and_chunk(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # Extra key in row
++    rows_extra_row_key = [
++        {"id": 1, "relevant_docs": [583], "relevant_chunks": [], "score": 0.95},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report1 = validate_predictions(rows_extra_row_key, queries, store)
++    assert report1.valid is False
++    assert any("unauthorized extra keys" in err.lower() and "score" in err.lower() for err in report1.errors)
++
++    # Extra key in chunk
++    rows_extra_chunk_key = [
++        {
++            "id": 1,
++            "relevant_docs": [583],
++            "relevant_chunks": [
++                {
++                    "doc_id": 583,
++                    "chunk_text": "Bệnh viện Bạch Mai là bệnh viện đa khoa hoàn chỉnh",
++                    "chunk_order": 0,
++                    "confidence_score": 0.99,
++                }
++            ],
++        },
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report2 = validate_predictions(rows_extra_chunk_key, queries, store)
++    assert report2.valid is False
++    assert any("unauthorized extra keys" in err.lower() and "confidence_score" in err.lower() for err in report2.errors)

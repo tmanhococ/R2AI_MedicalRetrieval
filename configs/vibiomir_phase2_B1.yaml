@@ -1,0 +1,71 @@
+run:
+  experiment_name: vibiomir_phase2_B1
+  seed: 42
+  require_real_models: false
+
+dataset:
+  expected_query_count: 1200
+  expected_official_count: 4394718
+  verify_actual_counts: true
+  scope: all
+  accepted_languages: [vi, en, zh, und]
+
+campaign:
+  scope: all
+  domain_whitelist: []
+  source_limit: null
+  reuse_existing_content: true
+  require_no_unresolved_sources: true
+  priority_changes_order_only: true
+
+resources:
+  embedding_start_batch: 8
+  reranker_start_batch: 4
+  oom_min_batch: 1
+  concurrent_gpu_models: 1
+  java_heap: 4G
+  row_group_cache_bytes: 268435456
+  disk_reserve_fraction: 0.25
+
+retrieval:
+  candidate_top_k: 200
+  sparse:
+    backend: lucene
+    k1: 1.2
+    b: 0.75
+    pretokenized: true
+    analyzer: whitespace
+    token_encoding: sha256_hex_v1
+    document_top_k_per_language: 500
+    chunk_top_k_per_language: 1000
+  dense:
+    enabled: false
+  candidate_docs: 200
+
+fusion:
+  method: weighted_rrf
+  rrf_k: 60
+  weights: {vi_bm25: 1.0, en_bm25: 1.0, zh_bm25: 1.0, und_bm25: 1.0}
+
+reranker:
+  enabled: false
+
+output:
+  fit_only_allowed_dev: true
+  fallback_policy: sparse_rank_caps
+  fallback_raw_logit_min: 0.0
+  min_results: 0
+  document_cap: 10
+  evidence_cap: 20
+  evidence_cap_per_doc: 2
+  fixed_count_validation: false
+
+submission:
+  exporter: vibiomir_json_zip
+  json_filename: results.json
+  zip_filename: submission_B1_sparse.zip
+  require_scope: full_source_pass
+  require_complete_sparse_membership: true
+  require_complete_dense_membership: false
+  require_completed_queries: 1200
+  report_terminal_gaps: true

@@ -1,0 +1,1395 @@
+# Review package: 86abaec..4a59f22
+
+## Commits
+4a59f22 feat: export validated ViBioMIR JSON submissions (Task 8)
+
+## Files changed
+ src/data/vibiomir_contracts.py           |  27 +-
+ src/submission/__init__.py               |  12 +
+ src/submission/validators.py             | 396 ++++++++++++++++++++
+ src/submission/vibiomir_json_zip.py      | 278 ++++++++++++++
+ tests/submission/test_vibiomir_export.py | 605 +++++++++++++++++++++++++++++++
+ 5 files changed, 1317 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/data/vibiomir_contracts.py b/src/data/vibiomir_contracts.py
+index 60e1b36..85ffda3 100644
+--- a/src/data/vibiomir_contracts.py
++++ b/src/data/vibiomir_contracts.py
+@@ -263,24 +263,49 @@ class SnapshotManifest:
+     ready_document_count: int
+     chunk_count: int
+     language_counts: dict[str, int]
+     quarantine_counts: dict[str, int]
+     shard_paths_and_hashes: list[dict[str, str]]
+ 
+ 
+ @dataclass(frozen=True)
+ class ValidationReport:
+     """Offline validation verdict for submission file."""
+-    is_valid: bool
++    valid: bool
+     query_count: int
++    document_count: int = 0
++    chunk_count: int = 0
+     errors: tuple[str, ...] = ()
+     warnings: tuple[str, ...] = ()
++    snapshot_id: str | None = None
++
++    def __post_init__(self) -> None:
++        if isinstance(self.errors, list):
++            object.__setattr__(self, "errors", tuple(self.errors))
++        if isinstance(self.warnings, list):
++            object.__setattr__(self, "warnings", tuple(self.warnings))
++
++    @property
++    def is_valid(self) -> bool:
++        return self.valid
++
++
++@dataclass(frozen=True)
++class ExportResult:
++    """Summary of exported official submission files and checksums."""
++    json_path: Path
++    zip_path: Path
++    validation_report_path: Path
++    json_sha256: str
++    zip_sha256: str
++    validation_report: ValidationReport | None = None
++
+ 
+ 
+ class PerQueryMetrics(tuple):
+     """Tuple of QueryMetrics supporting sequence indexing, iteration, and query_id dict lookup."""
+ 
+     def __new__(cls, items: Any = ()) -> PerQueryMetrics:
+         return super().__new__(cls, items)
+ 
+     def __init__(self, items: Any = ()) -> None:
+         self._by_id: dict[int, QueryMetrics] = {qm.query_id: qm for qm in self}
+diff --git a/src/submission/__init__.py b/src/submission/__init__.py
+index a89d927..bd49724 100644
+--- a/src/submission/__init__.py
++++ b/src/submission/__init__.py
+@@ -1,12 +1,24 @@
+ """Submission package for Multilingual Medical Retrieval MVP."""
+ 
+ from src.submission.base import SubmissionExporter, create_exporter
+ from src.submission.competition_csv import CompetitionCsvExporter
+ from src.submission.internal_jsonl import InternalJsonlExporter
++from src.submission.validators import (
++    SubmissionValidationError,
++    validate_predictions,
++    validate_zip,
++)
++from src.submission.vibiomir_json_zip import ExportResult, VibiomirExporter
+ 
+ __all__ = [
+     "SubmissionExporter",
+     "InternalJsonlExporter",
+     "CompetitionCsvExporter",
+     "create_exporter",
++    "VibiomirExporter",
++    "ExportResult",
++    "SubmissionValidationError",
++    "validate_predictions",
++    "validate_zip",
+ ]
++
+diff --git a/src/submission/validators.py b/src/submission/validators.py
+new file mode 100644
+index 0000000..d5c540a
+--- /dev/null
++++ b/src/submission/validators.py
+@@ -0,0 +1,396 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Sequence
++import zipfile
++
++from src.data.vibiomir_contracts import (
++    OfficialQuery,
++    SourceStore,
++    SubmissionChunk,
++    SubmissionRow,
++    ValidationReport,
++)
++
++INT64_MIN = -9223372036854775808
++INT64_MAX = 9223372036854775807
++
++
++class SubmissionValidationError(ValueError):
++    """Raised when submission rows or zip archives fail strict validation."""
++
++    def __init__(self, message: str, report: ValidationReport) -> None:
++        super().__init__(message)
++        self.report = report
++
++
++def _is_int64(val: Any) -> bool:
++    """Returns True if val is a signed 64-bit integer (rejecting bool)."""
++    return isinstance(val, int) and not isinstance(val, bool) and (INT64_MIN <= val <= INT64_MAX)
++
++
++def _extract_snapshot_id(store: SourceStore) -> str | None:
++    """Extracts snapshot identifier from SourceStore instance if available."""
++    if hasattr(store, "snapshot_id"):
++        return str(store.snapshot_id)
++    if hasattr(store, "manifest_data") and isinstance(store.manifest_data, dict):
++        return store.manifest_data.get("snapshot_id")
++    return None
++
++
++def validate_predictions(
++    rows: Sequence[SubmissionRow] | Any,
++    queries: Sequence[OfficialQuery],
++    store: SourceStore,
++    expected_count: int | None = None,
++) -> ValidationReport:
++    """Strictly validates submission rows against official queries and SourceStore snapshot.
++
++    Checks:
++    1. Top-level list and sequence structure.
++    2. Exact query coverage: no missing, extra, or duplicate query IDs.
++    3. Signed int64 IDs: rejects bool, string, float, out-of-range IDs.
++    4. Relevant docs/chunks list types: rejects missing or non-list types.
++    5. Registry membership: rejects foreign doc IDs not in store.
++    6. Deduplication: rejects duplicate doc IDs and duplicate (doc_id, chunk_text) in same query.
++    7. Exact source substring provenance: verifies chunk text is verbatim substring of doc source_text.
++    8. Valid empty predictions pass with empty lists.
++    9. Chunk doc_id not in relevant_docs is accepted if valid official doc.
++    10. Non-negative integer chunk_order (rejecting bool, negative, float).
++    """
++    errors: list[str] = []
++    warnings: list[str] = []
++    snapshot_id = _extract_snapshot_id(store)
++
++    if not isinstance(rows, (list, tuple)):
++        return ValidationReport(
++            valid=False,
++            query_count=0,
++            document_count=0,
++            chunk_count=0,
++            errors=(f"Submission rows must be a list/sequence, got {type(rows).__name__}",),
++            snapshot_id=snapshot_id,
++        )
++
++    expected_query_ids = {q.query_id for q in queries}
++    if expected_count is not None and len(rows) != expected_count:
++        errors.append(f"Expected query count was {expected_count}, got {len(rows)}")
++
++
++    seen_query_ids: set[int] = set()
++    duplicate_query_ids: set[int] = set()
++    total_docs = 0
++    total_chunks = 0
++
++    for idx, row in enumerate(rows):
++        if not isinstance(row, dict):
++            errors.append(f"Row at index {idx} is not a dictionary: {type(row).__name__}")
++            continue
++
++        # Validate Query ID
++        if "id" not in row:
++            errors.append(f"Row at index {idx} missing required key 'id'")
++            continue
++
++        raw_id = row["id"]
++        if not _is_int64(raw_id):
++            errors.append(
++                f"Row at index {idx}: query ID must be signed int64, got {type(raw_id).__name__} ({raw_id!r})"
++            )
++            continue
++
++        query_id = int(raw_id)
++        if query_id in seen_query_ids:
++            duplicate_query_ids.add(query_id)
++        seen_query_ids.add(query_id)
++
++        # Validate relevant_docs
++        if "relevant_docs" not in row:
++            errors.append(f"Query {query_id}: missing 'relevant_docs' field")
++        elif not isinstance(row["relevant_docs"], list):
++            errors.append(
++                f"Query {query_id}: 'relevant_docs' must be a list, got {type(row['relevant_docs']).__name__}"
++            )
++        else:
++            rel_docs = row["relevant_docs"]
++            total_docs += len(rel_docs)
++            seen_doc_ids: set[int] = set()
++            for doc_idx, raw_doc_id in enumerate(rel_docs):
++                if not _is_int64(raw_doc_id):
++                    errors.append(
++                        f"Query {query_id}: relevant_docs[{doc_idx}] doc_id must be integer (signed int64), "
++                        f"got {type(raw_doc_id).__name__} ({raw_doc_id!r})"
++                    )
++                    continue
++
++                doc_id = int(raw_doc_id)
++                if doc_id in seen_doc_ids:
++                    errors.append(f"Query {query_id}: duplicate document ID {doc_id} in relevant_docs")
++                seen_doc_ids.add(doc_id)
++
++                if not store.contains_official_doc(doc_id):
++                    errors.append(f"Query {query_id}: foreign doc ID {doc_id} not in official registry/snapshot")
++
++        # Validate relevant_chunks
++        if "relevant_chunks" not in row:
++            errors.append(f"Query {query_id}: missing 'relevant_chunks' field")
++        elif not isinstance(row["relevant_chunks"], list):
++            errors.append(
++                f"Query {query_id}: 'relevant_chunks' must be a list, got {type(row['relevant_chunks']).__name__}"
++            )
++        else:
++            rel_chunks = row["relevant_chunks"]
++            total_chunks += len(rel_chunks)
++            seen_chunks: set[tuple[int, str]] = set()
++
++            for chunk_idx, chunk in enumerate(rel_chunks):
++                if not isinstance(chunk, dict):
++                    errors.append(
++                        f"Query {query_id}: relevant_chunks[{chunk_idx}] must be dict, got {type(chunk).__name__}"
++                    )
++                    continue
++
++                # doc_id in chunk
++                if "doc_id" not in chunk:
++                    errors.append(f"Query {query_id}: relevant_chunks[{chunk_idx}] missing 'doc_id'")
++                    continue
++                raw_chunk_doc_id = chunk["doc_id"]
++                if not _is_int64(raw_chunk_doc_id):
++                    errors.append(
++                        f"Query {query_id}: relevant_chunks[{chunk_idx}] doc_id must be integer (signed int64), "
++                        f"got {type(raw_chunk_doc_id).__name__} ({raw_chunk_doc_id!r})"
++                    )
++                    continue
++
++                chunk_doc_id = int(raw_chunk_doc_id)
++
++                # chunk_text
++                if "chunk_text" not in chunk:
++                    errors.append(f"Query {query_id}: relevant_chunks[{chunk_idx}] missing 'chunk_text'")
++                    continue
++                chunk_text = chunk["chunk_text"]
++                if not isinstance(chunk_text, str) or not chunk_text.strip():
++                    errors.append(
++                        f"Query {query_id}: relevant_chunks[{chunk_idx}] 'chunk_text' must be non-empty string"
++                    )
++                    continue
++
++                # Duplicate chunk pair
++                chunk_pair = (chunk_doc_id, chunk_text)
++                if chunk_pair in seen_chunks:
++                    errors.append(
++                        f"Query {query_id}: duplicate chunk (doc_id={chunk_doc_id}, chunk_text) in relevant_chunks"
++                    )
++                seen_chunks.add(chunk_pair)
++
++                # Official registry check
++                if not store.contains_official_doc(chunk_doc_id):
++                    errors.append(
++                        f"Query {query_id}: foreign chunk doc_id {chunk_doc_id} not in official registry/snapshot"
++                    )
++                    continue
++
++                # chunk_order check if present
++                if "chunk_order" in chunk:
++                    order = chunk["chunk_order"]
++                    if isinstance(order, bool) or not isinstance(order, int) or order < 0:
++                        errors.append(
++                            f"Query {query_id}: chunk_order must be non-negative integer, got {order!r}"
++                        )
++
++                # Exact substring match in snapshot source_text
++                try:
++                    doc = store.get_document(chunk_doc_id)
++                    if chunk_text not in doc.source_text:
++                        errors.append(
++                            f"Query {query_id}: chunk_text is not a substring of source document {chunk_doc_id} in snapshot"
++                        )
++                except KeyError:
++                    errors.append(
++                        f"Query {query_id}: source document {chunk_doc_id} not found in snapshot store"
++                    )
++                except Exception as e:
++                    errors.append(
++                        f"Query {query_id}: failed to load document {chunk_doc_id} from snapshot: {e}"
++                    )
++
++    # Check query coverage
++    missing_queries = expected_query_ids - seen_query_ids
++    if missing_queries:
++        sample_missing = sorted(list(missing_queries))[:5]
++        errors.append(f"Missing {len(missing_queries)} queries (sample: {sample_missing})")
++
++    extra_queries = seen_query_ids - expected_query_ids
++    if extra_queries:
++        sample_extra = sorted(list(extra_queries))[:5]
++        errors.append(f"Found {len(extra_queries)} extra/unknown queries (sample: {sample_extra})")
++
++    if duplicate_query_ids:
++        sample_dup = sorted(list(duplicate_query_ids))[:5]
++        errors.append(f"Found {len(duplicate_query_ids)} duplicate queries (sample: {sample_dup})")
++
++    is_valid = len(errors) == 0
++    return ValidationReport(
++        valid=is_valid,
++        query_count=len(rows),
++        document_count=total_docs,
++        chunk_count=total_chunks,
++        errors=tuple(errors),
++        warnings=tuple(warnings),
++        snapshot_id=snapshot_id,
++    )
++
++
++def validate_zip(
++    path: Path | str,
++    queries: Sequence[OfficialQuery],
++    store: SourceStore,
++    expected_count: int | None = None,
++) -> ValidationReport:
++    """Strictly validates a ViBioMIR submission ZIP archive.
++
++    Checks:
++    1. ZIP exists and is a valid non-empty archive.
++    2. Contains exactly one regular entry named 'results.json' at root.
++    3. No directories, subdirectories, extra files, or encryption.
++    4. results.json decompresses into UTF-8 JSON array.
++    5. Runs validate_predictions on parsed content.
++    """
++    zip_path = Path(path)
++    snapshot_id = _extract_snapshot_id(store)
++
++    if not zip_path.exists():
++        return ValidationReport(
++            valid=False,
++            query_count=0,
++            document_count=0,
++            chunk_count=0,
++            errors=(f"Submission ZIP file not found: {zip_path}",),
++            snapshot_id=snapshot_id,
++        )
++
++    try:
++        with zipfile.ZipFile(zip_path, "r") as zf:
++            infolist = zf.infolist()
++            if not infolist:
++                return ValidationReport(
++                    valid=False,
++                    query_count=0,
++                    document_count=0,
++                    chunk_count=0,
++                    errors=("ZIP archive is empty",),
++                    snapshot_id=snapshot_id,
++                )
++
++            if len(infolist) > 1:
++                filenames = [info.filename for info in infolist]
++                return ValidationReport(
++                    valid=False,
++                    query_count=0,
++                    document_count=0,
++                    chunk_count=0,
++                    errors=(
++                        f"ZIP archive must contain exactly one root file named 'results.json', "
++                        f"found {len(infolist)} entries: {filenames}",
++                    ),
++                    snapshot_id=snapshot_id,
++                )
++
++            entry = infolist[0]
++            if entry.is_dir():
++                return ValidationReport(
++                    valid=False,
++                    query_count=0,
++                    document_count=0,
++                    chunk_count=0,
++                    errors=("ZIP archive entry cannot be a directory",),
++                    snapshot_id=snapshot_id,
++                )
++
++            # Check filename: must be strictly "results.json" without directory prefixes
++            if "/" in entry.filename or "\\" in entry.filename or entry.filename != "results.json":
++                return ValidationReport(
++                    valid=False,
++                    query_count=0,
++                    document_count=0,
++                    chunk_count=0,
++                    errors=(
++                        f"ZIP entry must be exactly 'results.json' at root (no subdirectories), "
++                        f"got {entry.filename!r}",
++                    ),
++                    snapshot_id=snapshot_id,
++                )
++
++            # Check encryption flag
++            if entry.flag_bits & 0x1:
++                return ValidationReport(
++                    valid=False,
++                    query_count=0,
++                    document_count=0,
++                    chunk_count=0,
++                    errors=("ZIP entry 'results.json' is encrypted",),
++                    snapshot_id=snapshot_id,
++                )
++
++            raw_bytes = zf.read(entry)
++
++    except zipfile.BadZipFile as e:
++        return ValidationReport(
++            valid=False,
++            query_count=0,
++            document_count=0,
++            chunk_count=0,
++            errors=(f"Corrupt or invalid ZIP archive: {e}",),
++            snapshot_id=snapshot_id,
++        )
++    except Exception as e:
++        return ValidationReport(
++            valid=False,
++            query_count=0,
++            document_count=0,
++            chunk_count=0,
++            errors=(f"Error reading ZIP archive: {e}",),
++            snapshot_id=snapshot_id,
++        )
++
++    # Decompress and parse results.json
++    try:
++        decoded_text = raw_bytes.decode("utf-8")
++        data = json.loads(decoded_text)
++    except UnicodeDecodeError as e:
++        return ValidationReport(
++            valid=False,
++            query_count=0,
++            document_count=0,
++            chunk_count=0,
++            errors=(f"results.json is not valid UTF-8: {e}",),
++            snapshot_id=snapshot_id,
++        )
++    except json.JSONDecodeError as e:
++        return ValidationReport(
++            valid=False,
++            query_count=0,
++            document_count=0,
++            chunk_count=0,
++            errors=(f"Failed to parse results.json as JSON: {e}",),
++            snapshot_id=snapshot_id,
++        )
++
++    if not isinstance(data, list):
++        return ValidationReport(
++            valid=False,
++            query_count=0,
++            document_count=0,
++            chunk_count=0,
++            errors=(f"results.json root element must be a JSON array, got {type(data).__name__}",),
++            snapshot_id=snapshot_id,
++        )
++
++    # Delegate predictions validation
++    return validate_predictions(
++        rows=data,
++        queries=queries,
++        store=store,
++        expected_count=expected_count,
++    )
+diff --git a/src/submission/vibiomir_json_zip.py b/src/submission/vibiomir_json_zip.py
+new file mode 100644
+index 0000000..6ff6aac
+--- /dev/null
++++ b/src/submission/vibiomir_json_zip.py
+@@ -0,0 +1,278 @@
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path
++from typing import Sequence
++import uuid
++import zipfile
++
++
++from src.data.schemas import FinalPrediction
++from src.data.vibiomir_contracts import (
++    ExportResult,
++    OfficialQuery,
++    SourceStore,
++    SubmissionChunk,
++    SubmissionRow,
++    ValidationReport,
++)
++from src.submission.validators import (
++    INT64_MAX,
++    INT64_MIN,
++    SubmissionValidationError,
++    _extract_snapshot_id,
++    validate_predictions,
++)
++
++
++class VibiomirExporter:
++    """Exports final model predictions into official ViBioMIR submission format.
++
++    Enforces:
++    1. Pre-serialization strict provenance checks (exact character spans, source hash/version).
++    2. Resolution of internal string IDs to signed int64 IDs.
++    3. Sort order by query ID ascending.
++    4. Deterministic formatting (UTF-8, ensure_ascii=False, indent=2, trailing newline).
++    5. Single-entry deterministic ZIP archive (fixed timestamp 1980-01-01, deflate level 9).
++    6. Atomic writes via temporary files and atomic replace.
++    7. Strict pre-export validation (no silent fixes or omissions).
++    """
++
++    def __init__(
++        self,
++        json_filename: str = "results.json",
++        zip_filename: str = "submission.zip",
++        emit_chunk_order: bool = True,
++        provenance_check: str = "strict",
++        expected_count: int | None = None,
++    ) -> None:
++        self.json_filename = json_filename
++        self.zip_filename = zip_filename
++        self.emit_chunk_order = emit_chunk_order
++        self.provenance_check = provenance_check
++        self.expected_count = expected_count
++
++    def export(
++        self,
++        predictions: Sequence[FinalPrediction],
++        queries: Sequence[OfficialQuery],
++        store: SourceStore,
++        output_dir: Path | str,
++        expected_count: int | None = None,
++    ) -> ExportResult:
++        """Translates predictions, validates all contracts, and writes submission files atomically.
++
++        Args:
++            predictions: Sequence of FinalPrediction objects from retrieval pipeline.
++            queries: Official queries from query.parquet to ensure exact coverage.
++            store: SnapshotSourceStore providing document text and chunk span verification.
++            output_dir: Target directory where results.json and ZIP will be created.
++            expected_count: Optional override for expected total query count.
++
++        Returns:
++            ExportResult with paths and SHA-256 digests.
++
++        Raises:
++            SubmissionValidationError: If predictions fail strict pre-serialization or schema checks.
++        """
++        target_dir = Path(output_dir)
++        target_dir.mkdir(parents=True, exist_ok=True)
++        eff_expected_count = expected_count if expected_count is not None else self.expected_count
++        snapshot_id = _extract_snapshot_id(store)
++
++        pre_errors: list[str] = []
++        rows: list[SubmissionRow] = []
++
++        # Index predictions and validate internal to official mapping
++        for fp in predictions:
++            # 1. Resolve query ID to signed int64
++            try:
++                qid_val = int(fp.query_id)
++                if not (INT64_MIN <= qid_val <= INT64_MAX):
++                    pre_errors.append(f"Prediction query_id {fp.query_id!r} out of signed int64 range")
++            except (ValueError, TypeError):
++                pre_errors.append(f"Cannot resolve internal query_id {fp.query_id!r} to integer")
++                continue
++
++            # 2. Resolve document IDs to signed int64
++            rel_docs: list[int] = []
++            for raw_doc_id in fp.document_ids:
++                try:
++                    did_val = int(raw_doc_id)
++                    if not (INT64_MIN <= did_val <= INT64_MAX):
++                        pre_errors.append(
++                            f"Query {qid_val}: doc_id {raw_doc_id!r} out of signed int64 range"
++                        )
++                        continue
++                    rel_docs.append(did_val)
++                except (ValueError, TypeError):
++                    pre_errors.append(
++                        f"Query {qid_val}: cannot resolve internal doc_id {raw_doc_id!r} to integer"
++                    )
++
++            # 3. Resolve chunks with strict provenance check
++            rel_chunks: list[SubmissionChunk] = []
++            for order_idx, chunk_id in enumerate(fp.chunk_ids):
++                try:
++                    chunk = store.get_chunk(chunk_id)
++                except KeyError:
++                    pre_errors.append(
++                        f"Query {qid_val}: orphan internal chunk ID {chunk_id!r} not found in store"
++                    )
++                    continue
++                except Exception as e:
++                    pre_errors.append(
++                        f"Query {qid_val}: error retrieving chunk {chunk_id!r}: {e}"
++                    )
++                    continue
++
++                if not chunk.text or not chunk.text.strip():
++                    pre_errors.append(
++                        f"Query {qid_val}: chunk {chunk_id} has empty text"
++                    )
++
++                if not store.contains_official_doc(chunk.doc_id):
++                    pre_errors.append(
++                        f"Query {qid_val}: chunk {chunk_id} doc_id {chunk.doc_id} not in official registry"
++                    )
++
++                if self.provenance_check == "strict":
++                    try:
++                        doc = store.get_document(chunk.doc_id)
++                        if chunk.source_version != doc.source_version:
++                            pre_errors.append(
++                                f"Query {qid_val}: chunk {chunk_id} source_version mismatch "
++                                f"({chunk.source_version!r} != {doc.source_version!r})"
++                            )
++                        if chunk.source_sha256 != doc.source_sha256:
++                            pre_errors.append(
++                                f"Query {qid_val}: chunk {chunk_id} source_sha256 mismatch "
++                                f"({chunk.source_sha256!r} != {doc.source_sha256!r})"
++                            )
++                        # Verify exact character span slice
++                        span_slice = doc.source_text[chunk.start_char : chunk.end_char]
++                        if span_slice != chunk.text:
++                            pre_errors.append(
++                                f"Query {qid_val}: chunk {chunk_id} exact span slice mismatch with source_text"
++                            )
++                        elif chunk.text not in doc.source_text:
++                            pre_errors.append(
++                                f"Query {qid_val}: chunk {chunk_id} text is not a substring of doc {doc.doc_id}"
++                            )
++                    except KeyError:
++                        pre_errors.append(
++                            f"Query {qid_val}: chunk {chunk_id} parent doc {chunk.doc_id} not found in store"
++                        )
++                    except Exception as e:
++                        pre_errors.append(
++                            f"Query {qid_val}: error verifying chunk {chunk_id} against source doc: {e}"
++                        )
++
++                chunk_entry: SubmissionChunk = {
++                    "doc_id": chunk.doc_id,
++                    "chunk_text": chunk.text,
++                }
++                if self.emit_chunk_order:
++                    chunk_entry["chunk_order"] = order_idx
++                rel_chunks.append(chunk_entry)
++
++            row: SubmissionRow = {
++                "id": qid_val,
++                "relevant_docs": rel_docs,
++                "relevant_chunks": rel_chunks,
++            }
++            rows.append(row)
++
++        # 4. Sort rows deterministically by query ID ascending
++        rows.sort(key=lambda r: r["id"])
++
++        # 5. Run Level B offline validation
++        report = validate_predictions(
++            rows=rows,
++            queries=queries,
++            store=store,
++            expected_count=eff_expected_count,
++        )
++
++        all_errors = list(pre_errors) + list(report.errors)
++        if all_errors:
++            full_report = ValidationReport(
++                valid=False,
++                query_count=report.query_count,
++                document_count=report.document_count,
++                chunk_count=report.chunk_count,
++                errors=tuple(all_errors),
++                warnings=report.warnings,
++                snapshot_id=snapshot_id,
++            )
++            raise SubmissionValidationError(
++                f"Submission validation failed with {len(all_errors)} errors",
++                report=full_report,
++            )
++
++        # 6. Format JSON deterministically
++        json_content = json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
++        json_bytes = json_content.encode("utf-8")
++        json_sha256 = hashlib.sha256(json_bytes).hexdigest()
++
++        # Target paths
++        target_json_path = target_dir / self.json_filename
++        target_zip_path = target_dir / self.zip_filename
++        target_report_path = target_dir / "validation_report.json"
++
++        # Temporary files for atomic writes
++        temp_id = uuid.uuid4().hex
++        temp_json_path = target_dir / f".tmp_{temp_id}.json"
++        temp_zip_path = target_dir / f".tmp_{temp_id}.zip"
++        temp_report_path = target_dir / f".tmp_{temp_id}_report.json"
++
++        try:
++            # Atomic write JSON
++            temp_json_path.write_bytes(json_bytes)
++            os.replace(temp_json_path, target_json_path)
++
++            # Atomic write deterministic ZIP
++            # Using fixed timestamp 1980-01-01 00:00:00, deflate level 9, standard attr 0o644
++            zinfo = zipfile.ZipInfo(filename="results.json", date_time=(1980, 1, 1, 0, 0, 0))
++            zinfo.external_attr = 0o644 << 16
++            zinfo.compress_type = zipfile.ZIP_DEFLATED
++
++            with zipfile.ZipFile(
++                temp_zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
++            ) as zf:
++                zf.writestr(zinfo, json_bytes)
++
++            zip_bytes = temp_zip_path.read_bytes()
++            zip_sha256 = hashlib.sha256(zip_bytes).hexdigest()
++            os.replace(temp_zip_path, target_zip_path)
++
++            # Atomic write validation report
++            report_dict = {
++                "valid": report.valid,
++                "query_count": report.query_count,
++                "document_count": report.document_count,
++                "chunk_count": report.chunk_count,
++                "errors": list(report.errors),
++                "warnings": list(report.warnings),
++                "snapshot_id": snapshot_id,
++            }
++            temp_report_path.write_text(json.dumps(report_dict, indent=2) + "\n", encoding="utf-8")
++            os.replace(temp_report_path, target_report_path)
++
++        except Exception:
++            # Clean up temporary artifacts on failure
++            for p in (temp_json_path, temp_zip_path, temp_report_path):
++                if p.exists():
++                    p.unlink(missing_ok=True)
++            raise
++
++        return ExportResult(
++            json_path=target_json_path,
++            zip_path=target_zip_path,
++            validation_report_path=target_report_path,
++            json_sha256=json_sha256,
++            zip_sha256=zip_sha256,
++            validation_report=report,
++        )
+diff --git a/tests/submission/test_vibiomir_export.py b/tests/submission/test_vibiomir_export.py
+new file mode 100644
+index 0000000..a8faf75
+--- /dev/null
++++ b/tests/submission/test_vibiomir_export.py
+@@ -0,0 +1,605 @@
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++import zipfile
++import pytest
++
++from src.data.schemas import FinalPrediction
++from src.data.vibiomir_contracts import (
++    ExtractedBlock,
++    ExtractedDocument,
++    OfficialQuery,
++    SourceStore,
++    SpanChunk,
++    SubmissionChunk,
++    SubmissionRow,
++    ValidationReport,
++)
++from src.submission.validators import (
++    SubmissionValidationError,
++    validate_predictions,
++    validate_zip,
++)
++from src.submission.vibiomir_json_zip import ExportResult, VibiomirExporter
++
++
++class MockSourceStore:
++    """In-memory SourceStore protocol implementation for testing."""
++
++    def __init__(
++        self,
++        docs: dict[int, ExtractedDocument] | None = None,
++        chunks: dict[str, SpanChunk] | None = None,
++        official_doc_ids: set[int] | None = None,
++        snapshot_id: str = "snap_test_001",
++    ) -> None:
++        self.docs = docs or {}
++        self.chunks = chunks or {}
++        self.official_doc_ids = official_doc_ids if official_doc_ids is not None else set(self.docs.keys())
++        self.snapshot_id = snapshot_id
++
++    def get_document(self, doc_id: int) -> ExtractedDocument:
++        if doc_id not in self.docs:
++            raise KeyError(f"Document {doc_id} not found")
++        return self.docs[doc_id]
++
++    def get_chunk(self, chunk_id: str) -> SpanChunk:
++        if chunk_id not in self.chunks:
++            raise KeyError(f"Chunk {chunk_id} not found")
++        return self.chunks[chunk_id]
++
++    def contains_official_doc(self, doc_id: int) -> bool:
++        return doc_id in self.official_doc_ids
++
++
++def _make_sample_doc_and_chunk(doc_id: int = 583, text: str = "Bệnh sốt xuất huyết do virus Dengue gây ra."):
++    doc = ExtractedDocument(
++        doc_id=doc_id,
++        source_version="v1",
++        source_text=text,
++        source_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
++        raw_sha256="raw_hash_001",
++        title="Sốt xuất huyết",
++        language="vi",
++        blocks=(ExtractedBlock(block_index=0, kind="p", start_char=0, end_char=len(text), section=None),),
++        quality_flags=(),
++    )
++    chunk_id = f"{doc_id}:{doc.source_sha256}:000000"
++    chunk = SpanChunk(
++        chunk_id=chunk_id,
++        doc_id=doc_id,
++        source_version=doc.source_version,
++        source_sha256=doc.source_sha256,
++        start_char=0,
++        end_char=len(text),
++        chunk_index=0,
++        language="vi",
++        section=None,
++        text=text,
++        index_text=text,
++        dense_token_count=10,
++        reranker_token_count=10,
++    )
++    return doc, chunk
++
++
++@pytest.fixture
++def store_and_queries():
++    doc1, chunk1 = _make_sample_doc_and_chunk(doc_id=583, text="Bệnh sốt xuất huyết Dengue lây qua muỗi vằn.")
++    doc2, chunk2 = _make_sample_doc_and_chunk(doc_id=4294967297, text="Triệu chứng gồm sốt cao, đau cơ và phát ban.")
++    store = MockSourceStore(
++        docs={583: doc1, 4294967297: doc2},
++        chunks={chunk1.chunk_id: chunk1, chunk2.chunk_id: chunk2},
++        official_doc_ids={583, 4294967297},
++        snapshot_id="snapshot_vibiomir_pilot",
++    )
++    queries = (
++        OfficialQuery(query_id=1, query="Sốt xuất huyết lây qua đâu?"),
++        OfficialQuery(query_id=2, query="Triệu chứng của sốt xuất huyết là gì?"),
++    )
++    return store, queries, chunk1, chunk2
++
++
++def test_source_store_protocol_compliance(store_and_queries):
++    store, _, _, _ = store_and_queries
++    assert isinstance(store, SourceStore)
++
++
++# ---------------------------------------------------------------------------
++# 1. Sparse IDs and Signed int64 validation
++# ---------------------------------------------------------------------------
++
++def test_sparse_int64_ids_pass(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    rows: list[SubmissionRow] = [
++        {
++            "id": 1,
++            "relevant_docs": [583, 4294967297],
++            "relevant_chunks": [{"doc_id": 583, "chunk_text": "Bệnh sốt xuất huyết Dengue lây qua muỗi vằn."}],
++        },
++        {
++            "id": 2,
++            "relevant_docs": [4294967297],
++            "relevant_chunks": [{"doc_id": 4294967297, "chunk_text": "Triệu chứng gồm sốt cao, đau cơ và phát ban."}],
++        },
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is True
++    assert report.query_count == 2
++    assert report.document_count == 3
++    assert report.chunk_count == 2
++    assert len(report.errors) == 0
++
++
++@pytest.mark.parametrize("bad_query_id", [True, False, "1", 1.0, 9223372036854775808, -9223372036854775809])
++def test_reject_non_int64_or_bool_query_id(store_and_queries, bad_query_id):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {"id": bad_query_id, "relevant_docs": [583], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("query ID" in err.lower() or "signed int64" in err.lower() or "integer" in err.lower() for err in report.errors)
++
++
++@pytest.mark.parametrize("bad_doc_id", [True, False, "583", 583.0, 9223372036854775808])
++def test_reject_non_int64_or_bool_doc_id(store_and_queries, bad_doc_id):
++    store, queries, _, _ = store_and_queries
++    # in relevant_docs
++    rows1 = [
++        {"id": 1, "relevant_docs": [bad_doc_id], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report1 = validate_predictions(rows1, queries, store)
++    assert report1.valid is False
++    assert any("doc_id" in err.lower() or "integer" in err.lower() for err in report1.errors)
++
++    # in relevant_chunks
++    rows2 = [
++        {"id": 1, "relevant_docs": [], "relevant_chunks": [{"doc_id": bad_doc_id, "chunk_text": "some text"}]},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report2 = validate_predictions(rows2, queries, store)
++    assert report2.valid is False
++    assert any("doc_id" in err.lower() or "integer" in err.lower() for err in report2.errors)
++
++
++# ---------------------------------------------------------------------------
++# 2. Query coverage
++# ---------------------------------------------------------------------------
++
++def test_reject_missing_query(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # Missing query 2
++    rows = [
++        {"id": 1, "relevant_docs": [583], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("missing" in err.lower() for err in report.errors)
++
++
++def test_reject_extra_query(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # Extra query 999
++    rows = [
++        {"id": 1, "relevant_docs": [], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++        {"id": 999, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("extra" in err.lower() or "unknown query" in err.lower() for err in report.errors)
++
++
++def test_reject_duplicate_query(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # Duplicate query 1
++    rows = [
++        {"id": 1, "relevant_docs": [], "relevant_chunks": []},
++        {"id": 1, "relevant_docs": [], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("duplicate" in err.lower() for err in report.errors)
++
++
++def test_expected_count_check(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {"id": 1, "relevant_docs": [], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    # expected 1200 but got 2
++    report = validate_predictions(rows, queries, store, expected_count=1200)
++    assert report.valid is False
++    assert any("expected" in err.lower() and "count" in err.lower() for err in report.errors)
++
++
++# ---------------------------------------------------------------------------
++# 3. Foreign doc IDs
++# ---------------------------------------------------------------------------
++
++def test_reject_foreign_doc_id(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # Doc 999999 not in store
++    rows = [
++        {"id": 1, "relevant_docs": [999999], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("foreign" in err.lower() or "registry" in err.lower() or "not in snapshot" in err.lower() for err in report.errors)
++
++
++def test_reject_foreign_chunk_doc_id(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {"id": 1, "relevant_docs": [], "relevant_chunks": [{"doc_id": 999999, "chunk_text": "text"}]},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("foreign" in err.lower() or "registry" in err.lower() or "not in snapshot" in err.lower() for err in report.errors)
++
++
++# ---------------------------------------------------------------------------
++# 4. Duplicates in relevant_docs and relevant_chunks
++# ---------------------------------------------------------------------------
++
++def test_reject_duplicate_doc_ids_in_same_query(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {"id": 1, "relevant_docs": [583, 583], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("duplicate" in err.lower() and "doc" in err.lower() for err in report.errors)
++
++
++def test_reject_duplicate_chunk_in_same_query(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    text = "Bệnh sốt xuất huyết Dengue lây qua muỗi vằn."
++    rows = [
++        {
++            "id": 1,
++            "relevant_docs": [583],
++            "relevant_chunks": [
++                {"doc_id": 583, "chunk_text": text},
++                {"doc_id": 583, "chunk_text": text},
++            ],
++        },
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("duplicate" in err.lower() and "chunk" in err.lower() for err in report.errors)
++
++
++# ---------------------------------------------------------------------------
++# 5. Missing lists and valid empty predictions
++# ---------------------------------------------------------------------------
++
++def test_missing_lists_rejected(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # missing relevant_docs
++    rows1 = [
++        {"id": 1, "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report1 = validate_predictions(rows1, queries, store)
++    assert report1.valid is False
++    assert any("relevant_docs" in err.lower() for err in report1.errors)
++
++    # missing relevant_chunks
++    rows2 = [
++        {"id": 1, "relevant_docs": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report2 = validate_predictions(rows2, queries, store)
++    assert report2.valid is False
++    assert any("relevant_chunks" in err.lower() for err in report2.errors)
++
++    # relevant_docs is not a list (e.g. set)
++    rows3 = [
++        {"id": 1, "relevant_docs": {583}, "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report3 = validate_predictions(rows3, queries, store)
++    assert report3.valid is False
++
++
++def test_valid_empty_predictions_pass(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {"id": 1, "relevant_docs": [], "relevant_chunks": []},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is True
++    assert report.document_count == 0
++    assert report.chunk_count == 0
++
++
++# ---------------------------------------------------------------------------
++# 6. Chunk exact source span and provenance
++# ---------------------------------------------------------------------------
++
++def test_reject_modified_chunk_text(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # chunk text modified from original doc
++    rows = [
++        {
++            "id": 1,
++            "relevant_docs": [583],
++            "relevant_chunks": [{"doc_id": 583, "chunk_text": "Đây là text bị bịa đặt không có trong tài liệu"}],
++        },
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("substring" in err.lower() or "provenance" in err.lower() or "not found in source" in err.lower() for err in report.errors)
++
++
++def test_chunk_with_official_doc_not_in_relevant_docs_accepted(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    # Chunk from doc 4294967297, but relevant_docs only contains [583]
++    rows = [
++        {
++            "id": 1,
++            "relevant_docs": [583],
++            "relevant_chunks": [{"doc_id": 4294967297, "chunk_text": "Triệu chứng gồm sốt cao, đau cơ và phát ban."}],
++        },
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is True
++    assert report.chunk_count == 1
++
++
++# ---------------------------------------------------------------------------
++# 7. chunk_order validation
++# ---------------------------------------------------------------------------
++
++def test_valid_chunk_order(store_and_queries):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {
++            "id": 1,
++            "relevant_docs": [583],
++            "relevant_chunks": [{"doc_id": 583, "chunk_text": "Bệnh sốt xuất huyết Dengue lây qua muỗi vằn.", "chunk_order": 0}],
++        },
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is True
++
++
++@pytest.mark.parametrize("bad_order", [-1, True, False, 1.5, "0"])
++def test_reject_invalid_chunk_order(store_and_queries, bad_order):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {
++            "id": 1,
++            "relevant_docs": [583],
++            "relevant_chunks": [{"doc_id": 583, "chunk_text": "Bệnh sốt xuất huyết Dengue lây qua muỗi vằn.", "chunk_order": bad_order}],
++        },
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    report = validate_predictions(rows, queries, store)
++    assert report.valid is False
++    assert any("chunk_order" in err.lower() for err in report.errors)
++
++
++# ---------------------------------------------------------------------------
++# 8. ZIP validation rules
++# ---------------------------------------------------------------------------
++
++def test_validate_zip_valid(tmp_path: Path, store_and_queries):
++    store, queries, _, _ = store_and_queries
++    rows = [
++        {"id": 1, "relevant_docs": [583], "relevant_chunks": [{"doc_id": 583, "chunk_text": "Bệnh sốt xuất huyết Dengue lây qua muỗi vằn."}]},
++        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
++    ]
++    zip_path = tmp_path / "submission.zip"
++    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
++        zf.writestr("results.json", json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
++
++    report = validate_zip(zip_path, queries, store)
++    assert report.valid is True
++    assert report.query_count == 2
++    assert report.snapshot_id == store.snapshot_id
++
++
++def test_reject_zip_with_extra_files(tmp_path: Path, store_and_queries):
++    store, queries, _, _ = store_and_queries
++    zip_path = tmp_path / "submission.zip"
++    with zipfile.ZipFile(zip_path, "w") as zf:
++        zf.writestr("results.json", json.dumps([{"id": 1, "relevant_docs": [], "relevant_chunks": []}, {"id": 2, "relevant_docs": [], "relevant_chunks": []}]))
++        zf.writestr("extra.txt", "bonus file")
++
++    report = validate_zip(zip_path, queries, store)
++    assert report.valid is False
++    assert any("exactly one" in err.lower() or "extra" in err.lower() for err in report.errors)
++
++
++def test_reject_zip_with_subdirectories(tmp_path: Path, store_and_queries):
++    store, queries, _, _ = store_and_queries
++    zip_path = tmp_path / "submission.zip"
++    with zipfile.ZipFile(zip_path, "w") as zf:
++        zf.writestr("sub/results.json", json.dumps([{"id": 1, "relevant_docs": [], "relevant_chunks": []}, {"id": 2, "relevant_docs": [], "relevant_chunks": []}]))
++
++    report = validate_zip(zip_path, queries, store)
++    assert report.valid is False
++    assert any("directory" in err.lower() or "results.json" in err.lower() for err in report.errors)
++
++
++def test_reject_zip_with_wrong_filename(tmp_path: Path, store_and_queries):
++    store, queries, _, _ = store_and_queries
++    zip_path = tmp_path / "submission.zip"
++    with zipfile.ZipFile(zip_path, "w") as zf:
++        zf.writestr("submission.json", "[]")
++
++    report = validate_zip(zip_path, queries, store)
++    assert report.valid is False
++    assert any("results.json" in err.lower() for err in report.errors)
++
++
++def test_reject_corrupt_or_non_zip(tmp_path: Path, store_and_queries):
++    store, queries, _, _ = store_and_queries
++    bad_file = tmp_path / "corrupt.zip"
++    bad_file.write_bytes(b"not a real zip file header")
++
++    report = validate_zip(bad_file, queries, store)
++    assert report.valid is False
++    assert any("zip" in err.lower() for err in report.errors)
++
++
++def test_reject_encrypted_zip(tmp_path: Path, store_and_queries):
++    store, queries, _, _ = store_and_queries
++    zip_path = tmp_path / "encrypted.zip"
++    with zipfile.ZipFile(zip_path, "w") as zf:
++        zf.writestr("results.json", b"[]")
++
++    # Flip bit 0 of general purpose flag in Central Directory header (PK\x01\x02)
++    data = bytearray(zip_path.read_bytes())
++    cd_idx = data.find(b"PK\x01\x02")
++    assert cd_idx != -1
++    data[cd_idx + 8] = 1
++    zip_path.write_bytes(data)
++
++    report = validate_zip(zip_path, queries, store)
++    assert report.valid is False
++    assert any("encrypt" in err.lower() for err in report.errors)
++
++
++
++
++# ---------------------------------------------------------------------------
++# 9. VibiomirExporter and Determinism
++# ---------------------------------------------------------------------------
++
++def test_vibiomir_exporter_end_to_end_and_determinism(tmp_path: Path, store_and_queries):
++    store, queries, chunk1, chunk2 = store_and_queries
++    predictions = [
++        FinalPrediction(
++            query_id="2",
++            document_ids=["4294967297"],
++            chunk_ids=[chunk2.chunk_id],
++            document_scores={"4294967297": 0.8},
++            chunk_scores={chunk2.chunk_id: 0.8},
++        ),
++        FinalPrediction(
++            query_id="1",
++            document_ids=["583", "4294967297"],
++            chunk_ids=[chunk1.chunk_id],
++            document_scores={"583": 0.95, "4294967297": 0.5},
++            chunk_scores={chunk1.chunk_id: 0.95},
++        ),
++    ]
++
++    out_dir_1 = tmp_path / "export_1"
++    out_dir_2 = tmp_path / "export_2"
++
++    exporter = VibiomirExporter()
++    res1 = exporter.export(predictions, queries, store, out_dir_1)
++    res2 = exporter.export(predictions, queries, store, out_dir_2)
++
++    assert isinstance(res1, ExportResult)
++    assert res1.json_path.exists()
++    assert res1.zip_path.exists()
++    assert res1.validation_report_path.exists()
++
++    # Exact deterministic checksums between runs
++    assert res1.json_sha256 == res2.json_sha256
++    assert res1.zip_sha256 == res2.zip_sha256
++
++    # Verify JSON content & formatting
++    json_bytes = res1.json_path.read_bytes()
++    assert json_bytes.endswith(b"\n")
++    data = json.loads(json_bytes.decode("utf-8"))
++
++    # Sorted by query ID ascending: query 1 before query 2
++    assert [row["id"] for row in data] == [1, 2]
++    assert data[0]["relevant_docs"] == [583, 4294967297]
++    assert len(data[0]["relevant_chunks"]) == 1
++    assert data[0]["relevant_chunks"][0]["doc_id"] == 583
++    assert data[0]["relevant_chunks"][0]["chunk_text"] == chunk1.text
++    assert data[0]["relevant_chunks"][0]["chunk_order"] == 0
++
++    # Verify ZIP structure
++    with zipfile.ZipFile(res1.zip_path, "r") as zf:
++        infolist = zf.infolist()
++        assert len(infolist) == 1
++        assert infolist[0].filename == "results.json"
++        assert zf.read("results.json") == json_bytes
++
++    # Validate output ZIP with validate_zip
++    report = validate_zip(res1.zip_path, queries, store)
++    assert report.valid is True
++
++
++def test_exporter_rejects_orphan_chunk_id(tmp_path: Path, store_and_queries):
++    store, queries, _, _ = store_and_queries
++    predictions = [
++        FinalPrediction(
++            query_id="1",
++            document_ids=["583"],
++            chunk_ids=["non_existing_chunk_id_xyz"],
++            document_scores={"583": 0.9},
++            chunk_scores={"non_existing_chunk_id_xyz": 0.9},
++        ),
++        FinalPrediction(
++            query_id="2",
++            document_ids=[],
++            chunk_ids=[],
++            document_scores={},
++            chunk_scores={},
++        ),
++    ]
++    exporter = VibiomirExporter()
++    with pytest.raises(SubmissionValidationError) as exc_info:
++        exporter.export(predictions, queries, store, tmp_path / "export_fail")
++    assert any("orphan" in err.lower() or "not found" in err.lower() for err in exc_info.value.report.errors)
++
++
++def test_exporter_rejects_tampered_chunk_provenance(tmp_path: Path, store_and_queries):
++    store, queries, chunk1, _ = store_and_queries
++    # Corrupt chunk text in store to simulate provenance mismatch with doc
++    bad_chunk = SpanChunk(
++        chunk_id=chunk1.chunk_id,
++        doc_id=chunk1.doc_id,
++        source_version=chunk1.source_version,
++        source_sha256="mismatched_sha256",
++        start_char=chunk1.start_char,
++        end_char=chunk1.end_char,
++        chunk_index=chunk1.chunk_index,
++        language=chunk1.language,
++        section=chunk1.section,
++        text="Văn bản đã bị sửa đổi trái phép",
++        index_text=chunk1.index_text,
++        dense_token_count=10,
++        reranker_token_count=10,
++    )
++    store.chunks[chunk1.chunk_id] = bad_chunk
++
++    predictions = [
++        FinalPrediction(
++            query_id="1",
++            document_ids=["583"],
++            chunk_ids=[chunk1.chunk_id],
++            document_scores={"583": 0.9},
++            chunk_scores={chunk1.chunk_id: 0.9},
++        ),
++        FinalPrediction(query_id="2", document_ids=[], chunk_ids=[], document_scores={}, chunk_scores={}),
++    ]
++    exporter = VibiomirExporter()
++    with pytest.raises(SubmissionValidationError) as exc_info:
++        exporter.export(predictions, queries, store, tmp_path / "export_fail2")
++    assert exc_info.value.report.valid is False
++    assert any("provenance" in err.lower() or "mismatch" in err.lower() or "source" in err.lower() for err in exc_info.value.report.errors)

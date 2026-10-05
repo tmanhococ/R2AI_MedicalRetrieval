@@ -24,15 +24,22 @@ def resolve_index_dirs(
     config: dict[str, Any],
     index_dir: Path | str | None = None,
 ) -> tuple[Path, Path]:
-    """Resolve BM25 and Dense index directories from explicit path or configuration."""
+    """Resolve BM25/Sparse and Dense index directories from explicit path or configuration."""
     if index_dir is not None:
         base = Path(index_dir)
     else:
         out_cfg = config.get("run", {}).get("output_dir", "artifacts")
         base = Path(out_cfg) / "indexes"
 
-    bm25_candidate = base / "bm25"
-    bm25_dir = bm25_candidate if bm25_candidate.exists() else base
+    candidates = [base / "sparse", base / "lucene", base / "bm25", base]
+    bm25_dir = base
+    for cand in candidates:
+        if cand.exists() and (cand / "manifest.json").exists():
+            bm25_dir = cand
+            break
+        elif cand.exists() and cand != base:
+            bm25_dir = cand
+            break
 
     dense_candidate = base / "dense"
     dense_dir = dense_candidate if dense_candidate.exists() else base
@@ -81,22 +88,29 @@ def build_retrievers(
     bm25_dir: Path,
     dense_dir: Path,
     encoder: Any = None,
-) -> tuple[BM25Retriever | None, DenseRetriever | None]:
-    """Instantiate BM25 and Dense retrievers based on config and manifest locations."""
+) -> tuple[Any | None, DenseRetriever | None]:
+    """Instantiate BM25/Sparse and Dense retrievers based on config and manifest locations."""
     retrieval_cfg = config.get("retrieval", {})
-    bm25_cfg = retrieval_cfg.get("bm25", {})
+    sparse_cfg = retrieval_cfg.get("sparse") or retrieval_cfg.get("bm25", {})
     dense_cfg = retrieval_cfg.get("dense", {})
 
-    bm25_retriever: BM25Retriever | None = None
-    if bm25_cfg.get("enabled", True) and bm25_dir.exists():
-        try:
-            bm25_retriever = BM25Retriever(
-                index_dir=bm25_dir,
-                backend=bm25_cfg.get("backend"),
-                tokenizers_config=bm25_cfg.get("tokenizers"),
-            )
-        except Exception as exc:
-            logger.warning("Failed to initialize BM25Retriever: %s", exc)
+    sparse_retriever: Any | None = None
+    if sparse_cfg.get("enabled", True) and bm25_dir.exists():
+        backend_name = str(sparse_cfg.get("backend", "bm25s")).lower()
+        if backend_name == "lucene":
+            from src.indexing.lucene import LuceneSparseBackend
+            k1 = float(sparse_cfg.get("k1", 1.2))
+            b = float(sparse_cfg.get("b", 0.75))
+            sparse_retriever = LuceneSparseBackend(index_dir=bm25_dir, k1=k1, b=b)
+        else:
+            try:
+                sparse_retriever = BM25Retriever(
+                    index_dir=bm25_dir,
+                    backend=sparse_cfg.get("backend"),
+                    tokenizers_config=sparse_cfg.get("tokenizers"),
+                )
+            except Exception as exc:
+                logger.warning("Failed to initialize BM25Retriever: %s", exc)
 
     dense_retriever: DenseRetriever | None = None
     if dense_cfg.get("enabled", True) and dense_dir.exists():
@@ -113,7 +127,7 @@ def build_retrievers(
         except Exception as exc:
             logger.warning("Failed to initialize DenseRetriever: %s", exc)
 
-    return bm25_retriever, dense_retriever
+    return sparse_retriever, dense_retriever
 
 
 def build_query_components(

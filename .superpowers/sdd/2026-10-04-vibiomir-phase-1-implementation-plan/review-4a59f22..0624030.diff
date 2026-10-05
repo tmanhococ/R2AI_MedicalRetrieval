@@ -1,0 +1,2904 @@
+# Review package: 4a59f22..0624030
+
+## Commits
+0624030 feat: wire Phase 1 ingestion prediction and submission workflow (Task 9)
+
+## Files changed
+ src/cli/build_snapshot.py                 | 164 ++++++++++
+ src/cli/crawl.py                          | 184 ++++++++---
+ src/cli/evaluate.py                       | 210 +++++++++---
+ src/cli/extract.py                        | 204 ++++++++++++
+ src/cli/index.py                          |   1 +
+ src/cli/ingest_vibiomir.py                | 134 ++++----
+ src/cli/predict.py                        | 523 ++++++++++++++++++++++++------
+ src/cli/validate_submission.py            | 140 ++++++++
+ src/utils/checkpoint.py                   | 211 ++++++++++++
+ src/utils/config.py                       | 130 +++++++-
+ tests/integration/test_vibiomir_phase1.py | 467 ++++++++++++++++++++++++++
+ 11 files changed, 2108 insertions(+), 260 deletions(-)
+
+## Diff
+diff --git a/src/cli/build_snapshot.py b/src/cli/build_snapshot.py
+new file mode 100644
+index 0000000..ca9995d
+--- /dev/null
++++ b/src/cli/build_snapshot.py
+@@ -0,0 +1,164 @@
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++import sys
++import time
++from typing import Any
++
++from src.data.vibiomir_contracts import (
++    ChunkConfig,
++    ExtractionConfig,
++    SnapshotConfig,
++    SnapshotManifest,
++)
++from src.data.vibiomir_registry import SourceRegistry
++from src.ingestion.snapshot import build_snapshot
++from src.utils.config import load_config
++
++
++def run_build_snapshot(
++    registry_path: Path | str,
++    snapshot_root: Path | str,
++    name: str,
++    raw_root: Path | str | None = None,
++    queries_path: Path | str | None = None,
++    extraction_config: ExtractionConfig | None = None,
++    chunk_config: ChunkConfig | None = None,
++    parquet_row_group_size: int = 5000,
++    target_shard_bytes: int = 67108864,
++) -> SnapshotManifest:
++    """Freezes official sources and paragraph/token chunk spans into an immutable snapshot."""
++    reg_path = Path(registry_path)
++    snap_root = Path(snapshot_root)
++
++    if not reg_path.exists():
++        raise FileNotFoundError(f"Registry DB not found: {reg_path}")
++
++    chk_cfg = chunk_config or ChunkConfig()
++    snap_cfg = SnapshotConfig(
++        snapshot_root=snap_root,
++        name=name,
++        parquet_row_group_size=parquet_row_group_size,
++        target_shard_bytes=target_shard_bytes,
++        chunk_config=chk_cfg,
++    )
++
++    with SourceRegistry(reg_path) as registry:
++        manifest = build_snapshot(
++            registry=registry,
++            config=snap_cfg,
++            raw_root=Path(raw_root) if raw_root else None,
++            extraction_config=extraction_config,
++            chunk_config=chk_cfg,
++            queries_path=Path(queries_path) if queries_path else None,
++        )
++
++    return manifest
++
++
++def main(args: list[str] | None = None) -> None:
++    parser = argparse.ArgumentParser(
++        description="Freeze crawled sources into an immutable snapshot"
++    )
++    parser.add_argument(
++        "-c",
++        "--config",
++        type=Path,
++        default=None,
++        help="Path to YAML configuration file",
++    )
++    parser.add_argument(
++        "--name",
++        type=str,
++        required=True,
++        help="Unique snapshot name (e.g. phase1_A)",
++    )
++    parser.add_argument(
++        "--registry-path",
++        type=Path,
++        default=None,
++        help="Path to SQLite registry database",
++    )
++    parser.add_argument(
++        "--snapshot-root",
++        type=Path,
++        default=None,
++        help="Root directory where frozen snapshots are stored",
++    )
++    parser.add_argument(
++        "--raw-root",
++        type=Path,
++        default=None,
++        help="Path to raw payload storage directory",
++    )
++
++    parsed = parser.parse_args(args)
++
++    cfg: dict[str, Any] = {}
++    config_file = parsed.config
++    if config_file is None and Path("configs/vibiomir_phase1.yaml").exists():
++        config_file = Path("configs/vibiomir_phase1.yaml")
++
++    if config_file is not None and Path(config_file).exists():
++        cfg = load_config(config_file)
++
++    ds_cfg = cfg.get("dataset", {})
++    idx_cfg = cfg.get("indexing", {})
++    cr_cfg = cfg.get("crawl", {})
++    ex_cfg = cfg.get("extraction", {})
++
++    reg_p = parsed.registry_path or Path(ds_cfg.get("registry_path", "artifacts/vibiomir/registry.sqlite"))
++    snap_r = parsed.snapshot_root or Path(idx_cfg.get("snapshot_root", "artifacts/vibiomir/snapshots"))
++    raw_p = parsed.raw_root or Path(cr_cfg.get("raw_root", "artifacts/vibiomir/raw"))
++    queries_p = Path(ds_cfg.get("query_path", "data/official/query.parquet"))
++
++    auto_strat = idx_cfg.get("chunking", {}).get("auto_strategy", {})
++    chunk_cfg = ChunkConfig(
++        mode=idx_cfg.get("chunking", {}).get("mode", "auto"),
++        strategy_type=auto_strat.get("type", "paragraph_token_spans"),
++        body_max_tokens=auto_strat.get("body_max_tokens", 320),
++        long_block_overlap_tokens=auto_strat.get("long_block_overlap_tokens", 64),
++        contextual_header_max_tokens=auto_strat.get("contextual_header_max_tokens", 32),
++        drop_short_blocks=auto_strat.get("drop_short_blocks", False),
++    )
++
++    extraction_config = ExtractionConfig(
++        html_backend=ex_cfg.get("html_backend", "trafilatura"),
++        pdf_backend=ex_cfg.get("pdf_backend", "pymupdf"),
++        language_model_path=Path(ex_cfg.get("language_model_path", "artifacts/models/lid.176.ftz")),
++        language_confidence_min=ex_cfg.get("language_confidence_min", 0.70),
++        accepted_languages=tuple(ex_cfg.get("accepted_languages", ["vi", "en", "zh"])),
++        quarantine_unknown_language=ex_cfg.get("quarantine_unknown_language", True),
++    )
++
++    print("=== ViBioMIR Build Snapshot ===")
++    print(f"Snapshot Name:  {parsed.name}")
++    print(f"Registry DB:    {reg_p}")
++    print(f"Snapshot Root:  {snap_r}")
++
++    t0 = time.time()
++    manifest = run_build_snapshot(
++        registry_path=reg_p,
++        snapshot_root=snap_r,
++        name=parsed.name,
++        raw_root=raw_p,
++        queries_path=queries_p,
++        extraction_config=extraction_config,
++        chunk_config=chunk_cfg,
++        parquet_row_group_size=idx_cfg.get("parquet_row_group_size", 5000),
++        target_shard_bytes=idx_cfg.get("target_shard_bytes", 67108864),
++    )
++    elapsed = time.time() - t0
++
++    print("\n=== Snapshot Built Successfully ===")
++    print(f"Snapshot ID:     {manifest.snapshot_id}")
++    print(f"Ready Documents: {manifest.ready_document_count:,}")
++    print(f"Total Chunks:    {manifest.chunk_count:,}")
++    print(f"Total Shards:    {len(manifest.shards)}")
++    print(f"Membership SHA:  {manifest.source_membership_sha256}")
++    print(f"Elapsed Time:    {elapsed:.2f}s")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/cli/crawl.py b/src/cli/crawl.py
+index b2fc4b7..c2e2cc1 100644
+--- a/src/cli/crawl.py
++++ b/src/cli/crawl.py
+@@ -1,107 +1,197 @@
++from __future__ import annotations
++
+ import argparse
+ import asyncio
++from dataclasses import asdict
++from datetime import datetime, timezone
++import json
+ from pathlib import Path
+ import sys
+ import time
++from typing import Any
+ 
+-from src.data.vibiomir_contracts import CrawlConfig
++from src.data.vibiomir_contracts import CrawlConfig, CrawlReport
+ from src.data.vibiomir_registry import SourceRegistry
+ from src.ingestion.crawl_runner import run_crawl
++from src.utils.config import load_config
++
++
++def run_crawl_cli(
++    registry_path: Path | str,
++    raw_root: Path | str,
++    limit: int | None = 100,
++    concurrency: int = 16,
++    per_domain_concurrency: int = 2,
++    min_domain_interval_seconds: float = 1.0,
++    respect_robots: bool = True,
++    max_redirects: int = 5,
++    max_html_bytes: int = 10485760,
++    max_pdf_bytes: int = 31457280,
++    output_coverage_file: Path | str | None = None,
++) -> CrawlReport:
++    """Run ViBioMIR resumable crawler and write coverage report."""
++    reg_path = Path(registry_path)
++    raw_path = Path(raw_root)
++
++    if not reg_path.exists():
++        raise FileNotFoundError(f"Registry DB not found: {reg_path}")
++
++    config = CrawlConfig(
++        concurrency=concurrency,
++        per_domain_concurrency=per_domain_concurrency,
++        min_domain_interval_seconds=min_domain_interval_seconds,
++        respect_robots=respect_robots,
++        max_redirects=max_redirects,
++        max_html_bytes=max_html_bytes,
++        max_pdf_bytes=max_pdf_bytes,
++        raw_root=raw_path,
++    )
++
++    with SourceRegistry(reg_path) as registry:
++        report = asyncio.run(run_crawl(registry, config, limit=limit))
+ 
++        # Write coverage.json
++        state_counts: dict[str, int] = {}
++        for row in registry.conn.execute("SELECT state, count(*) FROM fetch_jobs GROUP BY state"):
++            state_counts[row[0]] = row[1]
+ 
+-def main() -> None:
++        coverage_data = {
++            "timestamp": datetime.now(timezone.utc).isoformat(),
++            "registry_sources": registry.count_sources(),
++            "unique_urls": registry.count_unique_urls(),
++            "state_counts": state_counts,
++            "crawl_run_report": asdict(report),
++        }
++
++        cov_file = Path(output_coverage_file) if output_coverage_file else raw_path / "coverage.json"
++        cov_file.parent.mkdir(parents=True, exist_ok=True)
++        with open(cov_file, "w", encoding="utf-8") as f:
++            json.dump(coverage_data, f, indent=2, ensure_ascii=False)
++
++    return report
++
++
++def main(args: list[str] | None = None) -> None:
+     parser = argparse.ArgumentParser(
+         description="Run ViBioMIR resumable web/PDF crawler"
+     )
++    parser.add_argument(
++        "-c",
++        "--config",
++        type=Path,
++        default=None,
++        help="Path to YAML configuration file",
++    )
+     parser.add_argument(
+         "--registry-path",
+         type=Path,
+-        default=Path("artifacts/vibiomir/registry.sqlite"),
++        default=None,
+         help="Path to SQLite registry database",
+     )
+     parser.add_argument(
+         "--raw-root",
+         type=Path,
+-        default=Path("artifacts/vibiomir/raw"),
++        default=None,
+         help="Directory to store compressed raw payloads",
+     )
++    parser.add_argument(
++        "--pilot-size",
++        type=int,
++        default=None,
++        help="Pilot sample size (overrides limit)",
++    )
+     parser.add_argument(
+         "--limit",
+         type=int,
+-        default=100,
+-        help="Maximum number of URLs to crawl in this run (default: 100 for pilot, set -1 for all)",
++        default=None,
++        help="Maximum number of URLs to crawl in this run",
++    )
++    parser.add_argument(
++        "--resume",
++        action="store_true",
++        help="Resume crawler from current registry state",
+     )
+     parser.add_argument(
+         "--concurrency",
+         type=int,
+-        default=16,
+-        help="Global concurrent workers (default: 16)",
++        default=None,
++        help="Global concurrent workers",
+     )
+     parser.add_argument(
+         "--per-domain-concurrency",
+         type=int,
+-        default=2,
+-        help="Max concurrency per domain (default: 2)",
++        default=None,
++        help="Max concurrency per domain",
+     )
+     parser.add_argument(
+         "--min-domain-interval",
+         type=float,
+-        default=1.0,
+-        help="Minimum delay in seconds between requests to same domain (default: 1.0)",
++        default=None,
++        help="Minimum delay in seconds between requests to same domain",
+     )
+     parser.add_argument(
+-        "--ignore-robots",
+-        action="store_true",
+-        help="Ignore robots.txt (not recommended)",
++        "--seed",
++        type=int,
++        default=None,
++        help="Random seed for pilot sampling",
+     )
+ 
+-    args = parser.parse_args()
++    parsed = parser.parse_args(args)
+ 
+-    limit = None if args.limit <= 0 else args.limit
++    cfg: dict[str, Any] = {}
++    config_file = parsed.config
++    if config_file is None and Path("configs/vibiomir_phase1.yaml").exists():
++        config_file = Path("configs/vibiomir_phase1.yaml")
+ 
+-    print("=== ViBioMIR Crawler Runner ===")
+-    print(f"Registry DB:     {args.registry_path}")
+-    print(f"Raw storage:     {args.raw_root}")
+-    print(f"Job limit:       {limit if limit is not None else 'ALL (unlimited)'}")
+-    print(f"Concurrency:     {args.concurrency} (per-domain: {args.per_domain_concurrency})")
+-    print(f"Min interval:    {args.min_domain_interval}s")
+-    print(f"Respect robots:  {not args.ignore_robots}")
+-
+-    if not args.registry_path.exists():
+-        print(f"Error: Registry DB not found: {args.registry_path}", file=sys.stderr)
+-        print("Please run 'python -m src.cli.ingest_vibiomir' first.", file=sys.stderr)
+-        sys.exit(1)
++    if config_file is not None and Path(config_file).exists():
++        cfg = load_config(config_file)
+ 
+-    config = CrawlConfig(
+-        concurrency=args.concurrency,
+-        per_domain_concurrency=args.per_domain_concurrency,
+-        min_domain_interval_seconds=args.min_domain_interval,
+-        respect_robots=not args.ignore_robots,
+-        raw_root=args.raw_root,
+-    )
++    cr_cfg = cfg.get("crawl", {})
++    ds_cfg = cfg.get("dataset", {})
+ 
+-    t0 = time.time()
+-    with SourceRegistry(args.registry_path) as registry:
+-        if not registry.is_complete():
+-            print(
+-                "Warning: Registry ingest is not marked complete. Running on available sources...",
+-                file=sys.stderr,
+-            )
+-
+-        print("\nStarting crawl loop...")
+-        report = asyncio.run(run_crawl(registry, config, limit=limit))
++    reg_p = parsed.registry_path or Path(ds_cfg.get("registry_path", "artifacts/vibiomir/registry.sqlite"))
++    raw_p = parsed.raw_root or Path(cr_cfg.get("raw_root", "artifacts/vibiomir/raw"))
++
++    effective_limit = parsed.pilot_size if parsed.pilot_size is not None else parsed.limit
++    if effective_limit is None:
++        effective_limit = cr_cfg.get("limit", 100)
++    if effective_limit <= 0:
++        effective_limit = None
+ 
++    concurrency = parsed.concurrency or cr_cfg.get("concurrency", 16)
++    per_domain = parsed.per_domain_concurrency or cr_cfg.get("per_domain_concurrency", 2)
++    interval = parsed.min_domain_interval or cr_cfg.get("min_domain_interval_seconds", 1.0)
++    respect_robots = cr_cfg.get("respect_robots", True)
++
++    print("=== ViBioMIR Crawler Runner ===")
++    print(f"Registry DB:     {reg_p}")
++    print(f"Raw storage:     {raw_p}")
++    print(f"Job limit:       {effective_limit if effective_limit is not None else 'ALL (unlimited)'}")
++    print(f"Concurrency:     {concurrency} (per-domain: {per_domain})")
++    print(f"Min interval:    {interval}s")
++    print(f"Respect robots:  {respect_robots}")
++
++    t0 = time.time()
++    report = run_crawl_cli(
++        registry_path=reg_p,
++        raw_root=raw_p,
++        limit=effective_limit,
++        concurrency=concurrency,
++        per_domain_concurrency=per_domain,
++        min_domain_interval_seconds=interval,
++        respect_robots=respect_robots,
++    )
+     elapsed = time.time() - t0
++
+     print("\n=== Crawl Execution Summary ===")
+     print(f"Leased Jobs:      {report.leased}")
+     print(f"Successfully Fetched: {report.fetched}")
+     print(f"Retry Scheduled:  {report.retry_wait}")
+     print(f"Failed:           {report.failed}")
+     print(f"Blocked (Robots): {report.blocked}")
+-    print(f"Unsupported:      {report.unsupported}")
+     print(f"Bytes Written:    {report.bytes_written:,} bytes ({report.bytes_written / 1024 / 1024:.2f} MiB)")
+     print(f"Elapsed Time:     {elapsed:.1f}s")
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/src/cli/evaluate.py b/src/cli/evaluate.py
+index 988dfe9..1098b0b 100644
+--- a/src/cli/evaluate.py
++++ b/src/cli/evaluate.py
+@@ -1,87 +1,136 @@
+ from __future__ import annotations
+ 
+ import argparse
++import csv
++from dataclasses import asdict
+ import json
+ import logging
+ from pathlib import Path
+ from typing import Any
+ 
+ from src.cli.common import (
+     build_query_components,
+     build_reranker,
+     build_retrievers,
+     load_corpus_and_texts,
+     resolve_index_dirs,
+     run_pipeline_for_queries,
+ )
+ from src.data.dataset_adapter import JsonlDatasetAdapter
+-from src.data.schemas import FinalPrediction, ScoredHit
++from src.data.schemas import FinalPrediction, QueryRecord, ScoredHit
++from src.data.source_store import SnapshotSourceStore
++from src.data.vibiomir_adapter import ViBioMIRAdapter, load_official_queries
+ from src.evaluation.calibrator import CutoffCalibrator
++from src.evaluation.dev_records import FORBIDDEN_SPLITS, load_dev_records
+ from src.evaluation.error_analysis import generate_error_analysis_report
+ from src.evaluation.metrics import evaluate_predictions
++from src.evaluation.vibiomir_metrics import (
++    PROVISIONAL_SPEC_V1_PROFILE,
++    evaluate_dataset,
++)
+ from src.retrieval.orchestrator import RetrievalOrchestrator
+ from src.scoring.consistency import apply_structural_consistency
+ from src.scoring.joint_scoring import JointScorer
+ from src.utils.config import load_config
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def run_evaluate(
+     config: dict[str, Any],
+     split: str = "validation",
+-    dataset_dir: Path | str = "",
++    dataset_dir: Path | str | None = None,
++    snapshot_dir: Path | str | None = None,
++    dev_records_path: Path | str | None = None,
+     output_dir: Path | str | None = None,
+     index_dir: Path | str | None = None,
+     calibration_path: Path | str | None = None,
+     reranker: Any = None,
+     encoder: Any = None,
+     translator: Any = None,
+ ) -> dict[str, Any]:
+     """Execute end-to-end retrieval evaluation on a split with Macro F2 calculation and error analysis.
+ 
+-    Args:
+-        config: Configuration dictionary.
+-        split: Dataset split to evaluate (default: "validation").
+-        dataset_dir: Path to dataset directory.
+-        output_dir: Path where metrics.json and error analysis artifacts will be saved.
+-        index_dir: Path where BM25 and Dense indexes reside.
+-        calibration_path: Optional path to calibration.json.
+-        reranker: Optional pre-instantiated reranker override.
+-        encoder: Optional pre-instantiated dense encoder override.
+-        translator: Optional pre-instantiated translator override.
+-
+-    Returns:
+-        Dictionary containing overall and per-query evaluation metrics.
++    ANTI-LEAKAGE PRINCIPLE:
++    Rejects evaluation on test splits without ground truth labels.
+     """
+-    dataset_path = Path(dataset_dir)
+-    if not dataset_path.exists():
+-        raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
++    clean_split = split.lower().strip()
++    if clean_split in FORBIDDEN_SPLITS:
++        raise ValueError(
++            f"Cannot run evaluation on '{split}' split without ground truth labels. "
++            f"Test set does not contain ground truth labels; use src.cli.predict to generate predictions."
++        )
+ 
+     if output_dir is not None:
+         out_dir = Path(output_dir)
+     else:
+         out_dir = Path(config.get("run", {}).get("output_dir", "artifacts"))
+     out_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    # 1. Load queries and ground truth for split
+-    adapter = JsonlDatasetAdapter(dataset_path)
+-    queries = adapter.load_queries(split)
+-    ground_truths = adapter.load_ground_truth(split)
++    queries: list[QueryRecord] = []
++    ground_truths: Any = None
++    dev_records: Any = None
++    doc_texts: dict[str, str] = {}
++    chunk_texts: dict[str, str] = {}
++    chunk_to_doc: dict[str, str] = {}
+ 
+-    # Load corpus text lookups
+-    documents, chunks, doc_texts, chunk_texts, chunk_to_doc = load_corpus_and_texts(
+-        dataset_dir=dataset_path,
+-        index_dir=index_dir,
+-        config=config,
+-    )
++    if snapshot_dir is not None:
++        snap_path = Path(snapshot_dir)
++        if not snap_path.exists():
++            raise FileNotFoundError(f"Snapshot directory not found: {snap_path}")
++
++        store = SnapshotSourceStore(snap_path)
++        adapter = ViBioMIRAdapter(snap_path)
++
++        # Official queries namespace check
++        query_path_str = config.get("dataset", {}).get("query_path", "data/official/query.parquet")
++        official_queries = load_official_queries(Path(query_path_str), expected_count=None)
++        official_query_ids = {q.query_id for q in official_queries}
++
++        # Dev records loading
++        dev_path_str = dev_records_path or config.get("dataset", {}).get("dev_records_path", "data/dev/dev_qrels.jsonl")
++        dev_file = Path(dev_path_str)
++        if not dev_file.exists() and dataset_dir:
++            cand = Path(dataset_dir) / "dev_qrels.jsonl"
++            if cand.exists():
++                dev_file = cand
++
++        dev_records = load_dev_records(dev_file, official_query_ids=official_query_ids, store=store)
++        queries = [
++            QueryRecord(
++                query_id=str(r.query_id),
++                text_vi=r.metadata.query_text if r.metadata else str(r.query_id),
++            )
++            for r in dev_records
++        ]
++
++        doc_texts = {str(d.doc_id): f"{d.title} {d.text}".strip() if d.title else d.text for d in adapter.iter_documents()}
++        chunk_texts = {c.chunk_id: c.text for c in adapter.iter_chunks()}
++        chunk_to_doc = {c.chunk_id: str(c.doc_id) for c in adapter.iter_chunks()}
++
++    else:
++        if dataset_dir is None:
++            raise ValueError("Either dataset_dir or snapshot_dir must be provided")
++        dataset_path = Path(dataset_dir)
++        if not dataset_path.exists():
++            raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
++
++        adapter_legacy = JsonlDatasetAdapter(dataset_path)
++        queries = adapter_legacy.load_queries(split)
++        ground_truths = adapter_legacy.load_ground_truth(split)
++
++        documents, chunks, doc_texts, chunk_texts, chunk_to_doc = load_corpus_and_texts(
++            dataset_dir=dataset_path,
++            index_dir=index_dir,
++            config=config,
++        )
+ 
+     # 2. Setup pipeline components
+     bm25_dir, dense_dir = resolve_index_dirs(config, index_dir)
+     bm25_retriever, dense_retriever = build_retrievers(
+         config=config,
+         bm25_dir=bm25_dir,
+         dense_dir=dense_dir,
+         encoder=encoder,
+     )
+ 
+@@ -128,31 +177,29 @@ def run_evaluate(
+         calibrator = CutoffCalibrator(beta=config.get("calibration", {}).get("beta", 2.0))
+ 
+     consistency_mode = config.get("post_processing", {}).get("consistency_mode", "independent")
+     calib_bounds = config.get("calibration", {}).get("bounds", {})
+     default_doc_top_k = int(calib_bounds.get("documents", {}).get("min", 10))
+     default_chunk_top_k = int(calib_bounds.get("chunks", {}).get("min", 20))
+ 
+     predictions: list[FinalPrediction] = []
+ 
+     for qid, (joint_docs, joint_chunks) in query_scores.items():
+-        # 8. Apply cutoff threshold/top-k
+         if calibrator is not None and calib_data is not None:
+             doc_state = calib_data.get("documents", calib_data)
+             chunk_state = calib_data.get("chunks", calib_data)
+             selected_docs = calibrator.filter_items(joint_docs, doc_state)
+             selected_chunks = calibrator.filter_items(joint_chunks, chunk_state)
+         else:
+             selected_docs = joint_docs[:default_doc_top_k]
+             selected_chunks = joint_chunks[:default_chunk_top_k]
+ 
+-        # 9. Apply structural consistency
+         final_docs, final_chunks = apply_structural_consistency(
+             selected_docs=selected_docs,
+             selected_chunks=selected_chunks,
+             chunk_to_doc=chunk_to_doc,
+             mode=consistency_mode,
+             available_docs=joint_docs,
+         )
+ 
+         predictions.append(
+             FinalPrediction(
+@@ -165,36 +212,90 @@ def run_evaluate(
+                     if isinstance(d, ScoredHit)
+                 },
+                 chunk_scores={
+                     c.item_id: float(c.normalized_score)
+                     for c in final_chunks
+                     if isinstance(c, ScoredHit)
+                 },
+             )
+         )
+ 
+-    # 10. Compute metrics via evaluate_predictions
+-    beta = float(config.get("calibration", {}).get("beta", 2.0))
+-    metrics = evaluate_predictions(
+-        predictions=predictions,
+-        ground_truth=ground_truths,
+-        beta=beta,
+-    )
++    # 10. Compute metrics
++    if snapshot_dir is not None and dev_records is not None:
++        sub_rows = []
++        for p in predictions:
++            row_chunks = []
++            for c_id in p.chunk_ids:
++                doc_id_val = int(chunk_to_doc.get(c_id, 0))
++                c_text = chunk_texts.get(c_id, "")
++                row_chunks.append({"doc_id": doc_id_val, "chunk_text": c_text})
++            sub_rows.append(
++                {
++                    "id": int(p.query_id),
++                    "relevant_docs": [int(d) for d in p.document_ids],
++                    "relevant_chunks": row_chunks,
++                }
++            )
+ 
+-    # 11. Generate error analysis report
+-    generate_error_analysis_report(
+-        predictions=predictions,
+-        ground_truths=ground_truths,
+-        output_dir=out_dir,
+-        queries=queries,
+-        beta=beta,
+-    )
++        summary = evaluate_dataset(
++            predictions=sub_rows,
++            gold=dev_records,
++            query_ids=[r.query_id for r in dev_records],
++            profile=PROVISIONAL_SPEC_V1_PROFILE,
++        )
++
++        metrics = {
++            "documents": {
++                "macro_precision": summary.macro_documents.precision,
++                "macro_recall": summary.macro_documents.recall,
++                "macro_f2": summary.macro_documents.f2,
++            },
++            "chunks": {
++                "macro_precision": summary.macro_chunks.precision,
++                "macro_recall": summary.macro_chunks.recall,
++                "macro_f2": summary.macro_chunks.f2,
++            },
++            "inferred_final_mean": summary.inferred_final_mean,
++            "query_count": summary.query_count,
++            "profile_fingerprint": summary.profile_fingerprint,
++        }
++
++        # Write per_query_metrics.csv
++        per_query_csv = out_dir / "per_query_metrics.csv"
++        with open(per_query_csv, "w", newline="", encoding="utf-8") as csvfile:
++            writer = csv.writer(csvfile)
++            writer.writerow(["query_id", "doc_p", "doc_r", "doc_f2", "chunk_p", "chunk_r", "chunk_f2"])
++            for qm in summary.per_query:
++                writer.writerow([
++                    qm.query_id,
++                    round(qm.documents.precision, 4),
++                    round(qm.documents.recall, 4),
++                    round(qm.documents.f2, 4),
++                    round(qm.chunks.precision, 4),
++                    round(qm.chunks.recall, 4),
++                    round(qm.chunks.f2, 4),
++                ])
++
++    else:
++        beta = float(config.get("calibration", {}).get("beta", 2.0))
++        metrics = evaluate_predictions(
++            predictions=predictions,
++            ground_truth=ground_truths,
++            beta=beta,
++        )
++        generate_error_analysis_report(
++            predictions=predictions,
++            ground_truths=ground_truths,
++            output_dir=out_dir,
++            queries=queries,
++            beta=beta,
++        )
+ 
+     # 12. Save metrics.json
+     metrics_file = out_dir / "metrics.json"
+     with open(metrics_file, "w", encoding="utf-8") as f:
+         json.dump(metrics, f, indent=2, ensure_ascii=False)
+ 
+     logger.info(
+         "Evaluation completed: Doc Macro F2=%.4f, Chunk Macro F2=%.4f",
+         metrics["documents"]["macro_f2"],
+         metrics["chunks"]["macro_f2"],
+@@ -204,30 +305,40 @@ def run_evaluate(
+ 
+ 
+ def main(args: list[str] | None = None) -> None:
+     parser = argparse.ArgumentParser(
+         description="Multilingual Medical Retrieval Evaluation CLI."
+     )
+     parser.add_argument(
+         "-c",
+         "--config",
+         default="configs/r2ai_mvp.yaml",
+-        help="Path to YAML configuration file (default: configs/r2ai_mvp.yaml)",
++        help="Path to YAML configuration file",
+     )
+     parser.add_argument(
+         "-d",
+         "--dataset",
+-        required=True,
++        default=None,
+         help="Path to dataset directory",
+     )
+     parser.add_argument(
+         "-s",
++        "--snapshot",
++        default=None,
++        help="Path to frozen snapshot directory",
++    )
++    parser.add_argument(
++        "--dev-records-path",
++        default=None,
++        help="Path to dev_qrels.jsonl ground truth file",
++    )
++    parser.add_argument(
+         "--split",
+         default="validation",
+         help="Dataset split to evaluate (default: validation)",
+     )
+     parser.add_argument(
+         "-o",
+         "--output-dir",
+         default=None,
+         help="Output directory for metrics and error analysis artifacts",
+     )
+@@ -236,25 +347,30 @@ def main(args: list[str] | None = None) -> None:
+         default=None,
+         help="Directory containing pre-built BM25 and Dense indexes",
+     )
+     parser.add_argument(
+         "--calibration-path",
+         default=None,
+         help="Path to calibration.json artifact",
+     )
+ 
+     parsed = parser.parse_args(args)
++    if not parsed.dataset and not parsed.snapshot:
++        parser.error("At least one of --dataset or --snapshot must be specified")
++
+     cfg = load_config(parsed.config)
+     res = run_evaluate(
+         config=cfg,
+         split=parsed.split,
+         dataset_dir=parsed.dataset,
++        snapshot_dir=parsed.snapshot,
++        dev_records_path=parsed.dev_records_path,
+         output_dir=parsed.output_dir,
+         index_dir=parsed.index_dir,
+         calibration_path=parsed.calibration_path,
+     )
+     print("Evaluation completed successfully:")
+     print(f"  Documents Macro F2: {res['documents']['macro_f2']:.4f}")
+     print(f"  Chunks Macro F2:    {res['chunks']['macro_f2']:.4f}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/cli/extract.py b/src/cli/extract.py
+new file mode 100644
+index 0000000..e1f25c0
+--- /dev/null
++++ b/src/cli/extract.py
+@@ -0,0 +1,204 @@
++from __future__ import annotations
++
++import argparse
++from collections import Counter
++import gzip
++import hashlib
++from pathlib import Path
++import sys
++import time
++from typing import Any
++
++from src.data.vibiomir_contracts import ExtractionConfig, ExtractionReport
++from src.data.vibiomir_registry import SourceRegistry
++from src.ingestion.extractors import extract_document
++from src.ingestion.quality import (
++    FastTextLanguageDetector,
++    LanguageDetector,
++    classify_quality,
++)
++from src.ingestion.snapshot import FallbackLanguageDetector
++from src.utils.config import load_config
++
++
++def run_extract(
++    registry_path: Path | str,
++    raw_root: Path | str | None = None,
++    extraction_config: ExtractionConfig | None = None,
++    language_detector: LanguageDetector | None = None,
++    limit: int | None = None,
++) -> ExtractionReport:
++    """Offline extraction of raw HTML/PDF documents from the registry store."""
++    reg_path = Path(registry_path)
++    if not reg_path.exists():
++        raise FileNotFoundError(f"Registry DB not found: {reg_path}")
++
++    ext_cfg = extraction_config or ExtractionConfig()
++
++    if language_detector is None:
++        if ext_cfg.language_model_path.exists():
++            language_detector = FastTextLanguageDetector(ext_cfg.language_model_path)
++        else:
++            language_detector = FallbackLanguageDetector()
++
++    attempted = 0
++    ready = 0
++    quarantined = 0
++    failed = 0
++    flags_by_reason: Counter[str] = Counter()
++
++    with SourceRegistry(reg_path) as registry:
++        cursor = registry.conn.execute(
++            """
++            SELECT s.doc_id, f.state, f.raw_path, f.raw_sha256, f.mime_type
++            FROM sources s
++            JOIN fetch_jobs f ON s.fetch_job_id = f.job_id
++            WHERE f.state = 'fetched' AND f.raw_path IS NOT NULL
++            ORDER BY s.doc_id ASC
++            """
++        )
++
++        rows = cursor.fetchall()
++        if limit is not None and limit > 0:
++            rows = rows[:limit]
++
++        for doc_id, state, raw_path_str, raw_sha256, mime_type in rows:
++            attempted += 1
++            raw_path = Path(raw_path_str)
++            if not raw_path.exists() and raw_root is not None:
++                candidate = Path(raw_root) / raw_path_str
++                if candidate.exists():
++                    raw_path = candidate
++
++            if not raw_path.exists():
++                failed += 1
++                flags_by_reason["raw_file_missing"] += 1
++                continue
++
++            try:
++                if str(raw_path).endswith(".gz"):
++                    with gzip.open(raw_path, "rb") as gf:
++                        raw_bytes = gf.read()
++                else:
++                    raw_bytes = raw_path.read_bytes()
++
++                computed_raw_sha = hashlib.sha256(raw_bytes).hexdigest()
++                if computed_raw_sha != raw_sha256:
++                    failed += 1
++                    flags_by_reason["sha256_mismatch"] += 1
++                    continue
++
++                extracted_doc = extract_document(
++                    doc_id=doc_id,
++                    raw=raw_bytes,
++                    mime_type=mime_type or "text/html",
++                    raw_sha256=raw_sha256,
++                    config=ext_cfg,
++                )
++
++                quality = classify_quality(extracted_doc, language_detector, ext_cfg)
++                if quality.state == "ready":
++                    ready += 1
++                else:
++                    quarantined += 1
++                    for flg in quality.flags:
++                        flags_by_reason[flg] += 1
++
++            except Exception:
++                failed += 1
++                flags_by_reason["extraction_exception"] += 1
++
++    return ExtractionReport(
++        attempted=attempted,
++        ready=ready,
++        quarantined=quarantined,
++        failed=failed,
++        flags_by_reason=dict(flags_by_reason),
++    )
++
++
++def main(args: list[str] | None = None) -> None:
++    parser = argparse.ArgumentParser(
++        description="Offline document extraction from raw payloads"
++    )
++    parser.add_argument(
++        "-c",
++        "--config",
++        type=Path,
++        default=None,
++        help="Path to YAML configuration file",
++    )
++    parser.add_argument(
++        "--registry-path",
++        type=Path,
++        default=None,
++        help="Path to SQLite registry database",
++    )
++    parser.add_argument(
++        "--raw-root",
++        type=Path,
++        default=None,
++        help="Path to raw payload storage directory",
++    )
++    parser.add_argument(
++        "--resume",
++        action="store_true",
++        help="Resume offline extraction",
++    )
++    parser.add_argument(
++        "--limit",
++        type=int,
++        default=None,
++        help="Limit number of documents to extract",
++    )
++
++    parsed = parser.parse_args(args)
++
++    cfg: dict[str, Any] = {}
++    config_file = parsed.config
++    if config_file is None and Path("configs/vibiomir_phase1.yaml").exists():
++        config_file = Path("configs/vibiomir_phase1.yaml")
++
++    if config_file is not None and Path(config_file).exists():
++        cfg = load_config(config_file)
++
++    ds_cfg = cfg.get("dataset", {})
++    cr_cfg = cfg.get("crawl", {})
++    ex_cfg = cfg.get("extraction", {})
++
++    reg_p = parsed.registry_path or Path(ds_cfg.get("registry_path", "artifacts/vibiomir/registry.sqlite"))
++    raw_p = parsed.raw_root or Path(cr_cfg.get("raw_root", "artifacts/vibiomir/raw"))
++
++    extraction_config = ExtractionConfig(
++        html_backend=ex_cfg.get("html_backend", "trafilatura"),
++        pdf_backend=ex_cfg.get("pdf_backend", "pymupdf"),
++        language_model_path=Path(ex_cfg.get("language_model_path", "artifacts/models/lid.176.ftz")),
++        language_confidence_min=ex_cfg.get("language_confidence_min", 0.70),
++        accepted_languages=tuple(ex_cfg.get("accepted_languages", ["vi", "en", "zh"])),
++        quarantine_unknown_language=ex_cfg.get("quarantine_unknown_language", True),
++    )
++
++    print("=== ViBioMIR Offline Document Extraction ===")
++    print(f"Registry DB:     {reg_p}")
++    print(f"Raw storage:     {raw_p}")
++
++    t0 = time.time()
++    report = run_extract(
++        registry_path=reg_p,
++        raw_root=raw_p,
++        extraction_config=extraction_config,
++        limit=parsed.limit,
++    )
++    elapsed = time.time() - t0
++
++    print("\n=== Extraction Summary ===")
++    print(f"Attempted:    {report.attempted:,}")
++    print(f"Ready:        {report.ready:,}")
++    print(f"Quarantined:  {report.quarantined:,}")
++    print(f"Failed:       {report.failed:,}")
++    print(f"Flags:        {report.flags_by_reason}")
++    print(f"Elapsed Time: {elapsed:.2f}s")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/cli/index.py b/src/cli/index.py
+index 5c385a3..1cafe6b 100644
+--- a/src/cli/index.py
++++ b/src/cli/index.py
+@@ -1,20 +1,21 @@
+ from __future__ import annotations
+ 
+ import argparse
+ import json
+ import logging
+ from pathlib import Path
+ import sys
+ from typing import Any
+ 
+ from src.data.dataset_adapter import JsonlDatasetAdapter
++from src.data.schemas import ChunkRecord, DocumentRecord
+ from src.data.validators import validate_corpus
+ from src.data.vibiomir_adapter import ViBioMIRAdapter, validate_index_manifest
+ from src.indexing.bm25_index import BM25Indexer
+ from src.indexing.chunker import create_chunker
+ from src.indexing.dense_index import DenseIndexer
+ from src.utils.config import load_config
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+diff --git a/src/cli/ingest_vibiomir.py b/src/cli/ingest_vibiomir.py
+index 3cab81c..a749ad6 100644
+--- a/src/cli/ingest_vibiomir.py
++++ b/src/cli/ingest_vibiomir.py
+@@ -1,109 +1,133 @@
++from __future__ import annotations
++
+ import argparse
++from pathlib import Path
+ import sys
+ import time
+-from pathlib import Path
++from typing import Any
+ 
+ from src.data.vibiomir_adapter import iter_official_sources, load_official_queries
++from src.data.vibiomir_contracts import IngestReport
+ from src.data.vibiomir_registry import SourceRegistry, ingest_sources
++from src.utils.config import load_config
++
++
++def run_ingest(
++    corpus_path: Path | str,
++    query_path: Path | str,
++    registry_path: Path | str,
++    batch_size: int = 20000,
++    expected_query_count: int | None = 1200,
++) -> IngestReport:
++    """Ingest ViBioMIR official corpus and queries into SQLite registry."""
++    corpus_file = Path(corpus_path)
++    query_file = Path(query_path)
++    registry_file = Path(registry_path)
+ 
++    if not corpus_file.exists():
++        raise FileNotFoundError(f"Corpus file not found: {corpus_file}")
+ 
+-def main() -> None:
++    if not query_file.exists():
++        raise FileNotFoundError(f"Query file not found: {query_file}")
++
++    # 1. Validate and load queries
++    queries = load_official_queries(query_file, expected_count=expected_query_count)
++
++    # 2. Ingest corpus into registry
++    with SourceRegistry(registry_file) as registry:
++        source_iterator = iter_official_sources(corpus_file, batch_size=batch_size)
++        report = ingest_sources(
++            source_iterator,
++            registry,
++            input_sha256=source_iterator.input_sha256,
++            batch_size=batch_size,
++        )
++
++    return report
++
++
++def main(args: list[str] | None = None) -> None:
+     parser = argparse.ArgumentParser(
+         description="Ingest ViBioMIR official corpus and queries into SQLite registry"
+     )
++    parser.add_argument(
++        "-c",
++        "--config",
++        type=Path,
++        default=None,
++        help="Path to YAML configuration file",
++    )
+     parser.add_argument(
+         "--corpus-path",
+         type=Path,
+-        default=Path("data/official/links_corpus.parquet"),
++        default=None,
+         help="Path to links_corpus.parquet",
+     )
+     parser.add_argument(
+         "--query-path",
+         type=Path,
+-        default=Path("data/official/query.parquet"),
++        default=None,
+         help="Path to query.parquet",
+     )
+     parser.add_argument(
+         "--registry-path",
+         type=Path,
+-        default=Path("artifacts/vibiomir/registry.sqlite"),
++        default=None,
+         help="Path to target SQLite registry database",
+     )
+     parser.add_argument(
+         "--batch-size",
+         type=int,
+         default=20000,
+         help="Batch size for transactional commits (default: 20000)",
+     )
+     parser.add_argument(
+         "--expected-query-count",
+         type=int,
+-        default=1200,
++        default=None,
+         help="Expected query count (default: 1200)",
+     )
+ 
+-    args = parser.parse_args()
++    parsed = parser.parse_args(args)
+ 
+-    print(f"=== ViBioMIR Ingestion Pipeline ===")
+-    print(f"Corpus file:   {args.corpus_path}")
+-    print(f"Query file:    {args.query_path}")
+-    print(f"Registry DB:   {args.registry_path}")
+-    print(f"Commit batch:  {args.batch_size}")
++    cfg: dict[str, Any] = {}
++    config_file = parsed.config
++    if config_file is None and Path("configs/vibiomir_phase1.yaml").exists():
++        config_file = Path("configs/vibiomir_phase1.yaml")
+ 
+-    if not args.corpus_path.exists():
+-        print(f"Error: Corpus file not found: {args.corpus_path}", file=sys.stderr)
+-        sys.exit(1)
++    if config_file is not None and Path(config_file).exists():
++        cfg = load_config(config_file)
+ 
+-    if not args.query_path.exists():
+-        print(f"Error: Query file not found: {args.query_path}", file=sys.stderr)
+-        sys.exit(1)
++    ds_cfg = cfg.get("dataset", {})
++    corpus_p = parsed.corpus_path or Path(ds_cfg.get("source_path", "data/official/links_corpus.parquet"))
++    query_p = parsed.query_path or Path(ds_cfg.get("query_path", "data/official/query.parquet"))
++    registry_p = parsed.registry_path or Path(ds_cfg.get("registry_path", "artifacts/vibiomir/registry.sqlite"))
++    expected_count = parsed.expected_query_count if parsed.expected_query_count is not None else ds_cfg.get("expected_query_count", 1200)
+ 
+-    # 1. Validate and load queries
+-    print("\n[1/2] Validating official queries...")
+-    t0 = time.time()
+-    queries = load_official_queries(
+-        args.query_path, expected_count=args.expected_query_count
+-    )
+-    print(
+-        f"  Successfully validated {len(queries)} official queries in {time.time() - t0:.2f}s"
+-    )
++    print(f"=== ViBioMIR Ingestion Pipeline ===")
++    print(f"Corpus file:   {corpus_p}")
++    print(f"Query file:    {query_p}")
++    print(f"Registry DB:   {registry_p}")
++    print(f"Commit batch:  {parsed.batch_size}")
++    print(f"Expected qcnt: {expected_count}")
+ 
+-    # 2. Ingest corpus into registry
+-    print("\n[2/2] Ingesting official corpus sources into SQLite registry...")
+     t0 = time.time()
+-    with SourceRegistry(args.registry_path) as registry:
+-        # Wrapper around iter_official_sources to log progress periodically
+-        source_iterator = iter_official_sources(args.corpus_path, batch_size=args.batch_size)
+-        
+-        def progress_stream():
+-            count = 0
+-            last_log = time.time()
+-            for item in source_iterator:
+-                count += 1
+-                if count % 200000 == 0:
+-                    now = time.time()
+-                    elapsed = now - t0
+-                    rate = count / elapsed if elapsed > 0 else 0
+-                    print(
+-                        f"  Processed {count:,} rows ({rate:.0f} rows/s, elapsed: {elapsed:.1f}s)..."
+-                    )
+-                yield item
+-
+-        report = ingest_sources(
+-            progress_stream(),
+-            registry,
+-            input_sha256=source_iterator.input_sha256,
+-            batch_size=args.batch_size,
+-        )
+-
++    report = run_ingest(
++        corpus_path=corpus_p,
++        query_path=query_p,
++        registry_path=registry_p,
++        batch_size=parsed.batch_size,
++        expected_query_count=expected_count,
++    )
+     total_time = time.time() - t0
++
+     print("\n=== Ingestion Completed Successfully ===")
+     print(f"Total Rows:       {report.input_rows:,}")
+     print(f"Inserted Sources: {report.inserted_sources:,}")
+     print(f"Unique URLs:      {report.unique_urls:,}")
+     print(f"Input SHA-256:    {report.input_sha256}")
+-    print(f"Total Ingest Time:{total_time:.2f}s ({report.input_rows / total_time:.0f} rows/s)")
++    print(f"Total Ingest Time:{total_time:.2f}s")
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/src/cli/predict.py b/src/cli/predict.py
+index c53373d..54a19f1 100644
+--- a/src/cli/predict.py
++++ b/src/cli/predict.py
+@@ -1,85 +1,283 @@
+ from __future__ import annotations
+ 
+ import argparse
++from datetime import datetime, timezone
+ import json
+ import logging
+ from pathlib import Path
+-from typing import Any
++import sys
++import time
++from typing import Any, Sequence
+ 
+ from src.cli.common import (
+     build_query_components,
+     build_reranker,
+     build_retrievers,
+     load_corpus_and_texts,
+     resolve_index_dirs,
+-    run_pipeline_for_queries,
+ )
+ from src.data.dataset_adapter import JsonlDatasetAdapter
+-from src.data.schemas import FinalPrediction, ScoredHit
++from src.data.schemas import FinalPrediction, QueryRecord, ScoredHit
++from src.data.source_store import SnapshotSourceStore
++from src.data.vibiomir_adapter import ViBioMIRAdapter, load_official_queries
++from src.data.vibiomir_contracts import OfficialQuery
+ from src.evaluation.calibrator import CutoffCalibrator
++from src.fusion.weighted_rrf import fuse_stream_results
+ from src.retrieval.orchestrator import RetrievalOrchestrator
+ from src.scoring.consistency import apply_structural_consistency
+ from src.scoring.joint_scoring import JointScorer
+ from src.submission.base import create_exporter
++from src.submission.validators import validate_zip
++from src.submission.vibiomir_json_zip import VibiomirExporter
++from src.utils.checkpoint import InferenceCheckpointManager, compute_run_fingerprint
+ from src.utils.config import load_config
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _run_pipeline_single_query(
++    query: QueryRecord,
++    config: dict[str, Any],
++    orchestrator: RetrievalOrchestrator,
++    router: Any,
++    query_builder: Any,
++    reranker: Any,
++    joint_scorer: JointScorer,
++    doc_texts: dict[str, str],
++    chunk_texts: dict[str, str],
++    chunk_to_doc: dict[str, str],
++    calibrator: CutoffCalibrator | None,
++    calib_data: dict[str, Any] | None,
++    consistency_mode: str,
++    default_doc_top_k: int,
++    default_chunk_top_k: int,
++) -> tuple[FinalPrediction, dict[str, Any]]:
++    """Executes full retrieval, fusion, reranking, scoring, and consistency for a single query."""
++    retrieval_cfg = config.get("retrieval", {})
++    candidate_top_k = retrieval_cfg.get("candidate_top_k", 200)
++
++    fusion_cfg = config.get("fusion", {})
++    fusion_weights = fusion_cfg.get("weights")
++    rrf_k = fusion_cfg.get("rrf_k", 60)
++
++    reranker_cfg = config.get("reranker", {})
++    reranker_enabled = reranker_cfg.get("enabled", True) and reranker is not None
++    doc_strategy = reranker_cfg.get("document_strategy", "chunk_aggregation")
++    doc_top_k = reranker_cfg.get("document_top_k", 100)
++    chunk_top_k = reranker_cfg.get("chunk_top_k", 200)
++    max_length = reranker_cfg.get("max_length", 512)
++
++    qid = query.query_id
++    processed = router.route(query)
++    variants = query_builder.build(processed)
++
++    # 1. Multi-stream candidate retrieval
++    stream_results = orchestrator.retrieve_all_streams(variants, top_k=candidate_top_k)
++
++    # 2. Weighted RRF fusion
++    fused_docs, fused_chunks = fuse_stream_results(
++        stream_results=stream_results,
++        weights=fusion_weights,
++        rrf_k=rrf_k,
++        top_k_docs=doc_top_k,
++        top_k_chunks=chunk_top_k,
++    )
++
++    # 3. Reranking
++    if reranker_enabled:
++        scored_chunks = reranker.rerank_chunks(
++            query_variants=variants,
++            candidates=fused_chunks,
++            chunk_texts=chunk_texts,
++            top_k=chunk_top_k,
++        )
++        if doc_strategy == "chunk_aggregation":
++            scored_docs = reranker.rerank_documents_via_chunk_aggregation(
++                doc_candidates=fused_docs,
++                scored_chunks=scored_chunks,
++                top_k=doc_top_k,
++            )
++        else:
++            scored_docs = reranker.rerank_documents_direct(
++                query_variants=variants,
++                candidates=fused_docs,
++                doc_texts=doc_texts,
++                max_length=max_length,
++                top_k=doc_top_k,
++            )
++    else:
++        scored_docs = [
++            ScoredHit(
++                item_id=h.item_id,
++                item_type="document",
++                doc_id=h.doc_id,
++                language=h.language,
++                rerank_score=h.fusion_score,
++                normalized_score=h.fusion_score,
++                raw_fusion_score=h.fusion_score,
++            )
++            for h in fused_docs
++        ]
++        scored_chunks = [
++            ScoredHit(
++                item_id=h.item_id,
++                item_type="chunk",
++                doc_id=h.doc_id,
++                language=h.language,
++                rerank_score=h.fusion_score,
++                normalized_score=h.fusion_score,
++                raw_fusion_score=h.fusion_score,
++            )
++            for h in fused_chunks
++        ]
++
++    # 4. Joint Scoring
++    joint_docs, joint_chunks = joint_scorer.score(scored_docs, scored_chunks)
++
++    # 5. Cutoff Filtering
++    if calibrator is not None and calib_data is not None:
++        doc_state = calib_data.get("documents", calib_data)
++        chunk_state = calib_data.get("chunks", calib_data)
++        selected_docs = calibrator.filter_items(joint_docs, doc_state)
++        selected_chunks = calibrator.filter_items(joint_chunks, chunk_state)
++    else:
++        selected_docs = joint_docs[:default_doc_top_k]
++        selected_chunks = joint_chunks[:default_chunk_top_k]
++
++    # 6. Structural Consistency
++    final_docs, final_chunks = apply_structural_consistency(
++        selected_docs=selected_docs,
++        selected_chunks=selected_chunks,
++        chunk_to_doc=chunk_to_doc,
++        mode=consistency_mode,
++        available_docs=joint_docs,
++    )
++
++    pred = FinalPrediction(
++        query_id=qid,
++        document_ids=[d.doc_id if isinstance(d, ScoredHit) else str(d) for d in final_docs],
++        chunk_ids=[c.item_id if isinstance(c, ScoredHit) else str(c) for c in final_chunks],
++        document_scores={
++            d.doc_id: float(d.normalized_score)
++            for d in final_docs
++            if isinstance(d, ScoredHit)
++        },
++        chunk_scores={
++            c.item_id: float(c.normalized_score)
++            for c in final_chunks
++            if isinstance(c, ScoredHit)
++        },
++    )
++
++    debug_trace = {
++        "query_id": qid,
++        "query_text": query.text_vi,
++        "variants": {"vi": variants.vi, "en": variants.en, "zh": variants.zh},
++        "candidate_docs_count": len(fused_docs),
++        "candidate_chunks_count": len(fused_chunks),
++        "selected_docs_count": len(final_docs),
++        "selected_chunks_count": len(final_chunks),
++        "final_doc_ids": pred.document_ids,
++        "final_chunk_ids": pred.chunk_ids,
++    }
++
++    return pred, debug_trace
++
++
+ def run_predict(
+     config: dict[str, Any],
+     split: str = "test",
+-    dataset_dir: Path | str = "",
++    dataset_dir: Path | str | None = None,
++    snapshot_dir: Path | str | None = None,
+     calibration_path: Path | str | None = None,
++    output_dir: Path | str | None = None,
+     output_file: Path | str | None = None,
+     exporter_type: str = "internal_jsonl",
+     index_dir: Path | str | None = None,
+     reranker: Any = None,
+     encoder: Any = None,
+     translator: Any = None,
++    resume: bool = True,
++    export_submission: bool = False,
+ ) -> Path:
+-    """Generate and export final retrieval predictions for unlabeled test sets.
++    """Generate and export final retrieval predictions with per-query checkpoints and error blocking.
+ 
+     ANTI-LEAKAGE PRINCIPLE:
+-    This function strictly operates without loading ground truth. Cutoff thresholds and
+-    top-k parameters must be derived entirely from pre-computed validation calibration.
+-
+-    Args:
+-        config: Configuration dictionary.
+-        split: Dataset split to predict on (default: "test").
+-        dataset_dir: Directory containing test queries and corpus documents/chunks.
+-        calibration_path: Optional path to calibration.json.
+-        output_file: Target path where exported submission file will be saved.
+-        exporter_type: Submission format ('internal_jsonl' or 'competition_csv').
+-        index_dir: Directory containing pre-built BM25 and Dense indexes.
+-        reranker: Optional pre-instantiated reranker override.
+-        encoder: Optional pre-instantiated dense encoder override.
+-        translator: Optional pre-instantiated translator override.
+-
+-    Returns:
+-        Path to the exported prediction submission file.
++    This function strictly operates without ground truth labels. No metrics.json or fake 0 metrics are written.
+     """
+-    dataset_path = Path(dataset_dir)
+-    if not dataset_path.exists():
+-        raise FileNotFoundError(f"Dataset directory not found: {dataset_path}")
+-
+-    # 1. Anti-Leakage: Load queries ONLY (never load ground truth on test split)
+-    adapter = JsonlDatasetAdapter(dataset_path)
+-    queries = adapter.load_queries(split)
+-
+-    # Load corpus text lookups
+-    documents, chunks, doc_texts, chunk_texts, chunk_to_doc = load_corpus_and_texts(
+-        dataset_dir=dataset_path,
+-        index_dir=index_dir,
+-        config=config,
+-    )
++    t_start = time.time()
++
++    # Determine destination directory
++    if output_dir is not None:
++        out_dir = Path(output_dir)
++    elif output_file is not None:
++        out_dir = Path(output_file).parent
++    else:
++        run_cfg = config.get("run", {})
++        base_out = run_cfg.get("output_dir", "artifacts/experiments")
++        exp_name = run_cfg.get("experiment_name", "vibiomir_phase1_A")
++        out_dir = Path(base_out) / exp_name
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    # 1. Load queries and corpus/snapshot
++    queries: list[QueryRecord] = []
++    official_queries: list[OfficialQuery] = []
++    doc_texts: dict[str, str] = {}
++    chunk_texts: dict[str, str] = {}
++    chunk_to_doc: dict[str, str] = {}
++    snapshot_membership = None
++    store: SnapshotSourceStore | None = None
++
++    if snapshot_dir is not None:
++        snap_p = Path(snapshot_dir)
++        if not snap_p.exists():
++            raise FileNotFoundError(f"Snapshot directory not found: {snap_p}")
++        store = SnapshotSourceStore(snap_p)
++        adapter = ViBioMIRAdapter(snap_p)
++        snapshot_membership = adapter.manifest.source_membership_sha256
++
++        # Load queries from official query.parquet
++        query_path_str = config.get("dataset", {}).get("query_path", "data/official/query.parquet")
++        q_path = Path(query_path_str)
++        if not q_path.exists() and dataset_dir is not None:
++            candidate_q = Path(dataset_dir) / "query.parquet"
++            if candidate_q.exists():
++                q_path = candidate_q
++
++        expected_count = config.get("dataset", {}).get("expected_query_count", None)
++        official_queries = list(load_official_queries(q_path, expected_count=expected_count))
++        queries = [QueryRecord(query_id=str(q.query_id), text_vi=q.query) for q in official_queries]
++
++        doc_texts = {str(d.doc_id): f"{d.title} {d.text}".strip() if d.title else d.text for d in adapter.iter_documents()}
++        chunk_texts = {c.chunk_id: c.text for c in adapter.iter_chunks()}
++        chunk_to_doc = {c.chunk_id: str(c.doc_id) for c in adapter.iter_chunks()}
++
++    else:
++        if dataset_dir is None:
++            raise ValueError("Either snapshot_dir or dataset_dir must be specified")
++        ds_path = Path(dataset_dir)
++        if not ds_path.exists():
++            raise FileNotFoundError(f"Dataset directory not found: {ds_path}")
++
++        ds_adapter = JsonlDatasetAdapter(ds_path)
++        queries = ds_adapter.load_queries(split)
++        official_queries = []
++        for q in queries:
++            if str(q.query_id).isdigit():
++                official_queries.append(OfficialQuery(query_id=int(q.query_id), query=q.text_vi))
++
++        documents, chunks, doc_texts, chunk_texts, chunk_to_doc = load_corpus_and_texts(
++            dataset_dir=ds_path,
++            index_dir=index_dir,
++            config=config,
++        )
+ 
+     # 2. Setup pipeline components
+     bm25_dir, dense_dir = resolve_index_dirs(config, index_dir)
+     bm25_retriever, dense_retriever = build_retrievers(
+         config=config,
+         bm25_dir=bm25_dir,
+         dense_dir=dense_dir,
+         encoder=encoder,
+     )
+ 
+@@ -87,158 +285,271 @@ def run_predict(
+     orchestrator = RetrievalOrchestrator(
+         bm25_retriever=bm25_retriever,
+         dense_retriever=dense_retriever,
+         default_top_k=retrieval_cfg.get("candidate_top_k", 200),
+     )
+ 
+     router, query_builder = build_query_components(config, translator=translator)
+     reranker_inst = build_reranker(config, reranker=reranker)
+     joint_scorer = JointScorer.from_config(config)
+ 
+-    # Run retrieval pipeline up to joint scoring
+-    query_scores = run_pipeline_for_queries(
+-        queries=queries,
+-        config=config,
+-        orchestrator=orchestrator,
+-        router=router,
+-        query_builder=query_builder,
+-        reranker=reranker_inst,
+-        joint_scorer=joint_scorer,
+-        doc_texts=doc_texts,
+-        chunk_texts=chunk_texts,
+-    )
+-
+-    # 3. Load calibration.json if provided
++    # 3. Load calibration if provided
+     calib_data = None
+     if calibration_path:
+-        calib_path = Path(calibration_path)
+-        if not calib_path.exists():
++        calib_file = Path(calibration_path)
++        if not calib_file.exists():
+             raise FileNotFoundError(f"Calibration file not found: {calibration_path}")
+-        with open(calib_path, "r", encoding="utf-8") as f:
++        with open(calib_file, "r", encoding="utf-8") as f:
+             calib_data = json.load(f)
+ 
+     calibrator: CutoffCalibrator | None = None
+     if calib_data:
+         calibrator = CutoffCalibrator(beta=config.get("calibration", {}).get("beta", 2.0))
+ 
+     consistency_mode = config.get("post_processing", {}).get("consistency_mode", "independent")
+     calib_bounds = config.get("calibration", {}).get("bounds", {})
+-    default_doc_top_k = int(calib_bounds.get("documents", {}).get("min", 10))
+-    default_chunk_top_k = int(calib_bounds.get("chunks", {}).get("min", 20))
+-
+-    predictions: list[FinalPrediction] = []
+-
+-    for qid, (joint_docs, joint_chunks) in query_scores.items():
+-        # 4. Filter documents and chunks with calibrated cutoff
+-        if calibrator is not None and calib_data is not None:
+-            doc_state = calib_data.get("documents", calib_data)
+-            chunk_state = calib_data.get("chunks", calib_data)
+-            selected_docs = calibrator.filter_items(joint_docs, doc_state)
+-            selected_chunks = calibrator.filter_items(joint_chunks, chunk_state)
+-        else:
+-            selected_docs = joint_docs[:default_doc_top_k]
+-            selected_chunks = joint_chunks[:default_chunk_top_k]
+-
+-        # 5. Apply structural consistency
+-        final_docs, final_chunks = apply_structural_consistency(
+-            selected_docs=selected_docs,
+-            selected_chunks=selected_chunks,
+-            chunk_to_doc=chunk_to_doc,
+-            mode=consistency_mode,
+-            available_docs=joint_docs,
+-        )
++    default_doc_top_k = int(calib_bounds.get("documents", {}).get("min", 5))
++    default_chunk_top_k = int(calib_bounds.get("chunks", {}).get("min", 10))
++
++    # 4. Compute run fingerprint
++    index_manifests = []
++    if (bm25_dir / "manifest.json").exists():
++        with open(bm25_dir / "manifest.json", "r", encoding="utf-8") as f:
++            index_manifests.append(json.load(f))
++    if (dense_dir / "manifest.json").exists():
++        with open(dense_dir / "manifest.json", "r", encoding="utf-8") as f:
++            index_manifests.append(json.load(f))
+ 
+-        predictions.append(
+-            FinalPrediction(
+-                query_id=qid,
+-                document_ids=[d.doc_id if isinstance(d, ScoredHit) else str(d) for d in final_docs],
+-                chunk_ids=[c.item_id if isinstance(c, ScoredHit) else str(c) for c in final_chunks],
+-                document_scores={
+-                    d.doc_id: float(d.normalized_score)
+-                    for d in final_docs
+-                    if isinstance(d, ScoredHit)
+-                },
+-                chunk_scores={
+-                    c.item_id: float(c.normalized_score)
+-                    for c in final_chunks
+-                    if isinstance(c, ScoredHit)
+-                },
++    model_revisions = {
++        "dense": str(type(encoder).__name__ if encoder else config.get("retrieval", {}).get("dense", {}).get("model_name")),
++        "reranker": str(type(reranker_inst).__name__ if reranker_inst else config.get("reranker", {}).get("model_name")),
++    }
++
++    query_identifiers = [int(q.query_id) if str(q.query_id).isdigit() else str(q.query_id) for q in queries]
++    run_fp = compute_run_fingerprint(
++        query_manifest_or_ids=query_identifiers,
++        snapshot_manifest_or_membership=snapshot_membership,
++        index_manifests=index_manifests,
++        model_revisions=model_revisions,
++        config=config,
++    )
++
++    # 5. Initialize Checkpoint Manager
++    ckpt_mgr = InferenceCheckpointManager(
++        output_dir=out_dir,
++        run_fingerprint=run_fp,
++        resume=resume,
++    )
++    completed_qids = ckpt_mgr.get_completed_query_ids()
++
++    # 6. Execute per-query inference with checkpointing
++    debug_path = out_dir / "retrieval_debug.jsonl"
++    with open(debug_path, "a", encoding="utf-8") as debug_file:
++        for query in queries:
++            qid_val = int(query.query_id) if str(query.query_id).isdigit() else str(query.query_id)
++            if qid_val in completed_qids:
++                logger.info("Skipping already completed query %s", qid_val)
++                continue
++
++            try:
++                pred, trace = _run_pipeline_single_query(
++                    query=query,
++                    config=config,
++                    orchestrator=orchestrator,
++                    router=router,
++                    query_builder=query_builder,
++                    reranker=reranker_inst,
++                    joint_scorer=joint_scorer,
++                    doc_texts=doc_texts,
++                    chunk_texts=chunk_texts,
++                    chunk_to_doc=chunk_to_doc,
++                    calibrator=calibrator,
++                    calib_data=calib_data,
++                    consistency_mode=consistency_mode,
++                    default_doc_top_k=default_doc_top_k,
++                    default_chunk_top_k=default_chunk_top_k,
++                )
++                ckpt_mgr.save_checkpoint(query_id=qid_val, status="completed", prediction=pred)
++                debug_file.write(json.dumps(trace, ensure_ascii=False) + "\n")
++                debug_file.flush()
++
++            except Exception as exc:
++                logger.error("Inference failed for query %s: %s", qid_val, exc)
++                ckpt_mgr.save_checkpoint(query_id=qid_val, status="failed", error=str(exc))
++                # Never silently convert to empty predictions; keep failure recorded
++
++    # 7. Validate all queries and block export if any failed
++    all_predictions = ckpt_mgr.validate_and_get_all_predictions(required_query_ids=query_identifiers)
++
++    # 8. Save predictions.jsonl
++    predictions_path = out_dir / "predictions.jsonl"
++    with open(predictions_path, "w", encoding="utf-8") as f:
++        for p in all_predictions:
++            f.write(
++                json.dumps(
++                    {
++                        "query_id": p.query_id,
++                        "document_ids": p.document_ids,
++                        "chunk_ids": p.chunk_ids,
++                        "document_scores": p.document_scores,
++                        "chunk_scores": p.chunk_scores,
++                    },
++                    ensure_ascii=False,
++                )
++                + "\n"
+             )
++
++    # 9. Save run_manifest.json
++    total_time = time.time() - t_start
++    manifest_data = {
++        "run_fingerprint": run_fp,
++        "seed": config.get("run", {}).get("seed", 42),
++        "models": model_revisions,
++        "runtime_seconds": round(total_time, 2),
++        "total_queries": len(all_predictions),
++        "timestamp": datetime.now(timezone.utc).isoformat(),
++        "snapshot_membership_sha256": snapshot_membership,
++    }
++    with open(out_dir / "run_manifest.json", "w", encoding="utf-8") as f:
++        json.dump(manifest_data, f, indent=2, ensure_ascii=False)
++
++    # 10. Submission Export
++    effective_exporter = config.get("submission", {}).get("exporter", exporter_type)
++    if store is not None and (export_submission or effective_exporter == "vibiomir_json_zip"):
++        sub_cfg = config.get("submission", {})
++        vibiomir_exporter = VibiomirExporter(
++            json_filename=sub_cfg.get("json_filename", "results.json"),
++            zip_filename=sub_cfg.get("zip_filename", "submission_A.zip"),
++            emit_chunk_order=sub_cfg.get("emit_chunk_order", True),
++            provenance_check=sub_cfg.get("provenance_check", "strict"),
++            expected_count=len(official_queries),
++        )
++        export_result = vibiomir_exporter.export(
++            predictions=all_predictions,
++            queries=official_queries,
++            store=store,
++            output_dir=out_dir,
+         )
+ 
+-    # 6. Determine output file path and exporter
++        # Validate ZIP
++        val_report = validate_zip(
++            export_result.zip_path,
++            queries=official_queries,
++            store=store,
++            expected_count=len(official_queries),
++        )
++        val_data = {
++            "valid": val_report.valid,
++            "query_count": val_report.query_count,
++            "document_count": val_report.document_count,
++            "chunk_count": val_report.chunk_count,
++            "errors": list(val_report.errors),
++            "warnings": list(val_report.warnings),
++            "snapshot_id": val_report.snapshot_id,
++        }
++        with open(out_dir / "validation_report.json", "w", encoding="utf-8") as f:
++            json.dump(val_data, f, indent=2, ensure_ascii=False)
++
++        if not val_report.valid:
++            raise RuntimeError(f"Submission ZIP failed validation: {val_report.errors}")
++
++        return export_result.zip_path
++
+     if output_file is not None:
+-        target_output = Path(output_file)
++        target_out = Path(output_file)
+     else:
+-        out_dir = Path(config.get("run", {}).get("output_dir", "artifacts"))
+         ext = "csv" if exporter_type == "competition_csv" else "jsonl"
+-        target_output = out_dir / f"submission.{ext}"
++        target_out = out_dir / f"submission.{ext}"
+ 
+-    target_output.parent.mkdir(parents=True, exist_ok=True)
++    target_out.parent.mkdir(parents=True, exist_ok=True)
+     exporter = create_exporter(exporter_type)
+-    exported_path = exporter.export(predictions, target_output)
+-
+-    logger.info("Exported %d predictions to %s", len(predictions), exported_path)
+-    return exported_path
++    return exporter.export(all_predictions, target_out)
+ 
+ 
+ def main(args: list[str] | None = None) -> None:
+     parser = argparse.ArgumentParser(
+         description="Multilingual Medical Retrieval Prediction CLI."
+     )
+     parser.add_argument(
+         "-c",
+         "--config",
+         default="configs/r2ai_mvp.yaml",
+-        help="Path to YAML configuration file (default: configs/r2ai_mvp.yaml)",
++        help="Path to YAML configuration file",
+     )
+     parser.add_argument(
+         "-d",
+         "--dataset",
+-        required=True,
++        default=None,
+         help="Path to dataset directory",
+     )
+     parser.add_argument(
+         "-s",
++        "--snapshot",
++        default=None,
++        help="Path to frozen snapshot directory",
++    )
++    parser.add_argument(
+         "--split",
+         default="test",
+         help="Dataset split to predict (default: test)",
+     )
+     parser.add_argument(
+         "--calibration-path",
+         default=None,
+         help="Path to pre-fitted calibration.json file",
+     )
+     parser.add_argument(
+         "-o",
+         "--output-file",
+         default=None,
+         help="Destination path for submission file",
+     )
++    parser.add_argument(
++        "--output-dir",
++        default=None,
++        help="Output directory for predictions and checkpoints",
++    )
+     parser.add_argument(
+         "--exporter",
+         default="internal_jsonl",
+-        choices=["internal_jsonl", "competition_csv"],
+-        help="Exporter format (default: internal_jsonl)",
++        choices=["internal_jsonl", "competition_csv", "vibiomir_json_zip"],
++        help="Exporter format",
+     )
+     parser.add_argument(
+         "--index-dir",
+         default=None,
+         help="Directory containing pre-built BM25 and Dense indexes",
+     )
++    parser.add_argument(
++        "--resume",
++        action="store_true",
++        help="Resume inference from existing query checkpoints",
++    )
++    parser.add_argument(
++        "--export-submission",
++        action="store_true",
++        help="Export official ViBioMIR results.json and ZIP archive",
++    )
+ 
+     parsed = parser.parse_args(args)
++    if not parsed.dataset and not parsed.snapshot:
++        parser.error("At least one of --dataset or --snapshot must be specified")
++
+     cfg = load_config(parsed.config)
+     res_path = run_predict(
+         config=cfg,
+         split=parsed.split,
+         dataset_dir=parsed.dataset,
++        snapshot_dir=parsed.snapshot,
+         calibration_path=parsed.calibration_path,
++        output_dir=parsed.output_dir,
+         output_file=parsed.output_file,
+         exporter_type=parsed.exporter,
+         index_dir=parsed.index_dir,
++        resume=parsed.resume,
++        export_submission=parsed.export_submission,
+     )
+-    print(f"Predictions exported successfully to: {res_path}")
++    print(f"Predictions and artifacts successfully generated at: {res_path}")
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/src/cli/validate_submission.py b/src/cli/validate_submission.py
+new file mode 100644
+index 0000000..a242b93
+--- /dev/null
++++ b/src/cli/validate_submission.py
+@@ -0,0 +1,140 @@
++from __future__ import annotations
++
++import argparse
++from dataclasses import asdict
++import json
++from pathlib import Path
++import sys
++from typing import Any
++
++from src.data.source_store import SnapshotSourceStore
++from src.data.vibiomir_adapter import load_official_queries
++from src.data.vibiomir_contracts import ValidationReport
++from src.submission.validators import validate_zip
++from src.utils.config import load_config
++
++
++def run_validate_submission(
++    snapshot_dir: Path | str,
++    zip_path: Path | str,
++    query_path: Path | str,
++    expected_count: int | None = None,
++    output_report_file: Path | str | None = None,
++) -> ValidationReport:
++    """Validates submission ZIP file against official queries and frozen snapshot."""
++    snap_p = Path(snapshot_dir)
++    zip_p = Path(zip_path)
++    q_p = Path(query_path)
++
++    if not snap_p.exists():
++        raise FileNotFoundError(f"Snapshot directory not found: {snap_p}")
++    if not zip_p.exists():
++        raise FileNotFoundError(f"Submission ZIP file not found: {zip_p}")
++    if not q_p.exists():
++        raise FileNotFoundError(f"Query file not found: {q_p}")
++
++    store = SnapshotSourceStore(snap_p)
++    queries = load_official_queries(q_p, expected_count=expected_count)
++
++    report = validate_zip(zip_p, queries=queries, store=store, expected_count=expected_count)
++
++    report_data = {
++        "valid": report.valid,
++        "query_count": report.query_count,
++        "document_count": report.document_count,
++        "chunk_count": report.chunk_count,
++        "errors": list(report.errors),
++        "warnings": list(report.warnings),
++        "snapshot_id": report.snapshot_id,
++    }
++
++    out_file = Path(output_report_file) if output_report_file else zip_p.parent / "validation_report.json"
++    out_file.parent.mkdir(parents=True, exist_ok=True)
++    with open(out_file, "w", encoding="utf-8") as f:
++        json.dump(report_data, f, indent=2, ensure_ascii=False)
++
++    return report
++
++
++def main(args: list[str] | None = None) -> None:
++    parser = argparse.ArgumentParser(
++        description="Offline validation of official ViBioMIR submission ZIP archive"
++    )
++    parser.add_argument(
++        "-c",
++        "--config",
++        type=Path,
++        default=None,
++        help="Path to YAML configuration file",
++    )
++    parser.add_argument(
++        "--snapshot",
++        type=Path,
++        required=True,
++        help="Path to frozen snapshot directory",
++    )
++    parser.add_argument(
++        "--zip",
++        type=Path,
++        required=True,
++        help="Path to submission ZIP archive",
++    )
++    parser.add_argument(
++        "--query-path",
++        type=Path,
++        default=None,
++        help="Path to query.parquet",
++    )
++    parser.add_argument(
++        "--output-report",
++        type=Path,
++        default=None,
++        help="Path to output validation_report.json",
++    )
++
++    parsed = parser.parse_args(args)
++
++    cfg: dict[str, Any] = {}
++    config_file = parsed.config
++    if config_file is None and Path("configs/vibiomir_phase1.yaml").exists():
++        config_file = Path("configs/vibiomir_phase1.yaml")
++
++    if config_file is not None and Path(config_file).exists():
++        cfg = load_config(config_file)
++
++    ds_cfg = cfg.get("dataset", {})
++    query_p = parsed.query_path or Path(ds_cfg.get("query_path", "data/official/query.parquet"))
++    expected_count = ds_cfg.get("expected_query_count", 1200)
++
++    print("=== ViBioMIR Submission Validation ===")
++    print(f"Snapshot:  {parsed.snapshot}")
++    print(f"ZIP file:  {parsed.zip}")
++    print(f"Queries:   {query_p}")
++
++    report = run_validate_submission(
++        snapshot_dir=parsed.snapshot,
++        zip_path=parsed.zip,
++        query_path=query_p,
++        expected_count=expected_count,
++        output_report_file=parsed.output_report,
++    )
++
++    print("\n=== Validation Report ===")
++    print(f"Valid:           {report.valid}")
++    print(f"Query Count:     {report.query_count}")
++    print(f"Document Count:  {report.document_count}")
++    print(f"Chunk Count:     {report.chunk_count}")
++    print(f"Errors:          {len(report.errors)}")
++    print(f"Warnings:        {len(report.warnings)}")
++
++    if report.errors:
++        print("\nErrors encountered:")
++        for err in report.errors[:10]:
++            print(f"  - {err}")
++        sys.exit(1)
++    else:
++        print("\nAll checks passed successfully!")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/utils/checkpoint.py b/src/utils/checkpoint.py
+new file mode 100644
+index 0000000..f3a5c5f
+--- /dev/null
++++ b/src/utils/checkpoint.py
+@@ -0,0 +1,211 @@
++from __future__ import annotations
++
++from datetime import datetime, timezone
++import hashlib
++import json
++import logging
++from pathlib import Path
++from typing import Any, Sequence
++
++from src.data.schemas import FinalPrediction
++
++logger = logging.getLogger(__name__)
++
++
++def compute_run_fingerprint(
++    query_manifest_or_ids: Any = None,
++    snapshot_manifest_or_membership: Any = None,
++    index_manifests: Sequence[dict[str, Any]] | None = None,
++    model_revisions: dict[str, str] | None = None,
++    config: dict[str, Any] | None = None,
++) -> str:
++    """Computes a deterministic run_fingerprint incorporating query, corpus, index, model, and config parameters."""
++    h = hashlib.sha256()
++
++    # 1. Queries
++    if query_manifest_or_ids is not None:
++        if isinstance(query_manifest_or_ids, (list, tuple, set)):
++            q_repr = ",".join(str(qid) for qid in sorted(query_manifest_or_ids))
++            h.update(q_repr.encode("utf-8"))
++        else:
++            h.update(str(query_manifest_or_ids).encode("utf-8"))
++
++    # 2. Snapshot / Corpus
++    if snapshot_manifest_or_membership is not None:
++        if hasattr(snapshot_manifest_or_membership, "source_membership_sha256"):
++            h.update(str(snapshot_manifest_or_membership.source_membership_sha256).encode("utf-8"))
++        elif hasattr(snapshot_manifest_or_membership, "snapshot_id"):
++            h.update(str(snapshot_manifest_or_membership.snapshot_id).encode("utf-8"))
++        else:
++            h.update(str(snapshot_manifest_or_membership).encode("utf-8"))
++
++    # 3. Index Manifests
++    if index_manifests:
++        for idx in index_manifests:
++            serialized_idx = json.dumps(idx, sort_keys=True)
++            h.update(serialized_idx.encode("utf-8"))
++
++    # 4. Models
++    if model_revisions:
++        serialized_models = json.dumps(model_revisions, sort_keys=True)
++        h.update(serialized_models.encode("utf-8"))
++
++    # 5. Pipeline config settings (retrieval, fusion, scoring, post_processing, calibration)
++    if config:
++        critical_cfg = {
++            "retrieval": config.get("retrieval", {}),
++            "fusion": config.get("fusion", {}),
++            "reranker": config.get("reranker", {}),
++            "joint_scoring": config.get("joint_scoring", {}),
++            "post_processing": config.get("post_processing", {}),
++            "calibration": config.get("calibration", {}),
++        }
++        h.update(json.dumps(critical_cfg, sort_keys=True).encode("utf-8"))
++
++    return h.hexdigest()
++
++
++def _norm_qid(qid: Any) -> Any:
++    if isinstance(qid, int) and not isinstance(qid, bool):
++        return qid
++    if isinstance(qid, str) and qid.isdigit():
++        return int(qid)
++    return str(qid)
++
++
++class InferenceCheckpointManager:
++    """Manages transactional per-query prediction checkpoints, resume semantics, and error blocking."""
++
++    def __init__(
++        self,
++        output_dir: Path | str,
++        run_fingerprint: str,
++        resume: bool = True,
++    ) -> None:
++        self.output_dir = Path(output_dir)
++        self.output_dir.mkdir(parents=True, exist_ok=True)
++        self.run_fingerprint = run_fingerprint
++        self.checkpoint_path = self.output_dir / "predictions_checkpoint.jsonl"
++
++        self.completed_predictions: dict[Any, FinalPrediction | dict[str, Any]] = {}
++        self.failed_queries: dict[Any, str] = {}
++
++        if self.checkpoint_path.exists():
++            with open(self.checkpoint_path, "r", encoding="utf-8") as f:
++                for line_idx, line in enumerate(f, start=1):
++                    line_str = line.strip()
++                    if not line_str:
++                        continue
++                    try:
++                        record = json.loads(line_str)
++                    except json.JSONDecodeError:
++                        logger.warning(f"Corrupted checkpoint line {line_idx} in {self.checkpoint_path}")
++                        continue
++
++                    fp = record.get("run_fingerprint")
++                    if fp is not None and fp != self.run_fingerprint:
++                        if resume:
++                            raise ValueError(
++                                f"Run fingerprint mismatch in checkpoint: expected {self.run_fingerprint}, "
++                                f"found {fp}. Cannot resume."
++                            )
++
++                    qid = _norm_qid(record["query_id"])
++                    status = record.get("status")
++                    if status == "completed":
++                        self.completed_predictions[qid] = record.get("prediction")
++                        self.failed_queries.pop(qid, None)
++                    elif status == "failed":
++                        self.failed_queries[qid] = str(record.get("error", "Unknown error"))
++                        self.completed_predictions.pop(qid, None)
++
++    def save_checkpoint(
++        self,
++        query_id: Any,
++        status: str,
++        prediction: FinalPrediction | dict[str, Any] | None = None,
++        error: str | None = None,
++    ) -> None:
++        """Atomically appends a per-query checkpoint record."""
++        now_iso = datetime.now(timezone.utc).isoformat()
++        norm_id = _norm_qid(query_id)
++        pred_dict = None
++        if prediction is not None:
++            if isinstance(prediction, FinalPrediction):
++                pred_dict = {
++                    "query_id": prediction.query_id,
++                    "document_ids": list(prediction.document_ids),
++                    "chunk_ids": list(prediction.chunk_ids),
++                    "document_scores": dict(prediction.document_scores),
++                    "chunk_scores": dict(prediction.chunk_scores),
++                }
++            elif isinstance(prediction, dict):
++                pred_dict = prediction
++
++        record = {
++            "run_fingerprint": self.run_fingerprint,
++            "query_id": query_id,
++            "status": status,
++            "prediction": pred_dict,
++            "error": error,
++            "timestamp": now_iso,
++        }
++
++        with open(self.checkpoint_path, "a", encoding="utf-8") as f:
++            f.write(json.dumps(record, ensure_ascii=False) + "\n")
++            f.flush()
++
++        if status == "completed":
++            self.completed_predictions[norm_id] = pred_dict
++            self.failed_queries.pop(norm_id, None)
++        elif status == "failed":
++            self.failed_queries[norm_id] = str(error)
++            self.completed_predictions.pop(norm_id, None)
++
++    def get_completed_query_ids(self) -> set[Any]:
++        return set(self.completed_predictions.keys())
++
++    def get_failed_query_ids(self) -> set[Any]:
++        return set(self.failed_queries.keys())
++
++    def has_failed_queries(self) -> bool:
++        return len(self.failed_queries) > 0
++
++    def validate_and_get_all_predictions(
++        self,
++        required_query_ids: Sequence[Any],
++    ) -> list[FinalPrediction]:
++        """Validates that all required queries completed without failures and returns FinalPrediction objects."""
++        if self.has_failed_queries():
++            failed_sample = list(self.failed_queries.keys())[:5]
++            raise RuntimeError(
++                f"Query inference failed for {len(self.failed_queries)} queries (sample: {failed_sample}). "
++                f"Blocking final export."
++            )
++
++        norm_required = [_norm_qid(q) for q in required_query_ids]
++        missing = set(norm_required) - set(self.completed_predictions.keys())
++        if missing:
++            missing_sample = sorted(list(missing))[:5]
++            raise RuntimeError(
++                f"Missing predictions for {len(missing)} required queries (sample: {missing_sample}). "
++                f"Blocking final export."
++            )
++
++        results: list[FinalPrediction] = []
++        for qid in norm_required:
++            raw = self.completed_predictions[qid]
++            if isinstance(raw, FinalPrediction):
++                results.append(raw)
++            else:
++                results.append(
++                    FinalPrediction(
++                        query_id=str(raw["query_id"]),
++                        document_ids=list(raw.get("document_ids", [])),
++                        chunk_ids=list(raw.get("chunk_ids", [])),
++                        document_scores=dict(raw.get("document_scores", {})),
++                        chunk_scores=dict(raw.get("chunk_scores", {})),
++                    )
++                )
++
++        return results
+diff --git a/src/utils/config.py b/src/utils/config.py
+index 1f81251..220ea58 100644
+--- a/src/utils/config.py
++++ b/src/utils/config.py
+@@ -1,23 +1,143 @@
++from __future__ import annotations
++
++import copy
+ from pathlib import Path
+ from typing import Any, Union
+ import yaml
+ 
++ALLOWED_CONFIG_SECTIONS = {
++    "run": {
++        "experiment_name", "seed", "output_dir"
++    },
++    "dataset": {
++        "adapter", "query_path", "source_path", "expected_query_count", "registry_path", "dir"
++    },
++    "crawl": {
++        "concurrency", "per_domain_concurrency", "min_domain_interval_seconds",
++        "connect_timeout_seconds", "read_timeout_seconds", "total_deadline_seconds",
++        "max_attempts", "base_backoff_seconds", "lease_seconds", "max_redirects",
++        "max_html_bytes", "max_pdf_bytes", "respect_robots", "raw_root", "timeout"
++    },
++    "extraction": {
++        "html_backend", "pdf_backend", "language_model_path",
++        "language_confidence_min", "accepted_languages", "quarantine_unknown_language"
++    },
++    "indexing": {
++        "snapshot_root", "parquet_row_group_size", "target_shard_bytes",
++        "chunking", "validation"
++    },
++    "query_understanding": {
++        "normalize", "adaptive_routing", "translation"
++    },
++    "retrieval": {
++        "candidate_top_k", "bm25", "dense"
++    },
++    "fusion": {
++        "method", "rrf_k", "weights"
++    },
++    "reranker": {
++        "enabled", "model_name", "document_strategy", "document_top_k",
++        "chunk_top_k", "batch_size", "max_length", "query_window_tokens",
++        "query_window_overlap_tokens", "query_window_aggregation", "body_truncation"
++    },
++    "joint_scoring": {
++        "document", "chunk"
++    },
++    "post_processing": {
++        "consistency_mode"
++    },
++    "evaluation": {
++        "profile", "normalization", "tokenizer", "overlap_threshold",
++        "undefined_pr", "empty_both_f2", "scorer_parity_verified", "beta"
++    },
++    "calibration": {
++        "metric", "beta", "policies", "bounds", "fit_enabled",
++        "fallback_policy", "fixed_top_k"
++    },
++    "submission": {
++        "exporter", "doc_id_type", "emit_chunk_order", "json_filename",
++        "zip_filename", "provenance_check"
++    }
++}
++
++
++def merge_configs(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
++    """Deep merge overlay configuration on top of base configuration."""
++    merged = copy.deepcopy(base)
++    for key, val in overlay.items():
++        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
++            merged[key] = merge_configs(merged[key], val)
++        else:
++            merged[key] = copy.deepcopy(val)
++    return merged
++
++
++def validate_config(config: dict[str, Any]) -> None:
++    """Strictly validates configuration keys against allowed schema.
++
++    Raises:
++        ValueError: If unknown top-level sections or unrecognized configuration keys are found.
++    """
++    for section_name, section_val in config.items():
++        if section_name not in ALLOWED_CONFIG_SECTIONS:
++            raise ValueError(f"Unknown top-level configuration section: {section_name!r}")
++
++        if isinstance(section_val, dict):
++            allowed_subkeys = ALLOWED_CONFIG_SECTIONS[section_name]
++            for subkey in section_val.keys():
++                if subkey not in allowed_subkeys:
++                    raise ValueError(
++                        f"Unknown configuration key {subkey!r} in section {section_name!r}"
++                    )
++
+ 
+-def load_config(config_path: Union[str, Path]) -> dict[str, Any]:
+-    """Load and parse a YAML configuration file.
++def load_config(
++    config_path: Union[str, Path],
++    base_config_path: Union[str, Path, None] = None,
++    validate: bool = True,
++    overrides: dict[str, Any] | None = None,
++) -> dict[str, Any]:
++    """Load and parse a YAML configuration file with support for base overlay and deep overrides.
+ 
+     Args:
+-        config_path: Path to the YAML configuration file.
++        config_path: Path to the primary YAML configuration file.
++        base_config_path: Optional path to a base configuration file to merge with.
++        validate: Whether to validate the merged configuration against schema.
++        overrides: Optional runtime dictionary overrides (highest precedence).
+ 
+     Returns:
+-        dict: Parsed configuration dictionary.
++        dict: Parsed and merged configuration dictionary.
+ 
+     Raises:
+         FileNotFoundError: If the specified config file does not exist.
++        ValueError: If the config contains unknown sections or keys when validate=True.
+     """
+     path = Path(config_path)
+     if not path.exists():
+         raise FileNotFoundError(f"Config file not found: {path}")
++
+     with open(path, "r", encoding="utf-8") as f:
+         loaded = yaml.safe_load(f)
+-        return loaded if isinstance(loaded, dict) else {}
++        cfg = loaded if isinstance(loaded, dict) else {}
++
++    # If base_config_path is provided, or if config_path is vibiomir_phase1.yaml overlay,
++    # load and merge base config (configs/r2ai_mvp.yaml)
++    base_path = Path(base_config_path) if base_config_path is not None else None
++    if base_path is None and path.name == "vibiomir_phase1.yaml":
++        candidate_base = path.parent / "r2ai_mvp.yaml"
++        if candidate_base.exists():
++            base_path = candidate_base
++
++    if base_path is not None and base_path.exists() and base_path.resolve() != path.resolve():
++        with open(base_path, "r", encoding="utf-8") as bf:
++            base_loaded = yaml.safe_load(bf)
++            base_dict = base_loaded if isinstance(base_loaded, dict) else {}
++            cfg = merge_configs(base_dict, cfg)
++
++    if overrides:
++        cfg = merge_configs(cfg, overrides)
++
++    if validate:
++        validate_config(cfg)
++
++    return cfg
+diff --git a/tests/integration/test_vibiomir_phase1.py b/tests/integration/test_vibiomir_phase1.py
+new file mode 100644
+index 0000000..0235eb6
+--- /dev/null
++++ b/tests/integration/test_vibiomir_phase1.py
+@@ -0,0 +1,467 @@
++from __future__ import annotations
++
++import gzip
++import hashlib
++import json
++from pathlib import Path
++from typing import Any
++from unittest.mock import AsyncMock, patch
++import zipfile
++
++import numpy as np
++import pyarrow as pa
++import pyarrow.parquet as pq
++import pytest
++
++from src.cli.common import (
++    build_query_components,
++    build_reranker,
++    build_retrievers,
++    load_corpus_and_texts,
++    resolve_index_dirs,
++    run_pipeline_for_queries,
++)
++from src.data.schemas import FinalPrediction, SearchHit
++from src.data.source_store import SnapshotSourceStore
++from src.data.vibiomir_contracts import (
++    FetchResult,
++    OfficialQuery,
++    OfficialSource,
++)
++from src.data.vibiomir_registry import SourceRegistry, ingest_sources
++from src.reranking.reranker import DummyReranker
++from src.retrieval.orchestrator import RetrievalOrchestrator
++from src.submission.validators import validate_zip
++from src.utils.config import load_config, merge_configs, validate_config
++
++
++class FastMockDenseEncoder:
++    """Fast deterministic dense encoder producing 128-dim embeddings in microseconds."""
++
++    def __init__(self, dim: int = 128) -> None:
++        self.dim = dim
++
++    def encode(self, texts: list[str] | str, **kwargs: Any) -> np.ndarray:
++        if isinstance(texts, str):
++            texts = [texts]
++        vectors = []
++        for text in texts:
++            seed = int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16) % (2**31)
++            rng = np.random.RandomState(seed)
++            vec = rng.randn(self.dim).astype(np.float32)
++            norm = np.linalg.norm(vec)
++            if norm > 0:
++                vec /= norm
++            vectors.append(vec)
++        return np.vstack(vectors)
++
++
++# ==============================================================================
++# 1. Config Merge and Validation Tests
++# ==============================================================================
++
++def test_config_merge_cli_yaml_defaults(tmp_path: Path):
++    """Test precedence: CLI overrides > YAML config > code defaults."""
++    code_defaults = {
++        "run": {"seed": 42, "experiment_name": "default_exp"},
++        "crawl": {"concurrency": 4, "timeout": 30},
++    }
++
++    yaml_file = tmp_path / "test_config.yaml"
++    yaml_content = """
++run:
++  seed: 100
++crawl:
++  concurrency: 8
++"""
++    yaml_file.write_text(yaml_content, encoding="utf-8")
++
++    cli_overrides = {
++        "run": {"seed": 999},
++    }
++
++    # Step 1: Base + YAML
++    from src.utils.config import load_config, merge_configs
++
++    loaded_yaml = load_config(yaml_file, validate=False)
++    merged_yaml = merge_configs(code_defaults, loaded_yaml)
++    assert merged_yaml["run"]["seed"] == 100  # YAML overrides code default
++    assert merged_yaml["run"]["experiment_name"] == "default_exp"  # code default preserved
++    assert merged_yaml["crawl"]["concurrency"] == 8  # YAML overrides code default
++    assert merged_yaml["crawl"]["timeout"] == 30  # code default preserved
++
++    # Step 2: Merged + CLI overrides
++    final_cfg = merge_configs(merged_yaml, cli_overrides)
++    assert final_cfg["run"]["seed"] == 999  # CLI override wins
++    assert final_cfg["run"]["experiment_name"] == "default_exp"
++    assert final_cfg["crawl"]["concurrency"] == 8
++
++
++def test_unknown_yaml_key_rejected(tmp_path: Path):
++    """Test that unknown configuration keys are strictly rejected."""
++    bad_yaml = tmp_path / "bad_config.yaml"
++    bad_yaml.write_text("unknown_top_level_section:\n  foo: bar\n", encoding="utf-8")
++
++    with pytest.raises(ValueError, match="(?i)unknown"):
++        load_config(bad_yaml, validate=True)
++
++
++# ==============================================================================
++# 2. Unit End-to-End Fixture: 3 Queries, 2 URL Aliases, 1 Fetch Failure
++# ==============================================================================
++
++@pytest.fixture
++def e2e_dataset_dir(tmp_path: Path) -> Path:
++    """Creates small official parquet inputs: 3 queries (1, 4, 9), 2 URL aliases, 1 failure."""
++    data_dir = tmp_path / "data"
++    data_dir.mkdir(parents=True, exist_ok=True)
++
++    # 1. Official queries: IDs 1, 4, 9 (non-sequential, exactly 3)
++    queries_data = [
++        {"id": 1, "query": "Bệnh đái tháo đường và triệu chứng thường gặp"},
++        {"id": 4, "query": "Dấu hiệu cảnh báo hạ đường huyết cấp tính"},
++        {"id": 9, "query": "Biện pháp phòng ngừa biến chứng tim mạch ở người tiểu đường"},
++    ]
++    query_schema = pa.schema([
++        pa.field("id", pa.int64(), nullable=False),
++        pa.field("query", pa.string(), nullable=False),
++    ])
++    query_table = pa.Table.from_pylist(queries_data, schema=query_schema)
++    pq.write_table(query_table, data_dir / "query.parquet")
++
++    # 2. Official sources:
++    # - doc_id 101 and 102 share URL: "http://example.com/alias" (2 URL aliases)
++    # - doc_id 103 has URL: "http://example.com/fail" (1 fetch failure)
++    # - doc_id 104 has URL: "http://example.com/valid2" (healthy distinct source)
++    sources_data = [
++        {"id": 101, "url": "http://example.com/alias"},
++        {"id": 102, "url": "http://example.com/alias"},
++        {"id": 103, "url": "http://example.com/fail"},
++        {"id": 104, "url": "http://example.com/valid2"},
++    ]
++    source_schema = pa.schema([
++        pa.field("id", pa.int64(), nullable=False),
++        pa.field("url", pa.string(), nullable=False),
++    ])
++    source_table = pa.Table.from_pylist(sources_data, schema=source_schema)
++    pq.write_table(source_table, data_dir / "links_corpus.parquet")
++
++    return data_dir
++
++
++def test_unit_e2e_pipeline_with_aliases_and_fetch_failure(tmp_path: Path, e2e_dataset_dir: Path):
++    """Unit E2E: Ingest, crawl with mock responses, build snapshot, index, predict & export.
++
++    - 3 query IDs: 1, 4, 9
++    - 2 URL aliases: doc 101 & 102 share http://example.com/alias
++    - 1 fetch failure: http://example.com/fail
++    - Runs in < 3s using FastMockDenseEncoder and DummyReranker.
++    - Produces valid results.json in single-file ZIP with 3 queries and exact source spans.
++    """
++    artifacts_dir = tmp_path / "artifacts"
++    raw_root = artifacts_dir / "raw"
++    registry_path = artifacts_dir / "registry.sqlite"
++    snapshots_dir = artifacts_dir / "snapshots"
++    experiments_dir = artifacts_dir / "experiments" / "test_run"
++
++    # Step 1: Ingest via src.cli.ingest_vibiomir
++    from src.cli.ingest_vibiomir import run_ingest
++
++    ingest_report = run_ingest(
++        corpus_path=e2e_dataset_dir / "links_corpus.parquet",
++        query_path=e2e_dataset_dir / "query.parquet",
++        registry_path=registry_path,
++        batch_size=10,
++        expected_query_count=3,
++    )
++    assert ingest_report.input_rows == 4
++    assert ingest_report.unique_urls == 3  # 101 and 102 share same URL!
++
++    # Step 2: Crawl with mock network fetcher
++    alias_html = (
++        "<!DOCTYPE html><html><head><title>Bệnh tiểu đường</title></head><body>"
++        "<h1>Kiểm soát đường huyết</h1>"
++        "<p>Bệnh đái tháo đường là bệnh lý mạn tính cần được theo dõi đường huyết thường xuyên.</p>"
++        "<p>Dấu hiệu cảnh báo hạ đường huyết cấp tính bao gồm vã mồ hôi, run tay và chóng mặt.</p>"
++        "</body></html>"
++    ).encode("utf-8")
++
++    valid2_html = (
++        "<!DOCTYPE html><html><head><title>Tim mạch và đái tháo đường</title></head><body>"
++        "<h1>Biến chứng tim mạch</h1>"
++        "<p>Biện pháp phòng ngừa biến chứng tim mạch ở người tiểu đường là duy trì huyết áp ổn định.</p>"
++        "</body></html>"
++    ).encode("utf-8")
++
++    async def mock_fetch_one(job, client, config):
++        if "fail" in job.url:
++            return FetchResult(
++                job_id=job.job_id,
++                state="fetch_failed",
++                raw_path=None,
++                raw_sha256=None,
++                final_url=job.url,
++                mime_type="text/html",
++                http_status=404,
++                fetched_at="2026-10-04T12:00:00Z",
++                error_code="http_404",
++            )
++        content = alias_html if "alias" in job.url else valid2_html
++        content_hash = hashlib.sha256(content).hexdigest()
++        raw_path = raw_root / f"{job.job_id}.html.gz"
++        raw_path.parent.mkdir(parents=True, exist_ok=True)
++        with gzip.open(raw_path, "wb") as gf:
++            gf.write(content)
++        return FetchResult(
++            job_id=job.job_id,
++            state="fetched",
++            raw_path=str(raw_path),
++            raw_sha256=content_hash,
++            final_url=job.url,
++            mime_type="text/html",
++            http_status=200,
++            fetched_at="2026-10-04T12:00:00Z",
++            error_code=None,
++            bytes_written=len(content),
++        )
++
++    with patch("src.ingestion.crawl_runner.fetch_one", side_effect=mock_fetch_one):
++        from src.cli.crawl import run_crawl_cli
++        crawl_report = run_crawl_cli(
++            registry_path=registry_path,
++            raw_root=raw_root,
++            limit=10,
++        )
++    assert crawl_report.fetched == 2  # 2 unique URLs succeeded
++    assert crawl_report.failed == 1   # 1 unique URL failed (fail)
++
++    # Step 3: Build immutable snapshot via src.cli.build_snapshot
++    from src.cli.build_snapshot import run_build_snapshot
++    manifest = run_build_snapshot(
++        registry_path=registry_path,
++        snapshot_root=snapshots_dir,
++        name="test_snapshot_01",
++        raw_root=raw_root,
++        queries_path=e2e_dataset_dir / "query.parquet",
++    )
++    assert manifest.ready_document_count == 3  # docs 101, 102, 104 are ready! (103 failed)
++    assert manifest.chunk_count > 0
++
++    snapshot_path = snapshots_dir / "test_snapshot_01"
++
++    # Step 4: Index via src.cli.index using FastMockDenseEncoder
++    from src.cli.index import run_index
++    index_cfg = {
++        "run": {"output_dir": str(experiments_dir)},
++        "retrieval": {
++            "bm25": {"enabled": True, "backend": "bm25s"},
++            "dense": {"enabled": True, "backend": "faiss", "batch_size": 16},
++        },
++    }
++    index_result = run_index(
++        config=index_cfg,
++        snapshot_dir=snapshot_path,
++        output_dir=experiments_dir / "indexes",
++        encoder=FastMockDenseEncoder(),
++    )
++    assert index_result["num_documents"] == 3
++
++    # Step 5: Predict & Export Submission via src.cli.predict
++    from src.cli.predict import run_predict
++    predict_cfg = {
++        "run": {"output_dir": str(experiments_dir), "experiment_name": "test_exp"},
++        "dataset": {"query_path": str(e2e_dataset_dir / "query.parquet")},
++        "retrieval": {
++            "candidate_top_k": 10,
++            "bm25": {"enabled": True, "backend": "bm25s"},
++            "dense": {"enabled": True, "backend": "faiss", "batch_size": 16},
++        },
++        "fusion": {"weights": {"vi_bm25": 1.0, "vi_dense": 1.0}},
++        "reranker": {"enabled": True, "model_name": "dummy"},
++        "calibration": {"bounds": {"documents": {"min": 1, "max": 5}, "chunks": {"min": 1, "max": 5}}},
++        "submission": {
++            "exporter": "vibiomir_json_zip",
++            "json_filename": "results.json",
++            "zip_filename": "submission.zip",
++        },
++    }
++
++    zip_path = run_predict(
++        config=predict_cfg,
++        split="test",
++        snapshot_dir=snapshot_path,
++        index_dir=experiments_dir / "indexes",
++        output_dir=experiments_dir,
++        encoder=FastMockDenseEncoder(),
++        reranker=DummyReranker(),
++        export_submission=True,
++    )
++
++    assert Path(zip_path).exists()
++
++    # Step 6: Validate ZIP and submission rows
++    from src.data.vibiomir_adapter import load_official_queries
++    queries = load_official_queries(e2e_dataset_dir / "query.parquet")
++    store = SnapshotSourceStore(snapshot_path)
++
++    val_report = validate_zip(zip_path, queries=queries, store=store, expected_count=3)
++    assert val_report.valid is True
++    assert val_report.query_count == 3
++    assert len(val_report.errors) == 0
++
++    # Verify all 3 query IDs are present in root results.json
++    with zipfile.ZipFile(zip_path) as zf:
++        raw_json = json.loads(zf.read("results.json").decode("utf-8"))
++        result_ids = [r["id"] for r in raw_json]
++        assert result_ids == [1, 4, 9]
++
++        # Verify correct source chunk spans for non-empty predictions
++        for row in raw_json:
++            for ch in row["relevant_chunks"]:
++                doc = store.get_document(ch["doc_id"])
++                assert ch["chunk_text"] in doc.source_text
++
++
++# ==============================================================================
++# 3. Checkpoint & Resume Tests
++# ==============================================================================
++
++def test_inference_kill_and_resume_skips_completed_queries(tmp_path: Path, e2e_dataset_dir: Path):
++    """Test kill & resume: running inference partially, killing, and resuming skips completed queries."""
++    output_dir = tmp_path / "checkpoints_test"
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    from src.utils.checkpoint import InferenceCheckpointManager
++
++    queries = [
++        OfficialQuery(query_id=1, query="q1"),
++        OfficialQuery(query_id=4, query="q2"),
++        OfficialQuery(query_id=9, query="q3"),
++    ]
++
++    run_fp = "test_run_fingerprint_abc123"
++
++    # Stage 1: Process queries 1 and 4, then simulate kill/interrupt
++    mgr1 = InferenceCheckpointManager(output_dir=output_dir, run_fingerprint=run_fp)
++    mgr1.save_checkpoint(query_id=1, status="completed", prediction={"query_id": "1", "document_ids": ["101"], "chunk_ids": ["101:h:0"]})
++    mgr1.save_checkpoint(query_id=4, status="completed", prediction={"query_id": "4", "document_ids": ["102"], "chunk_ids": ["102:h:0"]})
++
++    # Stage 2: Resume with same fingerprint
++    mgr2 = InferenceCheckpointManager(output_dir=output_dir, run_fingerprint=run_fp)
++    completed_qids = mgr2.get_completed_query_ids()
++    assert completed_qids == {1, 4}
++
++    # Simulate skipping completed queries and processing remaining query 9
++    executed_queries = []
++    for q in queries:
++        if q.query_id in completed_qids:
++            continue
++        executed_queries.append(q.query_id)
++        mgr2.save_checkpoint(query_id=q.query_id, status="completed", prediction={"query_id": str(q.query_id), "document_ids": ["104"], "chunk_ids": []})
++
++    assert executed_queries == [9]  # Query 1 and 4 were skipped!
++    assert mgr2.get_completed_query_ids() == {1, 4, 9}
++
++
++def test_inference_failure_records_failed_state_and_blocks_export(tmp_path: Path):
++    """Query inference failure records a failure state and BLOCKS the final export."""
++    output_dir = tmp_path / "failure_test"
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    from src.utils.checkpoint import InferenceCheckpointManager
++
++    run_fp = "test_run_fingerprint_fail"
++    mgr = InferenceCheckpointManager(output_dir=output_dir, run_fingerprint=run_fp)
++
++    # Query 1 completes
++    mgr.save_checkpoint(query_id=1, status="completed", prediction={"query_id": "1", "document_ids": ["101"], "chunk_ids": []})
++    # Query 4 fails with exception
++    mgr.save_checkpoint(query_id=4, status="failed", error="CUDA out of memory error during inference")
++
++    # Assert manager tracks failure
++    assert mgr.has_failed_queries() is True
++    failed_qids = mgr.get_failed_query_ids()
++    assert 4 in failed_qids
++
++    # Final export must be blocked!
++    with pytest.raises(RuntimeError, match="(?i)inference failed.*blocking.*export"):
++        mgr.validate_and_get_all_predictions(required_query_ids=[1, 4, 9])
++
++
++def test_resume_with_mismatched_run_fingerprint_rejected(tmp_path: Path):
++    """Resuming with mismatched run_fingerprint is rejected with an error."""
++    output_dir = tmp_path / "mismatch_test"
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    from src.utils.checkpoint import InferenceCheckpointManager
++
++    # Initial checkpoint written with run_fingerprint_v1
++    mgr1 = InferenceCheckpointManager(output_dir=output_dir, run_fingerprint="run_fingerprint_v1")
++    mgr1.save_checkpoint(query_id=1, status="completed", prediction={"query_id": "1", "document_ids": [], "chunk_ids": []})
++
++    # Attempt to resume with different model/config -> run_fingerprint_v2
++    with pytest.raises(ValueError, match="(?i)fingerprint mismatch"):
++        InferenceCheckpointManager(output_dir=output_dir, run_fingerprint="run_fingerprint_v2", resume=True)
++
++
++# ==============================================================================
++# 4. Anti-leakage and Edge Cases Tests
++# ==============================================================================
++
++def test_test_set_without_labels_does_not_generate_fake_zero_metrics(tmp_path: Path):
++    """Test set without labels does NOT generate fake '0' metrics or metrics.json."""
++    output_dir = tmp_path / "no_labels_test"
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    # Verify run_predict does not write metrics.json
++    metrics_file = output_dir / "metrics.json"
++    assert not metrics_file.exists()
++
++
++def test_missing_language_stream_does_not_crash():
++    """Missing or empty language stream does not crash retrieval orchestrator."""
++    from src.query.query_processor import QueryVariants
++
++    orchestrator = RetrievalOrchestrator(bm25_retriever=None, dense_retriever=None)
++    variants = QueryVariants(vi="triệu chứng sốt xuất huyết", en="", zh=None)
++
++    # Should not crash and return empty streams safely
++    stream_results = orchestrator.retrieve_all_streams(variants, top_k=10)
++    assert isinstance(stream_results.doc_streams, dict)
++    assert isinstance(stream_results.chunk_streams, dict)
++
++
++def test_no_candidate_query_returns_clean_empty():
++    """Query with zero candidates produces clean empty prediction row."""
++    from src.fusion.weighted_rrf import fuse_stream_results
++    from src.retrieval.orchestrator import StreamResults
++    from src.scoring.joint_scoring import JointScorer
++
++    empty_streams = StreamResults(doc_streams={}, chunk_streams={})
++    fused_docs, fused_chunks = fuse_stream_results(empty_streams, top_k_docs=10, top_k_chunks=20)
++    assert fused_docs == []
++    assert fused_chunks == []
++
++    scorer = JointScorer()
++    joint_docs, joint_chunks = scorer.score([], [])
++    assert joint_docs == []
++    assert joint_chunks == []
++
++
++def test_evaluate_on_dev_split_with_snapshot_and_anti_leakage(tmp_path: Path, e2e_dataset_dir: Path):
++    """Test evaluate.py on dev split with snapshot produces metrics and csv, while rejecting test split."""
++    from src.cli.evaluate import run_evaluate
++
++    eval_cfg = {
++        "run": {"output_dir": str(tmp_path / "eval_out")},
++        "dataset": {"query_path": str(e2e_dataset_dir / "query.parquet")},
++    }
++
++    # 1. Anti-leakage: split="test" without labels must be rejected immediately
++    with pytest.raises(ValueError, match="(?i)without ground truth labels"):
++        run_evaluate(
++            config=eval_cfg,
++            split="test",
++            snapshot_dir=tmp_path / "dummy_snapshot",
++        )
++

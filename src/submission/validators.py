@@ -44,18 +44,21 @@ def validate_predictions(
     queries: Sequence[OfficialQuery],
     store: SourceStore,
     expected_count: int | None = None,
+    max_docs_per_query: int | None = None,
+    max_chunks_per_query: int | None = None,
+    max_chunks_per_doc: int | None = None,
 ) -> ValidationReport:
     """Strictly validates submission rows against official queries and SourceStore snapshot.
 
     Checks:
     1. Top-level list and sequence structure.
-    2. Exact query coverage: no missing, extra, or duplicate query IDs.
+    2. Exact query coverage: strictly requires exact official query ID set/count (no missing, extra, or duplicate query IDs).
     3. Signed int64 IDs: rejects bool, string, float, out-of-range IDs.
-    4. Relevant docs/chunks list types: rejects missing or non-list types.
+    4. Relevant docs/chunks list types: supports variable result counts (0 up to optional caps).
     5. Registry membership: rejects foreign doc IDs not in store.
     6. Deduplication: rejects duplicate doc IDs and duplicate (doc_id, chunk_text) in same query.
     7. Exact source substring provenance: verifies chunk text is verbatim substring of doc source_text.
-    8. Valid empty predictions pass with empty lists.
+    8. Valid empty predictions pass with empty lists (no zero-score padding forced).
     9. Chunk doc_id not in relevant_docs is accepted if valid official doc.
     10. Non-negative integer chunk_order (rejecting bool, negative, float).
     """
@@ -120,6 +123,10 @@ def validate_predictions(
             )
         else:
             rel_docs = row["relevant_docs"]
+            if max_docs_per_query is not None and len(rel_docs) > max_docs_per_query:
+                errors.append(
+                    f"Query {query_id}: exceeded max document cap ({len(rel_docs)} > {max_docs_per_query})"
+                )
             total_docs += len(rel_docs)
             seen_doc_ids: set[int] = set()
             for doc_idx, raw_doc_id in enumerate(rel_docs):
@@ -147,8 +154,13 @@ def validate_predictions(
             )
         else:
             rel_chunks = row["relevant_chunks"]
+            if max_chunks_per_query is not None and len(rel_chunks) > max_chunks_per_query:
+                errors.append(
+                    f"Query {query_id}: exceeded max chunk cap ({len(rel_chunks)} > {max_chunks_per_query})"
+                )
             total_chunks += len(rel_chunks)
             seen_chunks: set[tuple[int, str]] = set()
+            chunks_per_doc_count: dict[int, int] = {}
 
             for chunk_idx, chunk in enumerate(rel_chunks):
                 if not isinstance(chunk, dict):
@@ -195,6 +207,13 @@ def validate_predictions(
                         f"Query {query_id}: duplicate chunk (doc_id={chunk_doc_id}, chunk_text) in relevant_chunks"
                     )
                 seen_chunks.add(chunk_pair)
+
+                if max_chunks_per_doc is not None:
+                    chunks_per_doc_count[chunk_doc_id] = chunks_per_doc_count.get(chunk_doc_id, 0) + 1
+                    if chunks_per_doc_count[chunk_doc_id] > max_chunks_per_doc:
+                        errors.append(
+                            f"Query {query_id}: doc {chunk_doc_id} exceeded max chunks per doc ({chunks_per_doc_count[chunk_doc_id]} > {max_chunks_per_doc})"
+                        )
 
                 # Official registry check
                 if not store.contains_official_doc(chunk_doc_id):
@@ -259,6 +278,9 @@ def validate_zip(
     queries: Sequence[OfficialQuery],
     store: SourceStore,
     expected_count: int | None = None,
+    max_docs_per_query: int | None = None,
+    max_chunks_per_query: int | None = None,
+    max_chunks_per_doc: int | None = None,
 ) -> ValidationReport:
     """Strictly validates a ViBioMIR submission ZIP archive.
 
@@ -405,4 +427,7 @@ def validate_zip(
         queries=queries,
         store=store,
         expected_count=expected_count,
+        max_docs_per_query=max_docs_per_query,
+        max_chunks_per_query=max_chunks_per_query,
+        max_chunks_per_doc=max_chunks_per_doc,
     )

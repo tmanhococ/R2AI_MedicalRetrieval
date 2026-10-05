@@ -1,0 +1,50 @@
+commit 7bca314
+Author: Antigravity Subagent
+Date: 2026-09-22
+
+feat: implement translation caching and multilingual query builder with fault tolerance
+
+diff --stat:
+ src/query/__init__.py           |  18 ++-
+ src/query/translation_cache.py  | 121 +++++++++++++++
+ src/query/translator.py         | 292 +++++++++++++++++++++++++++++++++++
+ tests/test_translator.py        | 224 +++++++++++++++++++++++++++
+ 4 files changed, 653 insertions(+), 2 deletions(-)
+
+diff -U10 91bbd27..7bca314:
+--- a/src/query/__init__.py
++++ b/src/query/__init__.py
+@@ -1,15 +1,31 @@
+ from src.query.query_processor import (
+     AdaptiveQueryRouter,
+     ProcessedQuery,
+     QueryVariants,
+     build_query_variants,
+     normalize_vi_query,
+ )
++from src.query.translation_cache import TranslationCache
++from src.query.translator import (
++    ApiTranslator,
++    LocalHfTranslator,
++    MultilingualQueryBuilder,
++    PassthroughTranslator,
++    PrecomputedCacheTranslator,
++    Translator,
++    create_translator,
++)
+ 
+ __all__ = [
+     "AdaptiveQueryRouter",
+     "ProcessedQuery",
+     "QueryVariants",
+     "build_query_variants",
+     "normalize_vi_query",
++    "Translator",
++    "PrecomputedCacheTranslator",
++    "PassthroughTranslator",
++    "LocalHfTranslator",
++    "ApiTranslator",
++    "create_translator",
++    "MultilingualQueryBuilder",
++    "TranslationCache",
+ ]

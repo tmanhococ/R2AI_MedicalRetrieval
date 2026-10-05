@@ -1,0 +1,117 @@
+run:
+  experiment_name: vibiomir_phase2_B
+  seed: 42
+  require_real_models: true
+
+dataset:
+  expected_query_count: 1200
+  expected_official_count: 4394718
+  verify_actual_counts: true
+  scope: all
+  accepted_languages: [vi, en, zh, und]
+
+campaign:
+  scope: all
+  domain_whitelist: []
+  source_limit: null
+  reuse_existing_content: true
+  require_no_unresolved_sources: true
+  priority_changes_order_only: true
+
+resources:
+  embedding_start_batch: 8
+  reranker_start_batch: 4
+  oom_min_batch: 1
+  concurrent_gpu_models: 1
+  java_heap: 4G
+  row_group_cache_bytes: 268435456
+  disk_reserve_fraction: 0.25
+
+retrieval:
+  candidate_top_k: 200
+  sparse:
+    backend: lucene
+    k1: 1.2
+    b: 0.75
+    pretokenized: true
+    analyzer: whitespace
+    token_encoding: sha256_hex_v1
+    document_top_k_per_language: 500
+    chunk_top_k_per_language: 1000
+  dense:
+    enabled: true
+    model_name: intfloat/multilingual-e5-base
+    dimension: 768
+    query_prefix: "query: "
+    passage_prefix: "passage: "
+    normalize: true
+    vector_storage_dtype: float16
+    block_rows: 10000
+    backend: faiss_cpu_ivfpq
+    metric: inner_product
+    nlist: 4096
+    pq_m: 64
+    pq_bits: 8
+    train_rows: 200000
+    nprobe: 32
+    approximate_top_k: 4000
+    refined_top_k: 1000
+    query_window_tokens: 448
+    query_window_overlap: 64
+    search_all_languages_with_original_vi: true
+  candidate_docs: 200
+
+fusion:
+  method: weighted_rrf
+  rrf_k: 60
+  family_weights: {sparse_doc: 1.0, sparse_chunk: 0.75, dense: 1.0}
+  group_correlated_dense_variants: true
+
+evidence:
+  document_top_k: 100
+  base_windows_per_doc: 6
+  base_spans_per_query_max: 800
+  scan_all_chunks_in_candidate_doc: true
+  neighbor_blocks: 1
+  expanded_soft_target_tokens: 600
+  expansion_logit_tolerance: 0.5
+  require_positive_neighbor: true
+  dedup_span_overlap: 0.8
+  preserve_source_offsets: true
+
+reranker:
+  enabled: true
+  model_name: BAAI/bge-reranker-v2-m3
+  max_length: 512
+  passage_window_tokens: 320
+  query_window_tokens: 128
+  query_window_overlap: 16
+  window_aggregation: max
+  use_raw_logits: true
+  require_real_weights: true
+
+output:
+  fit_only_allowed_dev: true
+  fallback_policy: heuristic_ce_positive
+  fallback_raw_logit_min: 0.0
+  min_results: 0
+  document_cap: 10
+  evidence_cap: 20
+  evidence_cap_per_doc: 3
+  fixed_count_validation: false
+
+ann_audit:
+  sample_queries: 100
+  full_audit_queries: 20
+  top_k: 200
+  candidate_retention_min: 0.95
+
+submission:
+  exporter: vibiomir_json_zip
+  json_filename: results.json
+  zip_filename: submission_B.zip
+  require_scope: full_source_pass
+  require_complete_sparse_membership: true
+  require_complete_dense_membership: true
+  require_completed_queries: 1200
+  report_terminal_gaps: true

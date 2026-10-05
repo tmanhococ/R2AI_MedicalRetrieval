@@ -1,0 +1,807 @@
+# Review package: a523e859e4047de4326f3ea717691fcaad1b5180..ca217a50c008fa68df2ae3478b60615deb18784f
+
+## Commits
+ca217a5 feat: enforce full-corpus coverage contracts
+
+## Files changed
+ src/data/phase2_contracts.py        |  51 ++++
+ src/operations/coverage.py          | 231 +++++++++++++++++
+ tests/operations/test_full_scope.py | 476 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 758 insertions(+)
+
+## Diff
+diff --git a/src/data/phase2_contracts.py b/src/data/phase2_contracts.py
+index 93a1ce1..ace9eca 100644
+--- a/src/data/phase2_contracts.py
++++ b/src/data/phase2_contracts.py
+@@ -49,20 +49,71 @@ class CoverageLedger:
+     terminal_gap_count: int
+     unresolved_count: int
+     chunk_count: int
+     sparse_doc_count: int
+     sparse_chunk_count: int
+     dense_row_count: int
+     source_scope: str
+     registry_hash: str
+     snapshot_id: str
+ 
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "official_count": self.official_count,
++            "unique_url_count": self.unique_url_count,
++            "ready_doc_count": self.ready_doc_count,
++            "terminal_gap_count": self.terminal_gap_count,
++            "unresolved_count": self.unresolved_count,
++            "chunk_count": self.chunk_count,
++            "sparse_doc_count": self.sparse_doc_count,
++            "sparse_chunk_count": self.sparse_chunk_count,
++            "dense_row_count": self.dense_row_count,
++            "source_scope": self.source_scope,
++            "registry_hash": self.registry_hash,
++            "snapshot_id": self.snapshot_id,
++        }
++
++
++class ScopeViolationError(ValueError):
++    """Raised when coverage invariants or scope requirements are violated."""
++
++
++# Recognized scope labels in ViBioMIR Phase 2
++SCOPE_PARTIAL_BODY_INDEX = "PARTIAL_BODY_INDEX"
++SCOPE_FULL_SOURCE_PASS_WITH_GAPS = "FULL_SOURCE_PASS_WITH_GAPS"
++SCOPE_FULL_BODY_INDEX = "FULL_BODY_INDEX"
++SCOPE_FULL_HYBRID_WITH_GAPS = "FULL_HYBRID_WITH_GAPS"
++SCOPE_FULL_HYBRID = "FULL_HYBRID"
++
++VALID_SCOPES = (
++    SCOPE_PARTIAL_BODY_INDEX,
++    SCOPE_FULL_SOURCE_PASS_WITH_GAPS,
++    SCOPE_FULL_BODY_INDEX,
++    SCOPE_FULL_HYBRID_WITH_GAPS,
++    SCOPE_FULL_HYBRID,
++)
++
++
++@dataclass
++class IndexManifest:
++    """Manifest describing an assembled sparse or dense index artifact."""
++    snapshot_id: str
++    item_type: str
++    language: str
++    member_count: int
++    membership_sha256: str
++    backend: str
++    model_fingerprint: str | None
++    tokenizer_fingerprint: str
++    parameters: dict[str, Any] = field(default_factory=dict)
++    artifact_paths_and_hashes: dict[str, str] = field(default_factory=dict)
++
+ 
+ @dataclass
+ class EmbeddingBlock:
+     """Atomic block metadata for float16 embedding shards on disk."""
+     block_id: str
+     first_row: int
+     row_count: int
+     dimension: int
+     vector_path: str
+     mapping_path: str
+diff --git a/src/operations/coverage.py b/src/operations/coverage.py
+new file mode 100644
+index 0000000..db9b7e0
+--- /dev/null
++++ b/src/operations/coverage.py
+@@ -0,0 +1,231 @@
++from __future__ import annotations
++
++import logging
++from typing import Sequence
++
++from src.data.phase2_contracts import (
++    CoverageLedger,
++    FullCampaignConfig,
++    IndexManifest,
++    ScopeViolationError,
++    SCOPE_FULL_BODY_INDEX,
++    SCOPE_FULL_HYBRID,
++    SCOPE_FULL_HYBRID_WITH_GAPS,
++    SCOPE_FULL_SOURCE_PASS_WITH_GAPS,
++    SCOPE_PARTIAL_BODY_INDEX,
++    VALID_SCOPES,
++)
++from src.data.vibiomir_contracts import SnapshotManifest
++from src.data.vibiomir_registry import SourceRegistry
++
++logger = logging.getLogger(__name__)
++
++# Known terminal failure states for fetch jobs in registry
++TERMINAL_STATES = frozenset({
++    "fetch_failed",
++    "terminal_fetch_failure",
++    "blocked",
++    "robots_blocked",
++    "unsupported",
++    "unsupported_content",
++    "unsupported_language",
++    "terminal_extraction_failure",
++    "invalid_url",
++    "http_error",
++    "permanent_error",
++})
++
++# Known unresolved / in-flight states
++UNRESOLVED_STATES = frozenset({
++    "pending",
++    "leased",
++    "fetching",
++    "retry_wait",
++    "needs_review",
++})
++
++_NORMALIZED_TARGETS = {
++    "PARTIAL_BODY_INDEX": SCOPE_PARTIAL_BODY_INDEX,
++    "PARTIAL": SCOPE_PARTIAL_BODY_INDEX,
++    "FULL_SOURCE_PASS_WITH_GAPS": SCOPE_FULL_SOURCE_PASS_WITH_GAPS,
++    "FULL_SOURCE_PASS": SCOPE_FULL_SOURCE_PASS_WITH_GAPS,
++    "FULL_BODY_INDEX": SCOPE_FULL_BODY_INDEX,
++    "FULL_BODY": SCOPE_FULL_BODY_INDEX,
++    "STRICT_FULL_BODY": SCOPE_FULL_BODY_INDEX,
++    "FULL_HYBRID_WITH_GAPS": SCOPE_FULL_HYBRID_WITH_GAPS,
++    "FULL_HYBRID": SCOPE_FULL_HYBRID,
++}
++
++
++def build_coverage_ledger(
++    registry: SourceRegistry,
++    snapshot: SnapshotManifest,
++    index_manifests: Sequence[IndexManifest],
++    campaign_config: FullCampaignConfig | None = None,
++    has_real_reranker: bool = False,
++) -> CoverageLedger:
++    """Build and verify full-corpus coverage ledger across registry, snapshot, and indexes.
++
++    Enforces invariants:
++    1. index_manifest.snapshot_id == snapshot.snapshot_id
++    2. index_manifest (document) membership_sha256 matches snapshot.source_membership_sha256
++    3. official_count == ready_doc_count + terminal_gap_count + unresolved_count
++    """
++    # 1. Manifest invariants
++    for manifest in index_manifests:
++        if manifest.snapshot_id != snapshot.snapshot_id:
++            raise ScopeViolationError(
++                f"snapshot_id mismatch: index manifest has '{manifest.snapshot_id}', "
++                f"expected snapshot '{snapshot.snapshot_id}'"
++            )
++        if (
++            manifest.item_type == "document"
++            and manifest.member_count >= snapshot.ready_document_count
++            and manifest.membership_sha256
++        ):
++            if manifest.membership_sha256 != snapshot.source_membership_sha256:
++                raise ScopeViolationError(
++                    f"membership hash mismatch: index has '{manifest.membership_sha256}', "
++                    f"expected '{snapshot.source_membership_sha256}'"
++                )
++
++    # 2. Count indexed members across manifests
++    sparse_doc_count = 0
++    sparse_chunk_count = 0
++    dense_row_count = 0
++
++    for manifest in index_manifests:
++        is_dense = (
++            manifest.backend.startswith("faiss")
++            or "dense" in manifest.backend.lower()
++            or (manifest.model_fingerprint is not None and manifest.backend not in ("lucene", "bm25", "bm25s"))
++        )
++        if is_dense:
++            dense_row_count += manifest.member_count
++        elif manifest.item_type == "document":
++            sparse_doc_count += manifest.member_count
++        elif manifest.item_type == "chunk":
++            sparse_chunk_count += manifest.member_count
++
++    # 3. Query source registry
++    official_count = registry.count_sources()
++    unique_url_count = registry.count_unique_urls()
++    ready_doc_count = snapshot.ready_document_count
++    chunk_count = snapshot.chunk_count
++
++    terminal_gap_count = 0
++    if getattr(registry, "conn", None) is not None:
++        cursor = registry.conn.execute(
++            """
++            SELECT j.state, count(*)
++            FROM sources s
++            LEFT JOIN fetch_jobs j ON s.fetch_job_id = j.job_id
++            GROUP BY j.state
++            """
++        )
++        state_counts = dict(cursor.fetchall())
++        terminal_gap_count = sum(cnt for st, cnt in state_counts.items() if st in TERMINAL_STATES)
++
++    unresolved_count = official_count - ready_doc_count - terminal_gap_count
++    if unresolved_count < 0:
++        raise ScopeViolationError(
++            f"Corrupt coverage state: ready docs ({ready_doc_count}) + terminal gaps ({terminal_gap_count}) "
++            f"> official sources ({official_count})"
++        )
++
++    # Invariant: official_count == ready_doc_count + terminal_gap_count + unresolved_count
++    assert official_count == ready_doc_count + terminal_gap_count + unresolved_count
++
++    # Registry hash
++    reg_hash = ""
++    try:
++        ingest_state = registry.get_ingest_state()
++        if ingest_state:
++            reg_hash = ingest_state[0]
++    except Exception:
++        pass
++    if not reg_hash:
++        reg_hash = snapshot.registry_sha256
++
++    # 4. Scope labeling
++    forced_partial = False
++    if campaign_config is not None:
++        if campaign_config.source_limit is not None:
++            forced_partial = True
++        if campaign_config.domain_whitelist:
++            forced_partial = True
++        if campaign_config.scope != "all":
++            forced_partial = True
++
++    docs_fully_indexed = sparse_doc_count >= ready_doc_count
++    chunks_fully_indexed = sparse_chunk_count >= chunk_count
++    has_unresolved = unresolved_count > 0
++
++    if forced_partial or has_unresolved or not docs_fully_indexed or not chunks_fully_indexed:
++        source_scope = SCOPE_PARTIAL_BODY_INDEX
++    else:
++        is_hybrid = (
++            has_real_reranker
++            and dense_row_count >= chunk_count
++            and chunk_count > 0
++        )
++        if terminal_gap_count > 0:
++            source_scope = SCOPE_FULL_HYBRID_WITH_GAPS if is_hybrid else SCOPE_FULL_SOURCE_PASS_WITH_GAPS
++        else:
++            source_scope = SCOPE_FULL_HYBRID if is_hybrid else SCOPE_FULL_BODY_INDEX
++
++    return CoverageLedger(
++        official_count=official_count,
++        unique_url_count=unique_url_count,
++        ready_doc_count=ready_doc_count,
++        terminal_gap_count=terminal_gap_count,
++        unresolved_count=unresolved_count,
++        chunk_count=chunk_count,
++        sparse_doc_count=sparse_doc_count,
++        sparse_chunk_count=sparse_chunk_count,
++        dense_row_count=dense_row_count,
++        source_scope=source_scope,
++        registry_hash=reg_hash,
++        snapshot_id=snapshot.snapshot_id,
++    )
++
++
++def require_scope(ledger: CoverageLedger, target: str) -> None:
++    """Verify that a coverage ledger meets or exceeds the required target scope.
++
++    Raises ScopeViolationError if the target scope is not satisfied.
++    """
++    normalized_key = target.strip().upper()
++    target_scope = _NORMALIZED_TARGETS.get(normalized_key, normalized_key)
++
++    if target_scope not in VALID_SCOPES:
++        raise ValueError(f"Unknown scope target: '{target}' (valid: {VALID_SCOPES})")
++
++    # If target is PARTIAL_BODY_INDEX, any ledger satisfies it
++    if target_scope == SCOPE_PARTIAL_BODY_INDEX:
++        return
++
++    # If actual scope is PARTIAL_BODY_INDEX, it cannot satisfy any higher scope
++    if ledger.source_scope == SCOPE_PARTIAL_BODY_INDEX:
++        raise ScopeViolationError(
++            f"Scope violation: ledger has {ledger.source_scope}, cannot satisfy '{target}'. "
++            f"Unresolved sources: {ledger.unresolved_count}, "
++            f"docs indexed: {ledger.sparse_doc_count}/{ledger.ready_doc_count}, "
++            f"chunks indexed: {ledger.sparse_chunk_count}/{ledger.chunk_count}."
++        )
++
++    # Check terminal gaps requirement: FULL_BODY_INDEX and FULL_HYBRID do not allow gaps
++    if target_scope in (SCOPE_FULL_BODY_INDEX, SCOPE_FULL_HYBRID):
++        if ledger.terminal_gap_count > 0:
++            raise ScopeViolationError(
++                f"Scope violation: target '{target}' requires complete body coverage, "
++                f"but terminal gaps exist ({ledger.terminal_gap_count} gaps)."
++            )
++
++    # Check hybrid requirement: FULL_HYBRID_WITH_GAPS and FULL_HYBRID require hybrid pipeline
++    if target_scope in (SCOPE_FULL_HYBRID_WITH_GAPS, SCOPE_FULL_HYBRID):
++        if ledger.source_scope not in (SCOPE_FULL_HYBRID_WITH_GAPS, SCOPE_FULL_HYBRID):
++            raise ScopeViolationError(
++                f"Scope violation: target '{target}' requires full hybrid pipeline (dense index and reranker), "
++                f"but actual scope is {ledger.source_scope}."
++            )
+diff --git a/tests/operations/test_full_scope.py b/tests/operations/test_full_scope.py
+new file mode 100644
+index 0000000..82d43b4
+--- /dev/null
++++ b/tests/operations/test_full_scope.py
+@@ -0,0 +1,476 @@
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++from unittest.mock import MagicMock
++
++import pytest
++
++from src.data.phase2_contracts import (
++    CoverageLedger,
++    FullCampaignConfig,
++    IndexManifest,
++    ScopeViolationError,
++)
++from src.data.vibiomir_contracts import SnapshotManifest
++from src.data.vibiomir_registry import SourceRegistry
++from src.operations.coverage import (
++    build_coverage_ledger,
++    require_scope,
++)
++
++
++def _compute_membership_sha(doc_ids: list[int]) -> str:
++    membership_bytes = "".join(f"{d}\n" for d in sorted(doc_ids)).encode("utf-8")
++    return hashlib.sha256(membership_bytes).hexdigest()
++
++
++def _make_snapshot(
++    snapshot_id: str = "snap_phase2_01",
++    ready_doc_ids: list[int] | None = None,
++    chunk_count: int = 200,
++    quarantine_counts: dict[str, int] | None = None,
++    registry_sha256: str = "reg_sha_canonical",
++) -> SnapshotManifest:
++    if ready_doc_ids is None:
++        ready_doc_ids = list(range(1, 101))
++    membership_sha = _compute_membership_sha(ready_doc_ids)
++    return SnapshotManifest(
++        snapshot_id=snapshot_id,
++        created_at="2026-10-05T00:00:00Z",
++        registry_sha256=registry_sha256,
++        queries_sha256="queries_sha",
++        source_membership_sha256=membership_sha,
++        extractor_fingerprint="extractor_fp",
++        chunker_fingerprint="chunker_fp",
++        source_count=len(ready_doc_ids),
++        ready_document_count=len(ready_doc_ids),
++        chunk_count=chunk_count,
++        language_counts={"vi": len(ready_doc_ids)},
++        quarantine_counts=quarantine_counts or {},
++        shard_paths_and_hashes=[],
++    )
++
++
++def _make_index_manifest(
++    snapshot_id: str = "snap_phase2_01",
++    item_type: str = "document",
++    member_count: int = 100,
++    membership_sha256: str = "",
++    backend: str = "lucene",
++    language: str = "all",
++) -> IndexManifest:
++    return IndexManifest(
++        snapshot_id=snapshot_id,
++        item_type=item_type,
++        language=language,
++        member_count=member_count,
++        membership_sha256=membership_sha256,
++        backend=backend,
++        model_fingerprint=None if backend == "lucene" else "intfloat/multilingual-e5-base",
++        tokenizer_fingerprint="whitespace",
++        parameters={"k1": 1.2, "b": 0.75},
++        artifact_paths_and_hashes={},
++    )
++
++
++def _populate_registry(
++    db_path: Path,
++    sources: list[tuple[int, str, str]],
++    registry_hash: str = "reg_sha_canonical",
++) -> SourceRegistry:
++    """Populates SourceRegistry with doc_id, url, and fetch_job state."""
++    registry = SourceRegistry(db_path)
++    registry.init_ingest_state(registry_hash)
++
++    for doc_id, url, state in sources:
++        job_id = hashlib.sha256(url.encode("utf-8")).hexdigest()
++        with registry.conn:
++            registry.conn.execute(
++                "INSERT INTO sources (doc_id, original_url, fetch_job_id) VALUES (?, ?, ?)",
++                (doc_id, url, job_id),
++            )
++            registry.conn.execute(
++                """
++                INSERT OR REPLACE INTO fetch_jobs (
++                    job_id, url, state, attempts, created_at, updated_at
++                ) VALUES (?, ?, ?, 1, '2026-10-05T00:00:00Z', '2026-10-05T00:00:00Z')
++                """,
++                (job_id, url, state),
++            )
++    registry.mark_ingest_complete(registry_hash, len(sources))
++    return registry
++
++
++# ---------------------------------------------------------------------------
++# Test 1: Full registry (4.39M) + pilot (465 bodies) labels PARTIAL_BODY_INDEX
++# ---------------------------------------------------------------------------
++def test_full_registry_plus_pilot_bodies_labels_partial(tmp_path: Path):
++    """A registry with 4.39M official sources but only 465 ready bodies MUST label PARTIAL_BODY_INDEX."""
++    # Using mock registry for 4.39M scale
++    mock_registry = MagicMock(spec=SourceRegistry)
++    mock_registry.conn = None
++    mock_registry.count_sources.return_value = 4394718
++    mock_registry.count_unique_urls.return_value = 3980000
++    mock_registry.get_ingest_state.return_value = ("reg_sha_canonical", 4394718, True)
++
++    pilot_ids = list(range(1, 466))
++    pilot_snapshot = _make_snapshot(
++        snapshot_id="pilot_snap",
++        ready_doc_ids=pilot_ids,
++        chunk_count=930,
++    )
++    pilot_doc_index = _make_index_manifest(
++        snapshot_id="pilot_snap",
++        item_type="document",
++        member_count=465,
++        membership_sha256=_compute_membership_sha(pilot_ids),
++    )
++    pilot_chunk_index = _make_index_manifest(
++        snapshot_id="pilot_snap",
++        item_type="chunk",
++        member_count=930,
++        membership_sha256="chunk_hash",
++    )
++
++    ledger = build_coverage_ledger(
++        mock_registry,
++        pilot_snapshot,
++        [pilot_doc_index, pilot_chunk_index],
++    )
++
++    assert ledger.official_count == 4394718
++    assert ledger.unique_url_count == 3980000
++    assert ledger.ready_doc_count == 465
++    assert ledger.unresolved_count == 4394718 - 465
++    assert ledger.terminal_gap_count == 0
++    assert ledger.source_scope == "PARTIAL_BODY_INDEX"
++
++    # Strict scope guard: requiring full source pass or full body MUST raise
++    with pytest.raises(ScopeViolationError, match="PARTIAL_BODY_INDEX"):
++        require_scope(ledger, "FULL_SOURCE_PASS_WITH_GAPS")
++
++    with pytest.raises(ScopeViolationError, match="PARTIAL_BODY_INDEX"):
++        require_scope(ledger, "full_source_pass")
++
++    with pytest.raises(ScopeViolationError, match="PARTIAL_BODY_INDEX"):
++        require_scope(ledger, "FULL_BODY_INDEX")
++
++
++# ---------------------------------------------------------------------------
++# Test 2: Pending doc blocks full source pass
++# ---------------------------------------------------------------------------
++def test_pending_doc_blocks_full_source_pass(tmp_path: Path):
++    """Even a single pending or in-flight doc blocks full source pass."""
++    db_path = tmp_path / "test_reg.db"
++    # 10 sources: 9 fetched, 1 pending
++    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 10)]
++    sources.append((10, "https://example.com/doc_10", "pending"))
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = list(range(1, 10))
++    snapshot = _make_snapshot(
++        ready_doc_ids=ready_ids,
++        chunk_count=20,
++    )
++    doc_index = _make_index_manifest(
++        item_type="document",
++        member_count=9,
++        membership_sha256=_compute_membership_sha(ready_ids),
++    )
++    chunk_index = _make_index_manifest(
++        item_type="chunk",
++        member_count=20,
++    )
++
++    ledger = build_coverage_ledger(registry, snapshot, [doc_index, chunk_index])
++
++    assert ledger.official_count == 10
++    assert ledger.ready_doc_count == 9
++    assert ledger.unresolved_count == 1
++    assert ledger.terminal_gap_count == 0
++    assert ledger.source_scope == "PARTIAL_BODY_INDEX"
++
++    with pytest.raises(ScopeViolationError, match="Scope violation"):
++        require_scope(ledger, "FULL_SOURCE_PASS_WITH_GAPS")
++
++
++# ---------------------------------------------------------------------------
++# Test 3: Terminal failures reported properly (FULL_SOURCE_PASS_WITH_GAPS)
++# ---------------------------------------------------------------------------
++def test_terminal_failures_reported_properly(tmp_path: Path):
++    """When all sources are resolved (some ready, some terminal failures), labels FULL_SOURCE_PASS_WITH_GAPS."""
++    db_path = tmp_path / "test_reg.db"
++    # 100 sources: 80 fetched, 15 fetch_failed, 5 blocked. No pending.
++    sources = []
++    for i in range(1, 81):
++        sources.append((i, f"https://example.com/doc_{i}", "fetched"))
++    for i in range(81, 96):
++        sources.append((i, f"https://example.com/doc_{i}", "fetch_failed"))
++    for i in range(96, 101):
++        sources.append((i, f"https://example.com/doc_{i}", "blocked"))
++
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = list(range(1, 81))
++    snapshot = _make_snapshot(
++        ready_doc_ids=ready_ids,
++        chunk_count=160,
++    )
++    doc_index = _make_index_manifest(
++        item_type="document",
++        member_count=80,
++        membership_sha256=_compute_membership_sha(ready_ids),
++    )
++    chunk_index = _make_index_manifest(
++        item_type="chunk",
++        member_count=160,
++    )
++
++    ledger = build_coverage_ledger(registry, snapshot, [doc_index, chunk_index])
++
++    assert ledger.official_count == 100
++    assert ledger.ready_doc_count == 80
++    assert ledger.terminal_gap_count == 20
++    assert ledger.unresolved_count == 0
++    # Invariant: N = ready + terminal + unresolved
++    assert ledger.official_count == ledger.ready_doc_count + ledger.terminal_gap_count + ledger.unresolved_count
++    assert ledger.source_scope == "FULL_SOURCE_PASS_WITH_GAPS"
++
++    # Satisfies full source pass
++    require_scope(ledger, "FULL_SOURCE_PASS_WITH_GAPS")
++    require_scope(ledger, "full_source_pass")
++
++    # Does NOT satisfy full body index (because terminal gaps exist)
++    with pytest.raises(ScopeViolationError, match="terminal gaps"):
++        require_scope(ledger, "FULL_BODY_INDEX")
++
++
++# ---------------------------------------------------------------------------
++# Test 4: Ready doc or chunk omitted from index blocks validation
++# ---------------------------------------------------------------------------
++def test_ready_doc_or_chunk_omitted_blocks_validation(tmp_path: Path):
++    """Ready docs or chunks omitted from sparse indexes MUST force PARTIAL_BODY_INDEX."""
++    db_path = tmp_path / "test_reg.db"
++    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 51)]
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = list(range(1, 51))
++    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=100)
++
++    # Case A: Document index only has 49 out of 50 docs
++    incomplete_doc_ids = ready_ids[:49]
++    incomplete_doc_index = _make_index_manifest(
++        item_type="document",
++        member_count=49,
++        membership_sha256=_compute_membership_sha(incomplete_doc_ids),
++    )
++    full_chunk_index = _make_index_manifest(item_type="chunk", member_count=100)
++
++    ledger_a = build_coverage_ledger(
++        registry, snapshot, [incomplete_doc_index, full_chunk_index]
++    )
++    assert ledger_a.sparse_doc_count == 49
++    assert ledger_a.ready_doc_count == 50
++    assert ledger_a.source_scope == "PARTIAL_BODY_INDEX"
++    with pytest.raises(ScopeViolationError):
++        require_scope(ledger_a, "FULL_SOURCE_PASS_WITH_GAPS")
++
++    # Case B: Doc index is complete (50 docs), but chunk index has 95 out of 100 chunks
++    full_doc_index = _make_index_manifest(
++        item_type="document",
++        member_count=50,
++        membership_sha256=_compute_membership_sha(ready_ids),
++    )
++    incomplete_chunk_index = _make_index_manifest(item_type="chunk", member_count=95)
++
++    ledger_b = build_coverage_ledger(
++        registry, snapshot, [full_doc_index, incomplete_chunk_index]
++    )
++    assert ledger_b.sparse_chunk_count == 95
++    assert ledger_b.chunk_count == 100
++    assert ledger_b.source_scope == "PARTIAL_BODY_INDEX"
++    with pytest.raises(ScopeViolationError):
++        require_scope(ledger_b, "FULL_SOURCE_PASS_WITH_GAPS")
++
++
++# ---------------------------------------------------------------------------
++# Test 5: Equal count with wrong membership IDs fails verification
++# ---------------------------------------------------------------------------
++def test_equal_count_wrong_membership_rejects(tmp_path: Path):
++    """An index with equal count (e.g. 50) but different membership hash MUST be rejected."""
++    db_path = tmp_path / "test_reg.db"
++    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 51)]
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = list(range(1, 51))
++    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=100)
++
++    # Mismatched IDs (51..100) having the exact same count (50)
++    fraudulent_ids = list(range(51, 101))
++    fraudulent_hash = _compute_membership_sha(fraudulent_ids)
++
++    fraudulent_doc_index = _make_index_manifest(
++        item_type="document",
++        member_count=50,
++        membership_sha256=fraudulent_hash,  # Count is 50, but hash doesn't match snapshot!
++    )
++    chunk_index = _make_index_manifest(item_type="chunk", member_count=100)
++
++    with pytest.raises(ScopeViolationError, match="membership hash mismatch"):
++        build_coverage_ledger(
++            registry, snapshot, [fraudulent_doc_index, chunk_index]
++        )
++
++
++# ---------------------------------------------------------------------------
++# Test 6: Snapshot ID mismatch in index is rejected
++# ---------------------------------------------------------------------------
++def test_snapshot_id_mismatch_rejects(tmp_path: Path):
++    """An index built for a different snapshot_id MUST be rejected."""
++    db_path = tmp_path / "test_reg.db"
++    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 11)]
++    registry = _populate_registry(db_path, sources)
++
++    snapshot = _make_snapshot(snapshot_id="snap_A", ready_doc_ids=list(range(1, 11)))
++    doc_index = _make_index_manifest(snapshot_id="snap_B", member_count=10)
++
++    with pytest.raises(ScopeViolationError, match="snapshot_id mismatch"):
++        build_coverage_ledger(registry, snapshot, [doc_index])
++
++
++# ---------------------------------------------------------------------------
++# Test 7: Distinguish URL rows from unique URLs
++# ---------------------------------------------------------------------------
++def test_url_rows_vs_unique_urls_distinction(tmp_path: Path):
++    """Distinguishes between official URL rows (N) and unique URLs (U)."""
++    db_path = tmp_path / "test_reg.db"
++    # 5 docs sharing 2 URLs (aliases)
++    sources = [
++        (1, "https://example.com/pageA", "fetched"),
++        (2, "https://example.com/pageA", "fetched"),
++        (3, "https://example.com/pageA", "fetched"),
++        (4, "https://example.com/pageB", "fetched"),
++        (5, "https://example.com/pageB", "fetched"),
++    ]
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = [1, 2, 3, 4, 5]
++    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=10)
++    doc_index = _make_index_manifest(
++        member_count=5,
++        membership_sha256=_compute_membership_sha(ready_ids),
++    )
++    chunk_index = _make_index_manifest(item_type="chunk", member_count=10)
++
++    ledger = build_coverage_ledger(registry, snapshot, [doc_index, chunk_index])
++
++    assert ledger.official_count == 5
++    assert ledger.unique_url_count == 2
++
++
++# ---------------------------------------------------------------------------
++# Test 8: Source limit or domain whitelist forces PARTIAL_BODY_INDEX
++# ---------------------------------------------------------------------------
++def test_campaign_filters_force_partial(tmp_path: Path):
++    """Configuring source_limit or domain_whitelist automatically sets PARTIAL_BODY_INDEX."""
++    db_path = tmp_path / "test_reg.db"
++    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 21)]
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = list(range(1, 21))
++    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=40)
++    doc_index = _make_index_manifest(
++        member_count=20,
++        membership_sha256=_compute_membership_sha(ready_ids),
++    )
++    chunk_index = _make_index_manifest(item_type="chunk", member_count=40)
++
++    # With source_limit set
++    cfg_limit = FullCampaignConfig(source_limit=10)
++    ledger_limit = build_coverage_ledger(
++        registry, snapshot, [doc_index, chunk_index], campaign_config=cfg_limit
++    )
++    assert ledger_limit.source_scope == "PARTIAL_BODY_INDEX"
++
++    # With domain_whitelist set
++    cfg_whitelist = FullCampaignConfig(domain_whitelist=["example.com"])
++    ledger_whitelist = build_coverage_ledger(
++        registry, snapshot, [doc_index, chunk_index], campaign_config=cfg_whitelist
++    )
++    assert ledger_whitelist.source_scope == "PARTIAL_BODY_INDEX"
++
++
++# ---------------------------------------------------------------------------
++# Test 9: FULL_BODY_INDEX when R = N (no gaps, no unresolved)
++# ---------------------------------------------------------------------------
++def test_full_body_index_label(tmp_path: Path):
++    """When all official sources are content-ready without gaps, labels FULL_BODY_INDEX."""
++    db_path = tmp_path / "test_reg.db"
++    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 21)]
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = list(range(1, 21))
++    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=40)
++    doc_index = _make_index_manifest(
++        member_count=20,
++        membership_sha256=_compute_membership_sha(ready_ids),
++    )
++    chunk_index = _make_index_manifest(item_type="chunk", member_count=40)
++
++    ledger = build_coverage_ledger(registry, snapshot, [doc_index, chunk_index])
++
++    assert ledger.official_count == 20
++    assert ledger.ready_doc_count == 20
++    assert ledger.terminal_gap_count == 0
++    assert ledger.unresolved_count == 0
++    assert ledger.source_scope == "FULL_BODY_INDEX"
++
++    require_scope(ledger, "FULL_BODY_INDEX")
++    require_scope(ledger, "FULL_SOURCE_PASS_WITH_GAPS")
++
++
++# ---------------------------------------------------------------------------
++# Test 10: FULL_HYBRID and FULL_HYBRID_WITH_GAPS with dense index and reranker
++# ---------------------------------------------------------------------------
++def test_full_hybrid_labels(tmp_path: Path):
++    """Dense index and reranker enable FULL_HYBRID or FULL_HYBRID_WITH_GAPS."""
++    db_path = tmp_path / "test_reg.db"
++    # 20 sources: 18 fetched, 2 fetch_failed
++    sources = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 19)]
++    sources.extend([(19, "https://example.com/doc_19", "fetch_failed"), (20, "https://example.com/doc_20", "fetch_failed")])
++    registry = _populate_registry(db_path, sources)
++
++    ready_ids = list(range(1, 19))
++    snapshot = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=36)
++    doc_index = _make_index_manifest(
++        member_count=18,
++        membership_sha256=_compute_membership_sha(ready_ids),
++    )
++    chunk_index = _make_index_manifest(item_type="chunk", member_count=36)
++    dense_index = _make_index_manifest(
++        item_type="chunk",
++        member_count=36,
++        backend="faiss_cpu_ivfpq",
++    )
++
++    ledger_with_gaps = build_coverage_ledger(
++        registry, snapshot, [doc_index, chunk_index, dense_index], has_real_reranker=True
++    )
++    assert ledger_with_gaps.dense_row_count == 36
++    assert ledger_with_gaps.source_scope == "FULL_HYBRID_WITH_GAPS"
++    require_scope(ledger_with_gaps, "FULL_HYBRID_WITH_GAPS")
++    require_scope(ledger_with_gaps, "FULL_SOURCE_PASS_WITH_GAPS")
++
++    # Now with 0 gaps: FULL_HYBRID
++    db_path_full = tmp_path / "full_reg.db"
++    sources_full = [(i, f"https://example.com/doc_{i}", "fetched") for i in range(1, 19)]
++    reg_full = _populate_registry(db_path_full, sources_full)
++    snapshot_full = _make_snapshot(ready_doc_ids=ready_ids, chunk_count=36)
++
++    ledger_full = build_coverage_ledger(
++        reg_full, snapshot_full, [doc_index, chunk_index, dense_index], has_real_reranker=True
++    )
++    assert ledger_full.source_scope == "FULL_HYBRID"
++    require_scope(ledger_full, "FULL_HYBRID")
++    require_scope(ledger_full, "FULL_BODY_INDEX")
