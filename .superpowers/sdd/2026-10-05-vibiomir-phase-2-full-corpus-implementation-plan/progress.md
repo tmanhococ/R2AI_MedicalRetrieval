@@ -18,3 +18,5 @@ Task 3: complete (commits ccf271c..788c276, review clean)
 Task 4: complete (commits 788c276..9e990c1, review clean)
 Task 5: complete (commits 77dcae9..54b8629, review clean)
 Task 6: complete (commits f57b7fb..83c916b, review clean)
+Task 7: minor (deferred): In src/cli/generate_candidates.py, remove redundant translator instantiation
+Task 7: complete (commits 66b9b69..9fa13d2, review clean)
