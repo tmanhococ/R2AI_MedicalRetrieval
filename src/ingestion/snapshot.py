@@ -30,7 +30,12 @@ from src.data.vibiomir_contracts import (
     SpanChunk,
 )
 from src.data.vibiomir_registry import SourceRegistry
-from src.indexing.chunker import chunk_source_document
+from src.indexing.chunker import (
+    _build_contextual_header,
+    _count_tokens,
+    _get_token_offsets,
+    chunk_source_document,
+)
 from src.ingestion.extractors import extract_document
 from src.ingestion.quality import (
     FastTextLanguageDetector,
@@ -198,6 +203,129 @@ class FallbackLanguageDetector:
         if any(c in vi_chars for c in text.lower()):
             return ("vi", 0.96)
         return ("en", 0.85)
+
+
+def _rechunk_oversized_span(
+    sp: SpanChunk,
+    doc: ExtractedDocument,
+    dense_tokenizer: Any,
+    reranker_tokenizer: Any,
+    config: ChunkConfig,
+) -> list[SpanChunk]:
+    """Subdivides an oversized span deterministically to meet model token budget."""
+    body_max = config.body_max_tokens
+    long_overlap = config.long_block_overlap_tokens
+    header_max = config.contextual_header_max_tokens
+
+    span_text = sp.text
+    offsets = _get_token_offsets(dense_tokenizer, span_text)
+    if not offsets:
+        step = max(50, len(span_text) // 2)
+        offsets = [(i, min(i + step, len(span_text))) for i in range(0, len(span_text), step)]
+
+    total_toks = len(offsets)
+    token_pos = 0
+    sub_chunks: list[SpanChunk] = []
+
+    while token_pos < total_toks:
+        end_pos = min(token_pos + body_max, total_toks)
+        while end_pos > token_pos + 1:
+            cand_s = offsets[token_pos][0]
+            cand_e = offsets[end_pos - 1][1]
+            cand_t = span_text[cand_s:cand_e]
+            d_tok = _count_tokens(dense_tokenizer, cand_t)
+            r_tok = _count_tokens(reranker_tokenizer, cand_t)
+            if d_tok <= body_max and r_tok <= body_max:
+                break
+            end_pos -= 1
+
+        sub_s = sp.start_char + offsets[token_pos][0]
+        if token_pos == 0:
+            sub_s = sp.start_char
+        if end_pos >= total_toks:
+            sub_e = sp.end_char
+        else:
+            sub_e = sp.start_char + offsets[end_pos - 1][1]
+
+        sub_text = doc.source_text[sub_s:sub_e]
+        header = _build_contextual_header(
+            title=doc.title,
+            section=sp.section,
+            dense_tokenizer=dense_tokenizer,
+            reranker_tokenizer=reranker_tokenizer,
+            max_tokens=header_max,
+        )
+        idx_text = f"{header}\n\n{sub_text}" if header else sub_text
+        sub_chunks.append(
+            SpanChunk(
+                chunk_id="",
+                doc_id=doc.doc_id,
+                source_version=doc.source_version,
+                source_sha256=doc.source_sha256,
+                start_char=sub_s,
+                end_char=sub_e,
+                chunk_index=0,
+                language=doc.language,
+                section=sp.section,
+                text=sub_text,
+                index_text=idx_text,
+                dense_token_count=_count_tokens(dense_tokenizer, sub_text),
+                reranker_token_count=_count_tokens(reranker_tokenizer, sub_text),
+            )
+        )
+
+        if end_pos >= total_toks:
+            break
+        step_overlap = min(long_overlap, max(1, body_max // 2))
+        step = max(1, (end_pos - token_pos) - step_overlap)
+        token_pos += step
+
+    return sub_chunks
+
+
+def _validate_and_rechunk_spans(
+    spans: Sequence[SpanChunk],
+    doc: ExtractedDocument,
+    dense_tokenizer: Any,
+    reranker_tokenizer: Any,
+    config: ChunkConfig,
+) -> list[SpanChunk]:
+    """Validates each chunk against token budgets and re-chunks any oversized spans prior to freeze."""
+    body_max = config.body_max_tokens
+    validated: list[SpanChunk] = []
+
+    for sp in spans:
+        d_cnt = _count_tokens(dense_tokenizer, sp.text)
+        r_cnt = _count_tokens(reranker_tokenizer, sp.text)
+        if d_cnt <= body_max and r_cnt <= body_max:
+            validated.append(sp)
+        else:
+            logger.info(
+                f"Re-chunking oversized span in doc {doc.doc_id}: tokens ({d_cnt}, {r_cnt}) > budget {body_max}"
+            )
+            sub_spans = _rechunk_oversized_span(sp, doc, dense_tokenizer, reranker_tokenizer, config)
+            validated.extend(sub_spans)
+
+    final_spans: list[SpanChunk] = []
+    for idx, sp in enumerate(validated):
+        final_spans.append(
+            SpanChunk(
+                chunk_id=f"{doc.doc_id}:{doc.source_sha256}:{idx:06d}",
+                doc_id=doc.doc_id,
+                source_version=sp.source_version,
+                source_sha256=sp.source_sha256,
+                start_char=sp.start_char,
+                end_char=sp.end_char,
+                chunk_index=idx,
+                language=sp.language,
+                section=sp.section,
+                text=sp.text,
+                index_text=sp.index_text,
+                dense_token_count=_count_tokens(dense_tokenizer, sp.text),
+                reranker_token_count=_count_tokens(reranker_tokenizer, sp.text),
+            )
+        )
+    return final_spans
 
 
 def build_snapshot(
@@ -448,9 +576,16 @@ def build_snapshot(
                     ready_document_count += 1
                     language_counts[ready_doc.language] += 1
 
-                    # Generate SpanChunks
+                    # Generate SpanChunks and validate model token budget prior to freeze
                     spans = list(chunk_source_document(ready_doc, dense_tokenizer, reranker_tokenizer, chk_cfg))
-                    for sp in spans:
+                    validated_spans = _validate_and_rechunk_spans(
+                        spans=spans,
+                        doc=ready_doc,
+                        dense_tokenizer=dense_tokenizer,
+                        reranker_tokenizer=reranker_tokenizer,
+                        config=chk_cfg,
+                    )
+                    for sp in validated_spans:
                         chunk_row = {
                             "chunk_id": sp.chunk_id,
                             "doc_id": sp.doc_id,

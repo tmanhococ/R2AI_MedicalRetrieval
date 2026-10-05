@@ -478,3 +478,132 @@ def test_lru_cache_bounds_and_eviction():
     assert "k2" in byte_cache
     assert "k3" in byte_cache
     assert byte_cache.current_bytes == 9  # 5 + 4
+
+
+def test_snapshot_rechunks_oversized_spans_to_fit_budget(tmp_path: Path):
+    """build_snapshot validates token budgets and re-chunks any oversized spans prior to freeze."""
+    db_path = tmp_path / "registry.db"
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    registry = SourceRegistry(db_path)
+
+    sources = [OfficialSource(doc_id=1, url="https://example.com/long_article")]
+    ingest_sources(sources, registry)
+
+    long_paragraph = "Bệnh nhân cần được điều trị bằng kháng sinh phổ rộng theo đúng phác đồ của Bộ Y tế và theo dõi sát các chỉ số sinh tồn."
+    html = f"<html><body><article><p>{long_paragraph}</p></article></body></html>".encode("utf-8")
+    raw_p, raw_hash, _ = save_raw_atomic(raw_root, html)
+    cursor = registry.conn.execute("SELECT fetch_job_id FROM sources WHERE doc_id = 1")
+    job_id = cursor.fetchone()[0]
+    registry.finish_fetch(
+        FetchResult(
+            job_id=job_id,
+            state="fetched",
+            raw_path=str(raw_p),
+            raw_sha256=raw_hash,
+            final_url="https://example.com/long_article",
+            mime_type="text/html",
+            http_status=200,
+            fetched_at="2026-10-05T00:00:00Z",
+            error_code=None,
+            bytes_written=len(html),
+        )
+    )
+
+    # Impose a strict budget of max 8 tokens per chunk
+    config = SnapshotConfig(
+        snapshot_root=tmp_path / "snapshots",
+        name="snap_budget_test",
+        chunk_config=ChunkConfig(body_max_tokens=8, contextual_header_max_tokens=4),
+    )
+    manifest = build_snapshot(
+        registry=registry,
+        config=config,
+        raw_root=raw_root,
+        language_detector=DummyLanguageDetector(),
+    )
+
+    store = SnapshotSourceStore(tmp_path / "snapshots" / "snap_budget_test")
+    doc = store.get_document(1)
+    chunks = list(store.iter_chunks_for_doc(1))
+
+    assert len(chunks) > 1, "Oversized paragraph must be re-chunked into multiple spans"
+    for c in chunks:
+        assert c.dense_token_count <= 8, f"Chunk {c.chunk_id} exceeds dense token budget"
+        assert c.reranker_token_count <= 8, f"Chunk {c.chunk_id} exceeds reranker token budget"
+        # Exact character slice identity check
+        assert c.text == doc.source_text[c.start_char : c.end_char]
+    store.close()
+
+
+def test_lru_cache_thread_safety():
+    """LRUCache supports concurrent multi-threaded reads, writes, and evictions without race conditions."""
+    import concurrent.futures
+
+    cache = LRUCache[int, str](max_entries=50, max_bytes=10000)
+
+    def worker(worker_id: int):
+        for i in range(100):
+            key = (worker_id * 100 + i) % 75
+            cache[key] = f"val_{key}_{worker_id}"
+            _ = cache.get(key)
+            if i % 10 == 0:
+                _ = len(cache)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker, wid) for wid in range(8)]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()  # Will re-raise if an exception occurred
+
+    assert len(cache) <= 50
+
+
+def test_evidence_source_store_rejects_invalid_slice_bounds(tmp_path: Path):
+    """EvidenceSourceStore rejects out-of-bounds or inverted slice coordinates."""
+    snap_dir = _setup_multi_shard_snapshot(tmp_path)
+    raw_store = SnapshotSourceStore(snap_dir)
+    evidence_store = EvidenceSourceStore(raw_store)
+
+    doc1 = evidence_store.get_document(1)
+    doc_len = len(doc1.source_text)
+
+    # 1. Inverted bounds: start >= end
+    inv_span = EvidenceSpan(
+        span_id="inv_span",
+        doc_id=1,
+        source_version=doc1.source_version,
+        source_sha256=doc1.source_sha256,
+        start_char=20,
+        end_char=10,
+        seed_chunk_ids=(),
+        variant_kind="base",
+    )
+    evidence_store.register_evidence_span(inv_span)
+    with pytest.raises(ValueError, match="Invalid span bounds"):
+        evidence_store.get_chunk("inv_span")
+
+    # 2. Out of bounds: end > len(doc.source_text)
+    oob_span = EvidenceSpan(
+        span_id="oob_span",
+        doc_id=1,
+        source_version=doc1.source_version,
+        source_sha256=doc1.source_sha256,
+        start_char=0,
+        end_char=doc_len + 100,
+        seed_chunk_ids=(),
+        variant_kind="base",
+    )
+    evidence_store.register_evidence_span(oob_span)
+    with pytest.raises(ValueError, match="Invalid span bounds"):
+        evidence_store.get_chunk("oob_span")
+
+    # 3. Dynamic pattern with inverted bounds
+    with pytest.raises(ValueError, match="Invalid span bounds"):
+        evidence_store.get_chunk("span:1:50:20")
+
+    # 4. Dynamic pattern with out-of-bounds end
+    with pytest.raises(ValueError, match="Invalid span bounds"):
+        evidence_store.get_chunk(f"span:1:0:{doc_len + 500}")
+
+    evidence_store.close()
+

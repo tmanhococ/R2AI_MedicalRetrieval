@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, Callable, Generic, Iterator, Sequence, TypeVar
 
 import pyarrow.parquet as pq
@@ -37,44 +38,51 @@ class LRUCache(Generic[K, V]):
         self.size_fn = size_fn or (lambda _: 1)
         self._cache: OrderedDict[K, tuple[V, int]] = OrderedDict()
         self._current_bytes = 0
+        self._lock = threading.RLock()
 
     def get(self, key: K, default: V | None = None) -> V | None:
-        if key not in self._cache:
-            return default
-        self._cache.move_to_end(key)
-        val, _ = self._cache[key]
-        return val
+        with self._lock:
+            if key not in self._cache:
+                return default
+            self._cache.move_to_end(key)
+            val, _ = self._cache[key]
+            return val
 
     def __contains__(self, key: K) -> bool:
-        return key in self._cache
+        with self._lock:
+            return key in self._cache
 
     def __getitem__(self, key: K) -> V:
-        if key not in self._cache:
-            raise KeyError(key)
-        self._cache.move_to_end(key)
-        val, _ = self._cache[key]
-        return val
+        with self._lock:
+            if key not in self._cache:
+                raise KeyError(key)
+            self._cache.move_to_end(key)
+            val, _ = self._cache[key]
+            return val
 
     def __setitem__(self, key: K, value: V) -> None:
-        size = self.size_fn(value)
-        if key in self._cache:
-            _, old_size = self._cache[key]
-            self._current_bytes -= old_size
-            del self._cache[key]
+        with self._lock:
+            size = self.size_fn(value)
+            if key in self._cache:
+                _, old_size = self._cache[key]
+                self._current_bytes -= old_size
+                del self._cache[key]
 
-        self._cache[key] = (value, size)
-        self._current_bytes += size
-        self._cache.move_to_end(key)
-        self._evict()
+            self._cache[key] = (value, size)
+            self._current_bytes += size
+            self._cache.move_to_end(key)
+            self._evict()
 
     def pop(self, key: K, default: V | None = None) -> V | None:
-        if key not in self._cache:
-            return default
-        val, size = self._cache.pop(key)
-        self._current_bytes -= size
-        return val
+        with self._lock:
+            if key not in self._cache:
+                return default
+            val, size = self._cache.pop(key)
+            self._current_bytes -= size
+            return val
 
     def _evict(self) -> None:
+        # Called within self._lock
         while self._cache and (
             len(self._cache) > self.max_entries or self._current_bytes > self.max_bytes
         ):
@@ -82,23 +90,26 @@ class LRUCache(Generic[K, V]):
             self._current_bytes -= size
 
     def clear(self) -> None:
-        self._cache.clear()
-        self._current_bytes = 0
+        with self._lock:
+            self._cache.clear()
+            self._current_bytes = 0
 
     def __len__(self) -> int:
-        return len(self._cache)
+        with self._lock:
+            return len(self._cache)
 
     @property
     def current_bytes(self) -> int:
-        return self._current_bytes
+        with self._lock:
+            return self._current_bytes
 
 
 def _doc_size(doc: ExtractedDocument) -> int:
-    return len(doc.source_text.encode("utf-8")) + len(doc.blocks) * 64 + 512
+    return len(doc.source_text) * 2 + len(doc.blocks) * 64 + 512
 
 
 def _chunk_size(chunk: SpanChunk) -> int:
-    return len(chunk.text.encode("utf-8")) + len(chunk.index_text.encode("utf-8")) + 256
+    return len(chunk.text) * 2 + len(chunk.index_text) * 2 + 256
 
 
 def _row_to_document(row_dict: dict[str, Any]) -> ExtractedDocument:
@@ -453,7 +464,13 @@ class EvidenceSourceStore:
         if chunk_id in self._registered_spans:
             span = self._registered_spans[chunk_id]
             doc = self.get_document(span.doc_id)
+            if not (0 <= span.start_char < span.end_char <= len(doc.source_text)):
+                raise ValueError(
+                    f"Invalid span bounds for {chunk_id}: [{span.start_char}:{span.end_char}] "
+                    f"in document of length {len(doc.source_text)}"
+                )
             text = doc.source_text[span.start_char : span.end_char]
+            tok_count = text.count(" ") + 1 if text.strip() else 0
             chunk = SpanChunk(
                 chunk_id=span.span_id,
                 doc_id=span.doc_id,
@@ -466,8 +483,8 @@ class EvidenceSourceStore:
                 section=None,
                 text=text,
                 index_text=text,
-                dense_token_count=len(text.split()),
-                reranker_token_count=len(text.split()),
+                dense_token_count=tok_count,
+                reranker_token_count=tok_count,
             )
             self._span_chunk_cache[chunk_id] = chunk
             return chunk
@@ -479,27 +496,34 @@ class EvidenceSourceStore:
                     doc_id = int(parts[1])
                     start_c = int(parts[2])
                     end_c = int(parts[3])
-                    doc = self.get_document(doc_id)
-                    text = doc.source_text[start_c:end_c]
-                    chunk = SpanChunk(
-                        chunk_id=chunk_id,
-                        doc_id=doc.doc_id,
-                        source_version=doc.source_version,
-                        source_sha256=doc.source_sha256,
-                        start_char=start_c,
-                        end_char=end_c,
-                        chunk_index=-1,
-                        language=doc.language,
-                        section=None,
-                        text=text,
-                        index_text=text,
-                        dense_token_count=len(text.split()),
-                        reranker_token_count=len(text.split()),
-                    )
-                    self._span_chunk_cache[chunk_id] = chunk
-                    return chunk
                 except (ValueError, IndexError):
-                    pass
+                    return None
+
+                doc = self.get_document(doc_id)
+                if not (0 <= start_c < end_c <= len(doc.source_text)):
+                    raise ValueError(
+                        f"Invalid span bounds for {chunk_id}: [{start_c}:{end_c}] "
+                        f"in document of length {len(doc.source_text)}"
+                    )
+                text = doc.source_text[start_c:end_c]
+                tok_count = text.count(" ") + 1 if text.strip() else 0
+                chunk = SpanChunk(
+                    chunk_id=chunk_id,
+                    doc_id=doc.doc_id,
+                    source_version=doc.source_version,
+                    source_sha256=doc.source_sha256,
+                    start_char=start_c,
+                    end_char=end_c,
+                    chunk_index=-1,
+                    language=doc.language,
+                    section=None,
+                    text=text,
+                    index_text=text,
+                    dense_token_count=tok_count,
+                    reranker_token_count=tok_count,
+                )
+                self._span_chunk_cache[chunk_id] = chunk
+                return chunk
 
         return None
 
