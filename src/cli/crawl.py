@@ -126,9 +126,13 @@ def run_crawl_cli(
         with open(cov_file, "w", encoding="utf-8") as f:
             json.dump(coverage_data, f, indent=2, ensure_ascii=False)
 
-        # Also write to artifacts/experiments/vibiomir_phase1_A/coverage.json if exp dir exists
+        # Also write to artifacts/experiments/vibiomir_phase1_A/coverage.json if exp dir exists and this is the production run
         exp_cov_file = Path("artifacts/experiments/vibiomir_phase1_A/coverage.json")
-        if exp_cov_file.parent.exists():
+        is_prod_run = (
+            str(raw_path).replace("\\", "/").rstrip("/").endswith("artifacts/vibiomir/raw")
+            and str(reg_path).replace("\\", "/").rstrip("/").endswith("artifacts/vibiomir/registry.sqlite")
+        )
+        if exp_cov_file.parent.exists() and is_prod_run:
             with open(exp_cov_file, "w", encoding="utf-8") as f:
                 json.dump(coverage_data, f, indent=2, ensure_ascii=False)
 

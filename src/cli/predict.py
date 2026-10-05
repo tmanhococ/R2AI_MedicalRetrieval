@@ -201,13 +201,48 @@ def run_predict(
     resume: bool = True,
     export_submission: bool = False,
 ) -> Path:
-    """Generate and export final retrieval predictions with per-query checkpoints and error blocking.
-
-    ANTI-LEAKAGE PRINCIPLE:
-    This function strictly operates without ground truth labels. No metrics.json or fake 0 metrics are written.
-    """
-    t_start = time.time()
+    """Generate and export final retrieval predictions with per-query checkpoints and error blocking."""
     tracemalloc.start()
+    try:
+        return _run_predict_core(
+            config=config,
+            split=split,
+            dataset_dir=dataset_dir,
+            snapshot_dir=snapshot_dir,
+            calibration_path=calibration_path,
+            output_dir=output_dir,
+            output_file=output_file,
+            exporter_type=exporter_type,
+            index_dir=index_dir,
+            reranker=reranker,
+            encoder=encoder,
+            translator=translator,
+            resume=resume,
+            export_submission=export_submission,
+        )
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+
+
+def _run_predict_core(
+    config: dict[str, Any],
+    split: str = "test",
+    dataset_dir: Path | str | None = None,
+    snapshot_dir: Path | str | None = None,
+    calibration_path: Path | str | None = None,
+    output_dir: Path | str | None = None,
+    output_file: Path | str | None = None,
+    exporter_type: str = "internal_jsonl",
+    index_dir: Path | str | None = None,
+    reranker: Any = None,
+    encoder: Any = None,
+    translator: Any = None,
+    resume: bool = True,
+    export_submission: bool = False,
+) -> Path:
+    """Core prediction pipeline logic."""
+    t_start = time.time()
 
     # Determine destination directory
     if output_dir is not None:
@@ -405,7 +440,6 @@ def run_predict(
     # 9. Save run_manifest.json
     total_time = time.time() - t_start
     _, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
     peak_ram_mb = round(peak_bytes / (1024 * 1024), 2)
 
     manifest_data = {
