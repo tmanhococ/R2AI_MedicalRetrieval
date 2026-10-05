@@ -93,6 +93,8 @@ async def _run_crawl_with_client(
     client: httpx.AsyncClient,
     limit: int | None = None,
     job_ids: Sequence[str] | None = None,
+    campaign_id: str | None = None,
+    wait_for_retry: bool = False,
 ) -> CrawlReport:
     global_sem = asyncio.Semaphore(config.concurrency)
     throttler = DomainThrottler(config.per_domain_concurrency, config.min_domain_interval_seconds)
@@ -148,6 +150,7 @@ async def _run_crawl_with_client(
                 lease_seconds=int(config.lease_seconds),
                 max_attempts=config.max_attempts,
                 job_ids=job_ids,
+                campaign_id=campaign_id,
             )
             total_leased += len(new_jobs)
             for j in new_jobs:
@@ -155,6 +158,20 @@ async def _run_crawl_with_client(
                 active_tasks.add(t)
 
         if not active_tasks:
+            if wait_for_retry and (limit is None or total_leased < limit):
+                row = registry.conn.execute(
+                    "SELECT min(retry_at) FROM fetch_jobs WHERE state = 'retry_wait'"
+                ).fetchone()
+                if row and row[0]:
+                    try:
+                        earliest = datetime.fromisoformat(row[0])
+                        now_dt = datetime.now(timezone.utc)
+                        diff = (earliest - now_dt).total_seconds()
+                        if diff > 0:
+                            await asyncio.sleep(min(diff + 0.1, 5.0))
+                            continue
+                    except Exception:
+                        pass
             break
 
         done, active_tasks = await asyncio.wait(
@@ -195,10 +212,20 @@ async def run_crawl(
     limit: int | None = None,
     client: httpx.AsyncClient | None = None,
     job_ids: Sequence[str] | None = None,
+    campaign_id: str | None = None,
+    wait_for_retry: bool = False,
 ) -> CrawlReport:
     """Executes crawler with global/domain semaphores, domain interval throttling, and atomic checkpointing."""
     if client is not None:
-        return await _run_crawl_with_client(registry, config, client, limit, job_ids=job_ids)
+        return await _run_crawl_with_client(
+            registry,
+            config,
+            client,
+            limit,
+            job_ids=job_ids,
+            campaign_id=campaign_id,
+            wait_for_retry=wait_for_retry,
+        )
 
     limits = httpx.Limits(
         max_connections=config.concurrency,
@@ -215,4 +242,12 @@ async def run_crawl(
         timeout=timeouts,
         max_redirects=config.max_redirects,
     ) as managed_client:
-        return await _run_crawl_with_client(registry, config, managed_client, limit, job_ids=job_ids)
+        return await _run_crawl_with_client(
+            registry,
+            config,
+            managed_client,
+            limit,
+            job_ids=job_ids,
+            campaign_id=campaign_id,
+            wait_for_retry=wait_for_retry,
+        )

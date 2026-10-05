@@ -67,11 +67,28 @@ class SourceRegistry:
                 );
                 """
             )
-            for col, col_type in [("retry_at", "TEXT"), ("mime_type", "TEXT"), ("final_url", "TEXT")]:
+            for col, col_type in [
+                ("retry_at", "TEXT"),
+                ("mime_type", "TEXT"),
+                ("final_url", "TEXT"),
+                ("campaign_id", "TEXT"),
+                ("priority", "INTEGER DEFAULT 0"),
+            ]:
                 try:
                     self.conn.execute(f"ALTER TABLE fetch_jobs ADD COLUMN {col} {col_type};")
                 except sqlite3.OperationalError:
                     pass
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS campaigns (
+                    campaign_id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );
+                """
+            )
             self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ingest_state (
@@ -308,6 +325,7 @@ class SourceRegistry:
         max_attempts: int = 3,
         now: datetime | None = None,
         job_ids: Sequence[str] | None = None,
+        campaign_id: str | None = None,
     ) -> list[FetchJob]:
         """Leases up to limit jobs, reclaiming expired leases and elapsed retry_wait jobs."""
         if limit <= 0:
@@ -326,7 +344,7 @@ class SourceRegistry:
                     lease_until = NULL,
                     error_code = 'lease_timeout_exhausted',
                     updated_at = ?
-                WHERE state = 'fetching'
+                WHERE state IN ('fetching', 'leased')
                   AND lease_until IS NOT NULL
                   AND lease_until <= ?
                   AND attempts >= ?
@@ -340,7 +358,7 @@ class SourceRegistry:
                 SET state = 'pending',
                     lease_until = NULL,
                     updated_at = ?
-                WHERE state = 'fetching'
+                WHERE state IN ('fetching', 'leased')
                   AND lease_until IS NOT NULL
                   AND lease_until <= ?
                 """,
@@ -360,7 +378,7 @@ class SourceRegistry:
                 (now_iso, now_iso),
             )
 
-            # 3. Select pending jobs (optionally restricted to job_ids)
+            # 3. Select pending jobs (optionally restricted to job_ids and campaign_id)
             if job_ids is not None:
                 self.conn.execute(
                     "CREATE TEMP TABLE IF NOT EXISTS target_lease_jobs (jid TEXT PRIMARY KEY);"
@@ -370,28 +388,53 @@ class SourceRegistry:
                     "INSERT OR IGNORE INTO target_lease_jobs (jid) VALUES (?)",
                     [(j,) for j in job_ids],
                 )
-                rows = self.conn.execute(
-                    """
-                    SELECT j.job_id, j.url, j.attempts
-                    FROM fetch_jobs j
-                    JOIN target_lease_jobs t ON j.job_id = t.jid
-                    WHERE j.state = 'pending'
-                    ORDER BY j.attempts ASC, j.rowid ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+                if campaign_id is not None:
+                    rows = self.conn.execute(
+                        """
+                        SELECT j.job_id, j.url, j.attempts
+                        FROM fetch_jobs j
+                        JOIN target_lease_jobs t ON j.job_id = t.jid
+                        WHERE j.state = 'pending' AND (j.campaign_id = ? OR j.campaign_id IS NULL)
+                        ORDER BY j.attempts ASC, j.priority ASC, j.rowid ASC
+                        LIMIT ?
+                        """,
+                        (campaign_id, limit),
+                    ).fetchall()
+                else:
+                    rows = self.conn.execute(
+                        """
+                        SELECT j.job_id, j.url, j.attempts
+                        FROM fetch_jobs j
+                        JOIN target_lease_jobs t ON j.job_id = t.jid
+                        WHERE j.state = 'pending'
+                        ORDER BY j.attempts ASC, j.priority ASC, j.rowid ASC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ).fetchall()
             else:
-                rows = self.conn.execute(
-                    """
-                    SELECT job_id, url, attempts
-                    FROM fetch_jobs
-                    WHERE state = 'pending'
-                    ORDER BY attempts ASC, rowid ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+                if campaign_id is not None:
+                    rows = self.conn.execute(
+                        """
+                        SELECT job_id, url, attempts
+                        FROM fetch_jobs
+                        WHERE state = 'pending' AND (campaign_id = ? OR campaign_id IS NULL)
+                        ORDER BY attempts ASC, priority ASC, rowid ASC
+                        LIMIT ?
+                        """,
+                        (campaign_id, limit),
+                    ).fetchall()
+                else:
+                    rows = self.conn.execute(
+                        """
+                        SELECT job_id, url, attempts
+                        FROM fetch_jobs
+                        WHERE state = 'pending'
+                        ORDER BY attempts ASC, priority ASC, rowid ASC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ).fetchall()
 
             if not rows:
                 return []
