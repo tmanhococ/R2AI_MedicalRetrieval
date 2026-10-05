@@ -279,6 +279,8 @@ class SnapshotManifest:
     language_counts: dict[str, int]
     quarantine_counts: dict[str, int]
     shard_paths_and_hashes: list[dict[str, str]]
+    source_scope: str | None = None
+    gap_count: int = 0
 
 
 @dataclass(frozen=True)

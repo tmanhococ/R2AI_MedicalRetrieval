@@ -15,6 +15,11 @@ import uuid
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from src.data.phase2_contracts import (
+    SCOPE_FULL_BODY_INDEX,
+    SCOPE_FULL_SOURCE_PASS_WITH_GAPS,
+    SCOPE_PARTIAL_BODY_INDEX,
+)
 from src.data.vibiomir_contracts import (
     ChunkConfig,
     ExtractionConfig,
@@ -61,6 +66,13 @@ CHUNKS_SCHEMA = pa.schema([
     pa.field("index_text", pa.string(), nullable=False),
     pa.field("dense_token_count", pa.int64(), nullable=False),
     pa.field("reranker_token_count", pa.int64(), nullable=False),
+])
+
+GAPS_SCHEMA = pa.schema([
+    pa.field("doc_id", pa.int64(), nullable=False),
+    pa.field("original_url", pa.string(), nullable=False),
+    pa.field("reason", pa.string(), nullable=False),
+    pa.field("http_status", pa.int32(), nullable=True),
 ])
 
 
@@ -250,16 +262,23 @@ def build_snapshot(
                 chunk_id TEXT PRIMARY KEY,
                 doc_id INTEGER NOT NULL,
                 shard TEXT NOT NULL,
-                row_idx INTEGER NOT NULL
+                row_idx INTEGER NOT NULL,
+                chunk_index INTEGER
             );
             """
         )
+        lookup_conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_locations_doc_id ON chunk_locations(doc_id);")
 
-    all_registered_doc_ids: list[int] = []
-    ready_doc_ids: list[int] = []
+    source_count = 0
+    ready_document_count = 0
+    membership_hasher = hashlib.sha256()
     language_counts: dict[str, int] = Counter()
     quarantine_counts: dict[str, int] = Counter()
     chunk_count = 0
+    gap_records: list[dict[str, Any]] = []
+
+    # Extraction cache to avoid duplicate work when alias doc_ids point to same raw hash
+    extraction_cache: dict[tuple[str, str], ExtractedDocument] = {}
 
     try:
         # Fetch all sources and their fetch jobs from registry
@@ -273,7 +292,7 @@ def build_snapshot(
             """
         )
         doc_loc_batch: list[tuple[int, str, int]] = []
-        chunk_loc_batch: list[tuple[str, int, str, int]] = []
+        chunk_loc_batch: list[tuple[str, int, str, int, int]] = []
         official_doc_batch: list[tuple[int]] = []
 
         while True:
@@ -282,10 +301,27 @@ def build_snapshot(
                 break
 
             for doc_id, original_url, job_id, state, raw_path_str, raw_sha256, mime_type, http_status in rows:
-                all_registered_doc_ids.append(doc_id)
+                source_count += 1
                 official_doc_batch.append((doc_id,))
 
                 if state != "fetched" or not raw_path_str or not raw_sha256:
+                    gap_reason = "unknown_fetch_failure"
+                    if state in ("failed", "terminal_failure"):
+                        gap_reason = "terminal_fetch_failure"
+                    elif state == "blocked":
+                        gap_reason = "robots_blocked"
+                    elif state == "unsupported":
+                        gap_reason = "unsupported_content"
+                    elif state in ("pending", "leased", "retry_wait"):
+                        gap_reason = f"unresolved_{state}"
+                    else:
+                        gap_reason = f"fetch_state_{state}"
+                    gap_records.append({
+                        "doc_id": doc_id,
+                        "original_url": original_url,
+                        "reason": gap_reason,
+                        "http_status": http_status if http_status is not None else -1,
+                    })
                     continue
 
                 raw_path = Path(raw_path_str)
@@ -296,6 +332,12 @@ def build_snapshot(
 
                 if not raw_path.exists():
                     logger.warning(f"Raw file {raw_path_str} not found for doc {doc_id}")
+                    gap_records.append({
+                        "doc_id": doc_id,
+                        "original_url": original_url,
+                        "reason": "missing_raw_file",
+                        "http_status": http_status if http_status is not None else -1,
+                    })
                     continue
 
                 # Read raw content
@@ -312,20 +354,59 @@ def build_snapshot(
                         f"Raw SHA256 mismatch for doc {doc_id}: expected {raw_sha256}, got {computed_raw_sha}"
                     )
 
-                # Extract document
-                extracted_doc = extract_document(
-                    doc_id=doc_id,
-                    raw=raw_bytes,
-                    mime_type=mime_type or "text/html",
-                    raw_sha256=raw_sha256,
-                    config=ext_cfg,
-                )
+                # Extract document (checking cache for alias doc_ids)
+                cache_key = (raw_sha256, mime_type or "text/html")
+                if cache_key in extraction_cache:
+                    base_extracted = extraction_cache[cache_key]
+                    extracted_doc = ExtractedDocument(
+                        doc_id=doc_id,
+                        source_version=base_extracted.source_version,
+                        source_text=base_extracted.source_text,
+                        source_sha256=base_extracted.source_sha256,
+                        raw_sha256=base_extracted.raw_sha256,
+                        title=base_extracted.title,
+                        language=base_extracted.language,
+                        blocks=base_extracted.blocks,
+                        quality_flags=base_extracted.quality_flags,
+                    )
+                else:
+                    extracted_doc = extract_document(
+                        doc_id=doc_id,
+                        raw=raw_bytes,
+                        mime_type=mime_type or "text/html",
+                        raw_sha256=raw_sha256,
+                        config=ext_cfg,
+                    )
+                    if len(extraction_cache) < 256:
+                        extraction_cache[cache_key] = extracted_doc
 
                 # Classify quality
                 quality = classify_quality(extracted_doc, language_detector, ext_cfg)
 
-                if quality.state == "ready":
-                    # Finalize extracted document with verified language
+                # Check if usable und content should be preserved
+                hard_failure_flags = {
+                    "captcha",
+                    "soft_404",
+                    "empty_text",
+                    "extraction_failed",
+                    "unsupported_format",
+                    "unsupported_mime_type",
+                    "needs_ocr",
+                }
+                has_hard_failure = any(f in hard_failure_flags for f in quality.flags)
+                is_usable_und = (
+                    not has_hard_failure
+                    and len(extracted_doc.source_text.strip()) >= 50
+                    and (quality.language in ("und", "unknown", "") or "unknown_language" in quality.flags)
+                )
+
+                if quality.state == "ready" or is_usable_und:
+                    resolved_lang = (
+                        quality.language
+                        if (quality.state == "ready" and quality.language in ("vi", "en", "zh"))
+                        else "und"
+                    )
+
                     ready_doc = ExtractedDocument(
                         doc_id=extracted_doc.doc_id,
                         source_version=extracted_doc.source_version,
@@ -333,7 +414,7 @@ def build_snapshot(
                         source_sha256=extracted_doc.source_sha256,
                         raw_sha256=extracted_doc.raw_sha256,
                         title=extracted_doc.title,
-                        language=quality.language,
+                        language=resolved_lang,
                         blocks=extracted_doc.blocks,
                         quality_flags=quality.flags,
                     )
@@ -362,7 +443,9 @@ def build_snapshot(
                     }
                     doc_shard_name, doc_row_idx = doc_writer.add_row(doc_row)
                     doc_loc_batch.append((ready_doc.doc_id, doc_shard_name, doc_row_idx))
-                    ready_doc_ids.append(ready_doc.doc_id)
+
+                    membership_hasher.update(f"{ready_doc.doc_id}\n".encode("utf-8"))
+                    ready_document_count += 1
                     language_counts[ready_doc.language] += 1
 
                     # Generate SpanChunks
@@ -384,11 +467,19 @@ def build_snapshot(
                             "reranker_token_count": sp.reranker_token_count,
                         }
                         chunk_shard_name, chunk_row_idx = chunk_writer.add_row(chunk_row)
-                        chunk_loc_batch.append((sp.chunk_id, sp.doc_id, chunk_shard_name, chunk_row_idx))
+                        chunk_loc_batch.append(
+                            (sp.chunk_id, sp.doc_id, chunk_shard_name, chunk_row_idx, sp.chunk_index)
+                        )
                         chunk_count += 1
                 else:
                     for flg in quality.flags:
                         quarantine_counts[flg] += 1
+                    gap_records.append({
+                        "doc_id": doc_id,
+                        "original_url": original_url,
+                        "reason": f"quarantined:{','.join(quality.flags)}" if quality.flags else "quarantined",
+                        "http_status": http_status if http_status is not None else -1,
+                    })
 
             # Commit batches to lookup db periodically
             if len(official_doc_batch) >= 1000:
@@ -403,7 +494,7 @@ def build_snapshot(
                         doc_loc_batch,
                     )
                     lookup_conn.executemany(
-                        "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx) VALUES (?, ?, ?, ?)",
+                        "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx, chunk_index) VALUES (?, ?, ?, ?, ?)",
                         chunk_loc_batch,
                     )
                 doc_loc_batch.clear()
@@ -422,7 +513,7 @@ def build_snapshot(
                     doc_loc_batch,
                 )
                 lookup_conn.executemany(
-                    "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx) VALUES (?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx, chunk_index) VALUES (?, ?, ?, ?, ?)",
                     chunk_loc_batch,
                 )
             doc_loc_batch.clear()
@@ -436,6 +527,43 @@ def build_snapshot(
     finally:
         lookup_conn.close()
 
+    # Calculate gap statistics and source scope
+    unresolved_count = sum(1 for g in gap_records if g["reason"].startswith("unresolved_"))
+    terminal_gap_count = len(gap_records) - unresolved_count
+    if unresolved_count > 0:
+        source_scope = SCOPE_PARTIAL_BODY_INDEX
+    elif len(gap_records) > 0:
+        source_scope = SCOPE_FULL_SOURCE_PASS_WITH_GAPS
+    else:
+        source_scope = SCOPE_FULL_BODY_INDEX
+
+    # Write source_gaps.parquet if gaps exist
+    if gap_records:
+        gaps_table = pa.Table.from_pylist(gap_records, schema=GAPS_SCHEMA)
+        gaps_parquet_name = "source_gaps.parquet"
+        gaps_parquet_path = snapshot_dir / gaps_parquet_name
+        pq.write_table(gaps_table, str(gaps_parquet_path), compression="SNAPPY")
+        gaps_sha = hashlib.sha256(gaps_parquet_path.read_bytes()).hexdigest()
+        all_shards.append({
+            "path": gaps_parquet_name,
+            "sha256": gaps_sha,
+            "type": "gaps",
+            "rows": len(gap_records),
+            "bytes": gaps_parquet_path.stat().st_size,
+        })
+
+    # Write gaps.json
+    gaps_summary = {
+        "snapshot_id": config.name,
+        "total_gaps": len(gap_records),
+        "unresolved_count": unresolved_count,
+        "terminal_gap_count": terminal_gap_count,
+        "source_scope": source_scope,
+        "gap_counts_by_reason": dict(Counter(g["reason"] for g in gap_records)),
+    }
+    with open(snapshot_dir / "gaps.json", "w", encoding="utf-8") as f:
+        json.dump(gaps_summary, f, indent=2, ensure_ascii=False)
+
     # Calculate fingerprints and metadata
     created_at = datetime.now(timezone.utc).isoformat()
     ingest_state = registry.get_ingest_state()
@@ -445,8 +573,7 @@ def build_snapshot(
     if queries_path and Path(queries_path).exists():
         queries_sha256 = hashlib.sha256(Path(queries_path).read_bytes()).hexdigest()
 
-    membership_repr = "".join(f"{doc_id}\n" for doc_id in sorted(ready_doc_ids)).encode("utf-8")
-    source_membership_sha256 = hashlib.sha256(membership_repr).hexdigest()
+    source_membership_sha256 = membership_hasher.hexdigest()
 
     extractor_fingerprint = hashlib.sha256(
         f"{ext_cfg.html_backend}:{ext_cfg.pdf_backend}:{ext_cfg.language_confidence_min}".encode("utf-8")
@@ -466,12 +593,14 @@ def build_snapshot(
         source_membership_sha256=source_membership_sha256,
         extractor_fingerprint=extractor_fingerprint,
         chunker_fingerprint=chunker_fingerprint,
-        source_count=len(all_registered_doc_ids),
-        ready_document_count=len(ready_doc_ids),
+        source_count=source_count,
+        ready_document_count=ready_document_count,
         chunk_count=chunk_count,
         language_counts=dict(language_counts),
         quarantine_counts=dict(quarantine_counts),
         shard_paths_and_hashes=all_shards,
+        source_scope=source_scope,
+        gap_count=len(gap_records),
     )
 
     # Publish manifest atomically last
@@ -482,8 +611,8 @@ def build_snapshot(
     manifest_tmp.replace(manifest_final)
 
     logger.info(
-        f"Snapshot '{config.name}' published successfully: {len(ready_doc_ids)} docs, "
-        f"{chunk_count} chunks across {len(all_shards)} shards."
+        f"Snapshot '{config.name}' published successfully: {ready_document_count} docs, "
+        f"{chunk_count} chunks across {len(all_shards)} shards (scope: {source_scope}, gaps: {len(gap_records)})."
     )
 
     return manifest

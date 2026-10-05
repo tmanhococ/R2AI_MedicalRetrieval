@@ -199,6 +199,8 @@ class ViBioMIRAdapter:
             language_counts=m_data["language_counts"],
             quarantine_counts=m_data["quarantine_counts"],
             shard_paths_and_hashes=m_data["shard_paths_and_hashes"],
+            source_scope=m_data.get("source_scope"),
+            gap_count=m_data.get("gap_count", 0),
         )
 
         self.queries_path = Path(queries_path) if queries_path is not None else None
