@@ -22,3 +22,4 @@ Task 7: minor (deferred): In src/cli/generate_candidates.py, remove redundant tr
 Task 7: complete (commits 66b9b69..9fa13d2, review clean)
 Task 8: complete (commits f722f07..70266dc, review clean)
 Task 9: complete (commits 88aed98..b5bc32f, review clean)
+Task 10: complete (commits 2684c27..b7d06ec, review clean)
