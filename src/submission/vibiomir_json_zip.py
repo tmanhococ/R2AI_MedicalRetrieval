@@ -57,10 +57,13 @@ class VibiomirExporter:
     def export(
         self,
         predictions: Sequence[FinalPrediction],
-        arg2: Sequence[OfficialQuery] | Path | str,
+        arg2: Sequence[OfficialQuery] | Path | str | None = None,
         arg3: SourceStore | Path | str | None = None,
         output_dir: Path | str | None = None,
         expected_count: int | None = None,
+        *,
+        queries: Sequence[OfficialQuery] | None = None,
+        store: SourceStore | None = None,
     ) -> Path | ExportResult:
         """Translates predictions, validates all contracts, and writes submission files atomically.
 
@@ -68,6 +71,11 @@ class VibiomirExporter:
         - Protocol: export(predictions, output_path)
         - Direct: export(predictions, queries, store, output_dir, expected_count)
         """
+        if queries is not None:
+            arg2 = queries
+        if store is not None:
+            arg3 = store
+
         if isinstance(arg2, (str, Path)) or hasattr(arg2, "suffix") or (arg3 is not None and not isinstance(arg3, SourceStore) and not hasattr(arg3, "get_document")):
             # Called via protocol: export(predictions, output_path)
             output_path = arg2
