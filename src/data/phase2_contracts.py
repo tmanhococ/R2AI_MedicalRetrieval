@@ -56,6 +56,57 @@ class CoverageLedger:
     registry_hash: str
     snapshot_id: str
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "official_count": self.official_count,
+            "unique_url_count": self.unique_url_count,
+            "ready_doc_count": self.ready_doc_count,
+            "terminal_gap_count": self.terminal_gap_count,
+            "unresolved_count": self.unresolved_count,
+            "chunk_count": self.chunk_count,
+            "sparse_doc_count": self.sparse_doc_count,
+            "sparse_chunk_count": self.sparse_chunk_count,
+            "dense_row_count": self.dense_row_count,
+            "source_scope": self.source_scope,
+            "registry_hash": self.registry_hash,
+            "snapshot_id": self.snapshot_id,
+        }
+
+
+class ScopeViolationError(ValueError):
+    """Raised when coverage invariants or scope requirements are violated."""
+
+
+# Recognized scope labels in ViBioMIR Phase 2
+SCOPE_PARTIAL_BODY_INDEX = "PARTIAL_BODY_INDEX"
+SCOPE_FULL_SOURCE_PASS_WITH_GAPS = "FULL_SOURCE_PASS_WITH_GAPS"
+SCOPE_FULL_BODY_INDEX = "FULL_BODY_INDEX"
+SCOPE_FULL_HYBRID_WITH_GAPS = "FULL_HYBRID_WITH_GAPS"
+SCOPE_FULL_HYBRID = "FULL_HYBRID"
+
+VALID_SCOPES = (
+    SCOPE_PARTIAL_BODY_INDEX,
+    SCOPE_FULL_SOURCE_PASS_WITH_GAPS,
+    SCOPE_FULL_BODY_INDEX,
+    SCOPE_FULL_HYBRID_WITH_GAPS,
+    SCOPE_FULL_HYBRID,
+)
+
+
+@dataclass
+class IndexManifest:
+    """Manifest describing an assembled sparse or dense index artifact."""
+    snapshot_id: str
+    item_type: str
+    language: str
+    member_count: int
+    membership_sha256: str
+    backend: str
+    model_fingerprint: str | None
+    tokenizer_fingerprint: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    artifact_paths_and_hashes: dict[str, str] = field(default_factory=dict)
+
 
 @dataclass
 class EmbeddingBlock:
