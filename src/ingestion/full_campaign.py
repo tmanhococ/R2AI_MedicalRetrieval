@@ -76,8 +76,8 @@ def recover_expired_leases(
         return cursor.rowcount
 
 
-def _is_minor_or_multilingual_domain(domain: str, url: str) -> bool:
-    """Detects if a URL/domain corresponds to international or non-VI sources."""
+def _is_multilingual_source(domain: str, url: str) -> bool:
+    """Detects if a URL/domain corresponds to international or non-VI (EN/ZH) sources."""
     d = domain.lower()
     u = url.lower()
     if any(k in d for k in ("ncbi", "who.int", "nih.gov", "cdc.gov", "pubmed", "cochrane", "thelancet")):
@@ -86,19 +86,22 @@ def _is_minor_or_multilingual_domain(domain: str, url: str) -> bool:
         return True
     if any(k in u for k in ("/en/", "/zh/", "/english/", "lang=en", "lang=zh")):
         return True
-    if not (d.endswith(".vn") or "vn" in d or "viet" in d):
-        return True
     return False
 
 
-def plan_full_campaign(registry: SourceRegistry, config: FullCampaignConfig) -> str:
+def plan_full_campaign(
+    registry: SourceRegistry,
+    config: FullCampaignConfig,
+    campaign_id: str | None = None,
+    recover_all_inflight: bool = True,
+) -> str:
     """Plans full acquisition campaign with lease recovery, domain fair scheduling, and anti-starvation."""
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
-    campaign_id = f"campaign_{now_dt.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    cid = campaign_id or f"campaign_{now_dt.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
-    # 1. Recover expired leases
-    recover_expired_leases(registry, now=now_dt)
+    # 1. Recover inflight/expired leases
+    recover_expired_leases(registry, now=now_dt, recover_all_inflight=recover_all_inflight)
 
     # 2. Determine campaign scope
     if config.source_limit is not None or (config.domain_whitelist and len(config.domain_whitelist) > 0) or config.scope != "all":
@@ -130,12 +133,12 @@ def plan_full_campaign(registry: SourceRegistry, config: FullCampaignConfig) -> 
 
     # Sort domains by volume (smaller domains first for tie-breaking)
     sorted_domains = sorted(domain_jobs.keys(), key=lambda d: len(domain_jobs[d]))
-    minor_domains = {d for d in sorted_domains if len(domain_jobs[d]) <= 50}
+    max_domain_len = max((len(jobs) for jobs in domain_jobs.values()), default=0)
+    minor_threshold = min(50, max(5, max_domain_len // 3))
+    minor_domains = {d for d in sorted_domains if len(domain_jobs[d]) <= minor_threshold}
 
     # Interleave jobs in rounds: round 0 takes 1st URL from each domain, round 1 takes 2nd, etc.
-    # Anti-starvation: Minor domains and EN/ZH get higher priority within each round
     updates: list[tuple[str, int, str]] = []
-    max_domain_len = max((len(jobs) for jobs in domain_jobs.values()), default=0)
 
     for round_idx in range(max_domain_len):
         for domain in sorted_domains:
@@ -143,13 +146,14 @@ def plan_full_campaign(registry: SourceRegistry, config: FullCampaignConfig) -> 
             if round_idx < len(jobs):
                 job_id = jobs[round_idx]
                 url = job_urls[job_id]
-                # Lower integer = higher scheduling priority
-                base_prio = round_idx * 10
-                if _is_minor_or_multilingual_domain(domain, url):
-                    base_prio = max(0, base_prio - 2)
+                base_prio = round_idx * 10 + 2
+                if _is_multilingual_source(domain, url):
+                    prio = base_prio - 2
                 elif domain in minor_domains:
-                    base_prio = max(0, base_prio - 1)
-                updates.append((campaign_id, base_prio, job_id))
+                    prio = base_prio - 1
+                else:
+                    prio = base_prio
+                updates.append((cid, prio, job_id))
 
     # Batch update priority and campaign_id
     batch_size = 5000
@@ -168,10 +172,10 @@ def plan_full_campaign(registry: SourceRegistry, config: FullCampaignConfig) -> 
             INSERT OR REPLACE INTO campaigns (campaign_id, scope, config_json, created_at, status)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (campaign_id, campaign_scope, json.dumps(config_dict), now_iso, "planned"),
+            (cid, campaign_scope, json.dumps(config_dict), now_iso, "planned"),
         )
 
-    return campaign_id
+    return cid
 
 
 def import_content_cache(
@@ -211,6 +215,12 @@ def import_content_cache(
             continue
 
         stem = path.stem
+        # Handle double extensions such as doc_id.html.gz or job_id.html.gz
+        if path.name.endswith(".gz") and "." in stem:
+            inner_stem = Path(stem).stem
+            if inner_stem.isdigit() or len(inner_stem) == 64:
+                stem = inner_stem
+
         # Try matching by doc_id
         target_job_id: str | None = None
         target_url: str | None = None
@@ -246,8 +256,11 @@ def import_content_cache(
             logger.debug(f"Rejecting empty cache content for {target_url} at {path}")
             continue
 
-        # Look for companion metadata JSON
-        meta_path = path.with_suffix(".json")
+        # Look for companion metadata JSON (check both direct and stem-based)
+        meta_path = path.parent / f"{stem}.json"
+        if not meta_path.exists():
+            meta_path = path.with_suffix(".json")
+
         mime_type = "text/html; charset=utf-8"
         final_url = target_url
         http_status = 200

@@ -62,7 +62,20 @@ def run_full_crawl_cli(
                 imported = import_content_cache(registry=registry, cache_dir=c_path, raw_dir=raw_path)
                 logger.info(f"Imported {imported} items from content cache at {c_path}")
 
-        # 2. Plan full acquisition campaign
+        # 2. Plan or resume full acquisition campaign
+        campaign_id: str | None = None
+        if resume:
+            row = registry.conn.execute(
+                """
+                SELECT campaign_id, scope, config_json
+                FROM campaigns
+                ORDER BY created_at DESC LIMIT 1
+                """
+            ).fetchone()
+            if row:
+                campaign_id = row[0]
+                logger.info(f"Resuming existing campaign: {campaign_id}")
+
         camp_cfg = full_campaign_config or FullCampaignConfig(
             scope=scope,
             source_limit=limit,
@@ -70,8 +83,13 @@ def run_full_crawl_cli(
             priority_changes_order_only=True,
         )
 
-        campaign_id = plan_full_campaign(registry=registry, config=camp_cfg)
-        logger.info(f"Planned acquisition campaign: {campaign_id} (scope={camp_cfg.scope})")
+        campaign_id = plan_full_campaign(
+            registry=registry,
+            config=camp_cfg,
+            campaign_id=campaign_id,
+            recover_all_inflight=True,
+        )
+        logger.info(f"Active acquisition campaign: {campaign_id} (scope={camp_cfg.scope})")
 
         # 3. Run crawl loop until no pending / retry_wait remain (or limit reached)
         report: CrawlReport | None = None
@@ -94,21 +112,27 @@ def run_full_crawl_cli(
                 f"\nCrawling interrupted by user. Campaign {campaign_id} state preserved. "
                 f"Resume with: python -m src.cli.crawl_full --resume"
             )
-            # Fetch partial report
+            # Query actual progress from registry
+            counts = {
+                r[0]: r[1]
+                for r in registry.conn.execute(
+                    "SELECT state, count(*) FROM fetch_jobs GROUP BY state"
+                ).fetchall()
+            }
             report = CrawlReport(
-                leased=0,
-                fetched=0,
-                retry_wait=0,
-                failed=0,
-                blocked=0,
-                unsupported=0,
+                leased=counts.get("fetching", 0) + counts.get("leased", 0),
+                fetched=counts.get("fetched", 0),
+                retry_wait=counts.get("retry_wait", 0),
+                failed=counts.get("fetch_failed", 0),
+                blocked=counts.get("blocked", 0),
+                unsupported=counts.get("unsupported", 0),
                 bytes_written=0,
             )
 
         # 4. Record status in campaigns table
         with registry.conn:
             remaining_pending = registry.conn.execute(
-                "SELECT count(*) FROM fetch_jobs WHERE state IN ('pending', 'retry_wait')"
+                "SELECT count(*) FROM fetch_jobs WHERE state IN ('pending', 'retry_wait', 'fetching', 'leased')"
             ).fetchone()[0]
             status_str = "interrupted" if interrupted else ("completed" if remaining_pending == 0 else "partial")
             registry.conn.execute(

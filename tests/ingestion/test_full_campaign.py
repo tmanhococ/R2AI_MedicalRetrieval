@@ -21,6 +21,7 @@ from src.ingestion.full_campaign import (
     import_content_cache,
     plan_full_campaign,
     recover_expired_leases,
+    run_batch_extraction,
     run_full_campaign_crawl,
 )
 from src.cli.crawl_full import run_full_crawl_cli
@@ -449,5 +450,219 @@ async def test_5k_scale_smoke_and_throughput(tmp_path: Path):
     estimated_full_corpus_gb = (avg_bytes_per_doc * 4394718) / (1024**3)
     assert avg_bytes_per_doc > 0
     assert estimated_full_corpus_gb > 0
+
+    registry.close()
+
+
+def test_round_zero_priority_boost(tmp_path: Path):
+    """Round 0 guarantees distinct scheduling priorities for multilingual (0), minor (1), and major (2)."""
+    reg_path = tmp_path / "registry.sqlite"
+    registry = SourceRegistry(reg_path)
+    sources = _make_sample_sources()
+    ingest_sources(sources, registry)
+
+    cfg = FullCampaignConfig(scope="all")
+    cid = plan_full_campaign(registry, cfg)
+
+    # In round 0, multilingual URL should have priority 0
+    ncbi_job_id = hashlib.sha256("https://ncbi.nlm.nih.gov/pmc/articles/PMC123456/".encode("utf-8")).hexdigest()
+    clinic_job_id = hashlib.sha256("https://small-clinic.org/page/1".encode("utf-8")).hexdigest()
+    hospital_job_id = hashlib.sha256("https://large-hospital.vn/article/1".encode("utf-8")).hexdigest()
+
+    ncbi_job = registry.get_fetch_job(ncbi_job_id)
+    clinic_job = registry.get_fetch_job(clinic_job_id)
+    hospital_job = registry.get_fetch_job(hospital_job_id)
+
+    assert ncbi_job["priority"] == 0
+    assert clinic_job["priority"] == 1
+    assert hospital_job["priority"] == 2
+
+    registry.close()
+
+
+def test_resume_cli_reuses_existing_campaign_and_recovers_inflight_leases(tmp_path: Path):
+    """Running CLI with --resume reuses previous campaign_id, recovers in-flight leases, and completes."""
+    from datetime import timedelta
+    reg_path = tmp_path / "registry.sqlite"
+    raw_root = tmp_path / "raw"
+    registry = SourceRegistry(reg_path)
+
+    sources = [
+        OfficialSource(doc_id=1, url="https://example.com/item1"),
+        OfficialSource(doc_id=2, url="https://example.com/item2"),
+    ]
+    ingest_sources(sources, registry)
+
+    # Initial campaign planned
+    cfg = FullCampaignConfig(scope="all")
+    orig_cid = plan_full_campaign(registry, cfg)
+
+    # Simulate in-flight lease with lease_until in the future (within 120s)
+    future_iso = (datetime.now(timezone.utc) + timedelta(seconds=100)).isoformat()
+    job1_id = hashlib.sha256("https://example.com/item1".encode("utf-8")).hexdigest()
+    with registry.conn:
+        registry.conn.execute(
+            "UPDATE fetch_jobs SET state = 'fetching', lease_until = ? WHERE job_id = ?",
+            (future_iso, job1_id),
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html><body>Test</body></html>", headers={"Content-Type": "text/html"})
+
+    # Run CLI with resume=True
+    report = run_full_crawl_cli(
+        registry_path=reg_path,
+        raw_root=raw_root,
+        scope="all",
+        resume=True,
+        test_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    # Verified: reused orig_cid and fetched both jobs
+    assert report.fetched == 2
+    row = registry.conn.execute(
+        "SELECT status FROM campaigns WHERE campaign_id = ?", (orig_cid,)
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "completed"
+
+    registry.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_wait_matured_continuation(tmp_path: Path):
+    """When a retry_wait job backoff is already matured (diff <= 0), crawl loop does not prematurely terminate."""
+    from datetime import timedelta
+    reg_path = tmp_path / "registry.sqlite"
+    raw_root = tmp_path / "raw"
+    registry = SourceRegistry(reg_path)
+
+    sources = [
+        OfficialSource(doc_id=1, url="https://example.com/retry_ready"),
+    ]
+    ingest_sources(sources, registry)
+
+    # Put job in retry_wait with past retry_at
+    past_iso = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+    job_id = hashlib.sha256("https://example.com/retry_ready".encode("utf-8")).hexdigest()
+    with registry.conn:
+        registry.conn.execute(
+            "UPDATE fetch_jobs SET state = 'retry_wait', retry_at = ? WHERE job_id = ?",
+            (past_iso, job_id),
+        )
+
+    cfg = FullCampaignConfig(scope="all")
+    cid = plan_full_campaign(registry, cfg)
+
+    crawl_cfg = CrawlConfig(raw_root=raw_root, min_domain_interval_seconds=0.0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html><body>Retry success</body></html>", headers={"Content-Type": "text/html"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        report = await run_full_campaign_crawl(
+            registry=registry,
+            campaign_id=cid,
+            config=crawl_cfg,
+            client=client,
+            wait_for_retry=True,
+        )
+
+    assert report.fetched == 1
+    assert report.failed == 0
+
+    job_rec = registry.get_fetch_job(job_id)
+    assert job_rec["state"] == "fetched"
+
+    registry.close()
+
+
+def test_run_batch_extraction_integration(tmp_path: Path):
+    """run_batch_extraction extracts fetched documents and produces quality classified report."""
+    reg_path = tmp_path / "registry.sqlite"
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    registry = SourceRegistry(reg_path)
+
+    sources = [
+        OfficialSource(doc_id=1, url="https://example.com/doc1"),
+        OfficialSource(doc_id=2, url="https://example.com/doc2"),
+    ]
+    ingest_sources(sources, registry)
+
+    # 1. Valid Vietnamese HTML
+    doc1_content = (
+        b"<!DOCTYPE html><html><head><title>Dieu tri viem hong</title></head>"
+        b"<body><article><h1>Viem hong cap tinh</h1>"
+        b"<p>Viem hong cap la benh pho bien o tre em va nguoi lon. "
+        b"Trieu chung thuong gap la dau hong, sot, kho nuot va ho khan. "
+        b"Can nghi ngoi day du va uong nhieu nuoc am de phuc hoi suc khoe nhanh chong.</p>"
+        b"</article></body></html>"
+    )
+    sha1 = hashlib.sha256(doc1_content).hexdigest()
+    file1 = raw_root / sha1[:2] / f"{sha1}.gz"
+    file1.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(file1, "wb") as gf:
+        gf.write(doc1_content)
+
+    # 2. Corrupt/empty raw HTML
+    doc2_content = b"<html><body></body></html>"
+    sha2 = hashlib.sha256(doc2_content).hexdigest()
+    file2 = raw_root / sha2[:2] / f"{sha2}.gz"
+    file2.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(file2, "wb") as gf:
+        gf.write(doc2_content)
+
+    with registry.conn:
+        registry.conn.execute(
+            """
+            UPDATE fetch_jobs
+            SET state = 'fetched', raw_path = ?, raw_sha256 = ?, mime_type = 'text/html'
+            WHERE job_id = ?
+            """,
+            (str(file1), sha1, hashlib.sha256("https://example.com/doc1".encode("utf-8")).hexdigest()),
+        )
+        registry.conn.execute(
+            """
+            UPDATE fetch_jobs
+            SET state = 'fetched', raw_path = ?, raw_sha256 = ?, mime_type = 'text/html'
+            WHERE job_id = ?
+            """,
+            (str(file2), sha2, hashlib.sha256("https://example.com/doc2".encode("utf-8")).hexdigest()),
+        )
+
+    report = run_batch_extraction(registry=registry, raw_root=raw_root)
+    assert report.attempted == 2
+    assert report.ready >= 1
+    assert (report.quarantined + report.failed) >= 1
+
+    registry.close()
+
+
+def test_content_cache_import_double_extensions(tmp_path: Path):
+    """import_content_cache resolves double extension files like doc_id.html.gz and companion json."""
+    reg_path = tmp_path / "registry.sqlite"
+    raw_root = tmp_path / "raw"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    registry = SourceRegistry(reg_path)
+
+    sources = [
+        OfficialSource(doc_id=888, url="https://example.com/double_ext_doc"),
+    ]
+    ingest_sources(sources, registry)
+
+    raw_data = b"<html><body>Data from double extension cache</body></html>"
+    gz_file = cache_dir / "888.html.gz"
+    with gzip.open(gz_file, "wb") as gf:
+        gf.write(raw_data)
+
+    imported = import_content_cache(registry=registry, cache_dir=cache_dir, raw_dir=raw_root)
+    assert imported == 1
+
+    job_id = hashlib.sha256("https://example.com/double_ext_doc".encode("utf-8")).hexdigest()
+    rec = registry.get_fetch_job(job_id)
+    assert rec["state"] == "fetched"
+    assert Path(rec["raw_path"]).exists()
 
     registry.close()

@@ -162,14 +162,21 @@ async def _run_crawl_with_client(
                 row = registry.conn.execute(
                     "SELECT min(retry_at) FROM fetch_jobs WHERE state = 'retry_wait'"
                 ).fetchone()
-                if row and row[0]:
+                has_retry_jobs = bool(
+                    (row and row[0] is not None)
+                    or registry.conn.execute(
+                        "SELECT 1 FROM fetch_jobs WHERE state = 'retry_wait' LIMIT 1"
+                    ).fetchone()
+                )
+                if has_retry_jobs:
                     try:
-                        earliest = datetime.fromisoformat(row[0])
-                        now_dt = datetime.now(timezone.utc)
-                        diff = (earliest - now_dt).total_seconds()
-                        if diff > 0:
-                            await asyncio.sleep(min(diff + 0.1, 5.0))
-                            continue
+                        if row and row[0]:
+                            earliest = datetime.fromisoformat(row[0])
+                            now_dt = datetime.now(timezone.utc)
+                            diff = (earliest - now_dt).total_seconds()
+                            if diff > 0:
+                                await asyncio.sleep(min(diff + 0.1, 5.0))
+                        continue
                     except Exception:
                         pass
             break

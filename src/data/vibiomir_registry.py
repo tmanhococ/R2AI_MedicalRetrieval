@@ -91,6 +91,12 @@ class SourceRegistry:
             )
             self.conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_fetch_jobs_state_prio_att
+                ON fetch_jobs(state, priority, attempts);
+                """
+            )
+            self.conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS ingest_state (
                     input_sha256 TEXT PRIMARY KEY,
                     last_committed_row INTEGER NOT NULL,
@@ -496,7 +502,7 @@ class SourceRegistry:
             """
             SELECT job_id, url, state, attempts, lease_until, retry_at,
                    raw_path, raw_sha256, http_status, mime_type, final_url,
-                   error_code, created_at, updated_at
+                   error_code, campaign_id, priority, created_at, updated_at
             FROM fetch_jobs
             WHERE job_id = ?
             """,
