@@ -43,7 +43,7 @@ class OfficialSourceIterator:
             self._sha256 = compute_file_sha256(self.path)
         return self._sha256
 
-    def __iter__(self) -> Iterator[OfficialSource]:
+    def _generate_sources(self) -> Iterator[OfficialSource]:
         parquet_file = pq.ParquetFile(self.path)
         schema = parquet_file.schema_arrow
 
@@ -84,6 +84,15 @@ class OfficialSourceIterator:
                     raise ValueError(f"url must be non-empty string, got {raw_url!r}")
 
                 yield OfficialSource(doc_id=raw_id, url=raw_url.strip())
+
+    def __iter__(self) -> Iterator[OfficialSource]:
+        self._active_iter = self._generate_sources()
+        return self
+
+    def __next__(self) -> OfficialSource:
+        if not hasattr(self, "_active_iter") or self._active_iter is None:
+            self._active_iter = self._generate_sources()
+        return next(self._active_iter)
 
 
 def iter_official_sources(

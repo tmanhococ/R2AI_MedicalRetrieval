@@ -88,6 +88,9 @@ class VibiomirExporter:
         # Index predictions and validate internal to official mapping
         for fp in predictions:
             # 1. Resolve query ID to signed int64
+            if isinstance(fp.query_id, bool):
+                pre_errors.append(f"Prediction query_id cannot be boolean: {fp.query_id!r}")
+                continue
             try:
                 qid_val = int(fp.query_id)
                 if not (INT64_MIN <= qid_val <= INT64_MAX):
@@ -99,6 +102,11 @@ class VibiomirExporter:
             # 2. Resolve document IDs to signed int64
             rel_docs: list[int] = []
             for raw_doc_id in fp.document_ids:
+                if isinstance(raw_doc_id, bool):
+                    pre_errors.append(
+                        f"Query {qid_val}: doc_id cannot be boolean: {raw_doc_id!r}"
+                    )
+                    continue
                 try:
                     did_val = int(raw_doc_id)
                     if not (INT64_MIN <= did_val <= INT64_MAX):

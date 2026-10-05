@@ -93,6 +93,12 @@ def validate_predictions(
             errors.append(f"Row at index {idx} missing required key 'id'")
             continue
 
+        extra_row_keys = set(row.keys()) - {"id", "relevant_docs", "relevant_chunks"}
+        if extra_row_keys:
+            errors.append(
+                f"Row at index {idx} (query ID {row.get('id')!r}): unauthorized extra keys {sorted(extra_row_keys)}"
+            )
+
         raw_id = row["id"]
         if not _is_int64(raw_id):
             errors.append(
@@ -150,6 +156,12 @@ def validate_predictions(
                         f"Query {query_id}: relevant_chunks[{chunk_idx}] must be dict, got {type(chunk).__name__}"
                     )
                     continue
+
+                extra_chunk_keys = set(chunk.keys()) - {"doc_id", "chunk_text", "chunk_order"}
+                if extra_chunk_keys:
+                    errors.append(
+                        f"Query {query_id}: relevant_chunks[{chunk_idx}] contains unauthorized extra keys {sorted(extra_chunk_keys)}"
+                    )
 
                 # doc_id in chunk
                 if "doc_id" not in chunk:

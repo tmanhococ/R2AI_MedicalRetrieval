@@ -35,7 +35,11 @@ class RobotsManager:
         robots_url = f"{origin}/robots.txt"
         rp: urllib.robotparser.RobotFileParser | None = None
         try:
-            resp = await client.get(robots_url, follow_redirects=True)
+            resp = await client.get(
+                robots_url,
+                headers={"User-Agent": self.user_agent},
+                follow_redirects=True,
+            )
             if resp.status_code == 200:
                 rp = urllib.robotparser.RobotFileParser()
                 rp.parse(resp.text.splitlines())
@@ -206,5 +210,9 @@ async def run_crawl(
         write=10.0,
         pool=10.0,
     )
-    async with httpx.AsyncClient(limits=limits, timeout=timeouts) as managed_client:
+    async with httpx.AsyncClient(
+        limits=limits,
+        timeout=timeouts,
+        max_redirects=config.max_redirects,
+    ) as managed_client:
         return await _run_crawl_with_client(registry, config, managed_client, limit, job_ids=job_ids)

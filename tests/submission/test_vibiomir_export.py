@@ -603,3 +603,69 @@ def test_exporter_rejects_tampered_chunk_provenance(tmp_path: Path, store_and_qu
         exporter.export(predictions, queries, store, tmp_path / "export_fail2")
     assert exc_info.value.report.valid is False
     assert any("provenance" in err.lower() or "mismatch" in err.lower() or "source" in err.lower() for err in exc_info.value.report.errors)
+
+
+def test_exporter_rejects_boolean_query_id_and_doc_id(tmp_path: Path, store_and_queries):
+    store, queries, chunk1, _ = store_and_queries
+    # Boolean query_id
+    predictions_bool_qid = [
+        FinalPrediction(
+            query_id=True,
+            document_ids=["583"],
+            chunk_ids=[chunk1.chunk_id],
+            document_scores={"583": 0.9},
+            chunk_scores={chunk1.chunk_id: 0.9},
+        ),
+        FinalPrediction(query_id="2", document_ids=[], chunk_ids=[], document_scores={}, chunk_scores={}),
+    ]
+    exporter = VibiomirExporter()
+    with pytest.raises(SubmissionValidationError) as exc:
+        exporter.export(predictions_bool_qid, queries, store, tmp_path / "exp_bool_q")
+    assert any("boolean" in err.lower() for err in exc.value.report.errors)
+
+    # Boolean doc_id
+    predictions_bool_did = [
+        FinalPrediction(
+            query_id="1",
+            document_ids=[True],
+            chunk_ids=[chunk1.chunk_id],
+            document_scores={"True": 0.9},
+            chunk_scores={chunk1.chunk_id: 0.9},
+        ),
+        FinalPrediction(query_id="2", document_ids=[], chunk_ids=[], document_scores={}, chunk_scores={}),
+    ]
+    with pytest.raises(SubmissionValidationError) as exc:
+        exporter.export(predictions_bool_did, queries, store, tmp_path / "exp_bool_d")
+    assert any("boolean" in err.lower() for err in exc.value.report.errors)
+
+
+def test_validator_rejects_unauthorized_extra_keys_in_row_and_chunk(store_and_queries):
+    store, queries, _, _ = store_and_queries
+    # Extra key in row
+    rows_extra_row_key = [
+        {"id": 1, "relevant_docs": [583], "relevant_chunks": [], "score": 0.95},
+        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
+    ]
+    report1 = validate_predictions(rows_extra_row_key, queries, store)
+    assert report1.valid is False
+    assert any("unauthorized extra keys" in err.lower() and "score" in err.lower() for err in report1.errors)
+
+    # Extra key in chunk
+    rows_extra_chunk_key = [
+        {
+            "id": 1,
+            "relevant_docs": [583],
+            "relevant_chunks": [
+                {
+                    "doc_id": 583,
+                    "chunk_text": "Bệnh viện Bạch Mai là bệnh viện đa khoa hoàn chỉnh",
+                    "chunk_order": 0,
+                    "confidence_score": 0.99,
+                }
+            ],
+        },
+        {"id": 2, "relevant_docs": [], "relevant_chunks": []},
+    ]
+    report2 = validate_predictions(rows_extra_chunk_key, queries, store)
+    assert report2.valid is False
+    assert any("unauthorized extra keys" in err.lower() and "confidence_score" in err.lower() for err in report2.errors)

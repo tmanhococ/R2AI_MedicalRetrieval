@@ -237,6 +237,11 @@ def pack_reranker_inputs(
             input_ids = toks
             attention_mask = [1] * len(toks)
 
+        # Strict clamp guard: guarantee input_ids and attention_mask never exceed max_length
+        if len(input_ids) > max_length:
+            input_ids = input_ids[:max_length]
+            attention_mask = attention_mask[:max_length]
+
         packed_pairs.append(
             PackedPair(
                 query_text=w_text,
