@@ -95,6 +95,11 @@ class RetrievalOrchestrator:
                 return None
             return query_variants.zh.strip()
 
+        elif stream_name == "und_bm25":
+            if not query_variants.vi or not query_variants.vi.strip():
+                return None
+            return query_variants.vi.strip()
+
         return None
 
     def _invoke_retriever(

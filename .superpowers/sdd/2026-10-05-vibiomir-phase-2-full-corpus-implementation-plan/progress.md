@@ -15,3 +15,4 @@ Task 2: fix round 1/5 (5 addressed, 0 open — retry loop, inflight leases, resu
 Task 2: complete (commits f3e77e2..ccf271c, review clean)
 Task 3: fix round 1/5 (3 addressed, 0 open — token budget re-chunking, thread-safe LRU cache, span bounds validation; commits b4e1b03..788c276)
 Task 3: complete (commits ccf271c..788c276, review clean)
+Task 4: complete (commits 788c276..9e990c1, review clean)

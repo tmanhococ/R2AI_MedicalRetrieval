@@ -45,6 +45,14 @@ class SearchHit:
     raw_score: float
     rank: int
 
+    @property
+    def id(self) -> str:
+        return self.item_id
+
+    @property
+    def score(self) -> float:
+        return self.raw_score
+
 
 @dataclass(frozen=True)
 class FusedHit:

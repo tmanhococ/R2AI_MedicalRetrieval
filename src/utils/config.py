@@ -7,10 +7,19 @@ import yaml
 
 ALLOWED_CONFIG_SECTIONS = {
     "run": {
-        "experiment_name", "seed", "output_dir"
+        "experiment_name", "seed", "output_dir", "require_real_models"
     },
     "dataset": {
-        "adapter", "query_path", "source_path", "expected_query_count", "registry_path", "dir"
+        "adapter", "query_path", "source_path", "expected_query_count", "registry_path", "dir",
+        "expected_official_count", "verify_actual_counts", "scope", "accepted_languages"
+    },
+    "campaign": {
+        "scope", "domain_whitelist", "source_limit", "reuse_existing_content",
+        "require_no_unresolved_sources", "priority_changes_order_only"
+    },
+    "resources": {
+        "embedding_start_batch", "reranker_start_batch", "oom_min_batch",
+        "concurrent_gpu_models", "java_heap", "row_group_cache_bytes", "disk_reserve_fraction"
     },
     "crawl": {
         "concurrency", "per_domain_concurrency", "min_domain_interval_seconds",
@@ -30,15 +39,23 @@ ALLOWED_CONFIG_SECTIONS = {
         "normalize", "adaptive_routing", "translation"
     },
     "retrieval": {
-        "candidate_top_k", "bm25", "dense"
+        "candidate_top_k", "bm25", "dense", "sparse", "candidate_docs"
     },
     "fusion": {
-        "method", "rrf_k", "weights"
+        "method", "rrf_k", "weights", "family_weights", "group_correlated_dense_variants"
+    },
+    "evidence": {
+        "document_top_k", "base_windows_per_doc", "base_spans_per_query_max",
+        "scan_all_chunks_in_candidate_doc", "neighbor_blocks", "expanded_soft_target_tokens",
+        "expansion_logit_tolerance", "require_positive_neighbor", "dedup_span_overlap",
+        "preserve_source_offsets"
     },
     "reranker": {
         "enabled", "model_name", "document_strategy", "document_top_k",
         "chunk_top_k", "batch_size", "max_length", "query_window_tokens",
-        "query_window_overlap_tokens", "query_window_aggregation", "body_truncation"
+        "query_window_overlap_tokens", "query_window_aggregation", "body_truncation",
+        "passage_window_tokens", "query_window_overlap", "window_aggregation",
+        "use_raw_logits", "require_real_weights"
     },
     "joint_scoring": {
         "document", "chunk"
@@ -54,9 +71,19 @@ ALLOWED_CONFIG_SECTIONS = {
         "metric", "beta", "policies", "bounds", "fit_enabled",
         "fallback_policy", "fixed_top_k"
     },
+    "output": {
+        "fit_only_allowed_dev", "fallback_policy", "fallback_raw_logit_min",
+        "min_results", "document_cap", "evidence_cap", "evidence_cap_per_doc",
+        "fixed_count_validation"
+    },
+    "ann_audit": {
+        "sample_queries", "full_audit_queries", "top_k", "candidate_retention_min"
+    },
     "submission": {
         "exporter", "doc_id_type", "emit_chunk_order", "json_filename",
-        "zip_filename", "provenance_check"
+        "zip_filename", "provenance_check", "require_scope",
+        "require_complete_sparse_membership", "require_complete_dense_membership",
+        "require_completed_queries", "report_terminal_gaps"
     }
 }
 
