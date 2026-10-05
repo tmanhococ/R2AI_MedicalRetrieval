@@ -17,3 +17,4 @@ Task 3: fix round 1/5 (3 addressed, 0 open — token budget re-chunking, thread-
 Task 3: complete (commits ccf271c..788c276, review clean)
 Task 4: complete (commits 788c276..9e990c1, review clean)
 Task 5: complete (commits 77dcae9..54b8629, review clean)
+Task 6: complete (commits f57b7fb..83c916b, review clean)
