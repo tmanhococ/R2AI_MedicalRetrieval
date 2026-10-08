@@ -223,16 +223,11 @@ def main(args: list[str] | None = None) -> None:
     if config_file and config_file.exists():
         cfg = load_config(config_file)
 
-    reg_path = (
-        parsed.registry_path
-        or (Path(cfg.get("dataset", {}).get("registry_path")) if "dataset" in cfg else None)
-        or Path("artifacts/vibiomir/registry.sqlite")
-    )
-    raw_root = (
-        parsed.raw_root
-        or (Path(cfg.get("crawl", {}).get("raw_root")) if "crawl" in cfg else None)
-        or Path("artifacts/vibiomir/raw")
-    )
+    reg_val = cfg.get("dataset", {}).get("registry_path") if "dataset" in cfg else None
+    raw_val = cfg.get("crawl", {}).get("raw_root") if "crawl" in cfg else None
+
+    reg_path = parsed.registry_path or (Path(reg_val) if reg_val else None) or Path("artifacts/vibiomir/registry.sqlite")
+    raw_root = parsed.raw_root or (Path(raw_val) if raw_val else None) or Path("artifacts/vibiomir/raw")
 
     crawl_cfg_data = cfg.get("crawl", {})
     crawl_cfg = CrawlConfig(

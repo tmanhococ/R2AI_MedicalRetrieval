@@ -124,11 +124,15 @@ def _extract_lxml_fallback(tree) -> list[tuple[str, str | None, str]]:
 
     for elem in tree.xpath("//h1 | //h2 | //h3 | //h4 | //h5 | //h6 | //p | //ul | //ol | //table | //blockquote"):
         tag = elem.tag.lower()
-        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+        if tag in ("h1", "h2"):
             t = "".join(elem.itertext()).strip()
-            if t:
+            if t and len(t) > 2 and t not in (">", ">>", "|", "»"):
                 current_section = t
                 raw_blocks.append(("heading", current_section, t))
+        elif tag in ("h3", "h4", "h5", "h6"):
+            t = "".join(elem.itertext()).strip()
+            if t:
+                raw_blocks.append(("paragraph", current_section, t))
         elif tag == "p":
             t = "".join(elem.itertext()).strip()
             if t:
@@ -186,26 +190,29 @@ def extract_html_document(
 
     raw_blocks: list[tuple[str, str | None, str]] = []
 
-    # 1. Primary extractor: Trafilatura with XML output
-    try:
-        cleaned_html_bytes = html.tostring(tree, encoding="utf-8")
-        xml_output = trafilatura.extract(
-            cleaned_html_bytes,
-            output_format="xml",
-            include_tables=True,
-            include_formatting=True,
-            include_comments=True,
-            favor_recall=True,
-        )
-        if xml_output:
-            raw_blocks = _parse_trafilatura_xml(xml_output)
-    except Exception as e:
-        logger.debug(f"Trafilatura extraction failed for doc_id {doc_id}: {e}")
-        raw_blocks = []
-
-    # 2. Fallback extractor: Direct lxml traversal if Trafilatura produced no blocks
-    if not raw_blocks:
+    if getattr(config, "html_backend", "trafilatura") == "lxml":
         raw_blocks = _extract_lxml_fallback(tree)
+    else:
+        # 1. Primary extractor: Trafilatura with XML output
+        try:
+            cleaned_html_bytes = html.tostring(tree, encoding="utf-8")
+            xml_output = trafilatura.extract(
+                cleaned_html_bytes,
+                output_format="xml",
+                include_tables=True,
+                include_formatting=True,
+                include_comments=True,
+                favor_recall=True,
+            )
+            if xml_output:
+                raw_blocks = _parse_trafilatura_xml(xml_output)
+        except Exception as e:
+            logger.debug(f"Trafilatura extraction failed for doc_id {doc_id}: {e}")
+            raw_blocks = []
+
+        # 2. Fallback extractor: Direct lxml traversal if Trafilatura produced no blocks
+        if not raw_blocks:
+            raw_blocks = _extract_lxml_fallback(tree)
 
     quality_flags: list[str] = []
     if not raw_blocks:

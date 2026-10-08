@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Sequence
+import time
 import uuid
 
 import pyarrow as pa
@@ -91,6 +92,8 @@ class ShardedParquetWriter:
         schema: pa.Schema,
         row_group_size: int = 5000,
         target_shard_bytes: int = 67108864,
+        start_shard_index: int = 0,
+        completed_shards: list[dict[str, Any]] | None = None,
     ) -> None:
         self.output_dir = output_dir
         self.prefix = prefix
@@ -98,13 +101,13 @@ class ShardedParquetWriter:
         self.row_group_size = row_group_size
         self.target_shard_bytes = target_shard_bytes
 
-        self.shard_index = 0
+        self.shard_index = start_shard_index
         self.current_rows: list[dict[str, Any]] = []
         self.current_tmp_path: Path | None = None
         self.current_final_name: str | None = None
         self.current_writer: pq.ParquetWriter | None = None
         self.current_shard_rows = 0
-        self.completed_shards: list[dict[str, Any]] = []
+        self.completed_shards: list[dict[str, Any]] = list(completed_shards) if completed_shards else []
 
     def _open_new_shard(self) -> None:
         self.current_final_name = f"{self.prefix}_{self.shard_index:05d}.parquet"
@@ -172,19 +175,25 @@ class ShardedParquetWriter:
             self.current_writer = None
 
         if self.current_tmp_path and self.current_tmp_path.exists():
-            final_path = self.output_dir / self.current_final_name
-            self.current_tmp_path.replace(final_path)
+            if self.current_shard_rows > 0:
+                final_path = self.output_dir / self.current_final_name
+                self.current_tmp_path.replace(final_path)
 
-            file_bytes = final_path.stat().st_size
-            file_hash = hashlib.sha256(final_path.read_bytes()).hexdigest()
-            self.completed_shards.append({
-                "path": self.current_final_name,
-                "sha256": file_hash,
-                "type": self.prefix,
-                "rows": self.current_shard_rows,
-                "bytes": file_bytes,
-            })
-            self.shard_index += 1
+                file_bytes = final_path.stat().st_size
+                file_hash = hashlib.sha256(final_path.read_bytes()).hexdigest()
+                self.completed_shards.append({
+                    "path": self.current_final_name,
+                    "sha256": file_hash,
+                    "type": self.prefix,
+                    "rows": self.current_shard_rows,
+                    "bytes": file_bytes,
+                })
+                self.shard_index += 1
+            else:
+                try:
+                    self.current_tmp_path.unlink()
+                except Exception:
+                    pass
 
         return self.completed_shards
 
@@ -338,8 +347,10 @@ def build_snapshot(
     reranker_tokenizer: Any = None,
     language_detector: LanguageDetector | None = None,
     queries_path: Path | None = None,
+    source_limit: int | None = None,
+    resume: bool = False,
 ) -> SnapshotManifest:
-    """Builds an immutable frozen snapshot from a SourceRegistry with atomic publication and shard rotation."""
+    """Builds an immutable frozen snapshot from a SourceRegistry with atomic publication, shard rotation, and resume checkpointing."""
     snapshot_dir = config.snapshot_root / config.name
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -352,22 +363,6 @@ def build_snapshot(
             language_detector = FastTextLanguageDetector(ext_cfg.language_model_path)
         else:
             language_detector = FallbackLanguageDetector()
-
-    # Setup sharded writers
-    doc_writer = ShardedParquetWriter(
-        output_dir=snapshot_dir,
-        prefix="documents",
-        schema=DOCUMENTS_SCHEMA,
-        row_group_size=config.parquet_row_group_size,
-        target_shard_bytes=config.target_shard_bytes,
-    )
-    chunk_writer = ShardedParquetWriter(
-        output_dir=snapshot_dir,
-        prefix="chunks",
-        schema=CHUNKS_SCHEMA,
-        row_group_size=config.parquet_row_group_size,
-        target_shard_bytes=config.target_shard_bytes,
-    )
 
     import sqlite3
     lookup_db_path = snapshot_dir / "lookup.sqlite"
@@ -396,32 +391,184 @@ def build_snapshot(
             """
         )
         lookup_conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_locations_doc_id ON chunk_locations(doc_id);")
+        lookup_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshot_gaps (
+                doc_id INTEGER PRIMARY KEY,
+                original_url TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                http_status INTEGER
+            );
+            """
+        )
+        lookup_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshot_checkpoint (
+                key TEXT PRIMARY KEY,
+                val TEXT NOT NULL
+            );
+            """
+        )
+
+    last_processed_doc_id = 0
+    doc_completed_shards: list[dict[str, Any]] = []
+    chunk_completed_shards: list[dict[str, Any]] = []
+
+    if resume:
+        # 1. Clean up orphaned tmp files
+        for tmp_f in snapshot_dir.glob("*.tmp_*"):
+            try:
+                tmp_f.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to remove stale tmp file {tmp_f}: {e}")
+
+        # 2. Discover finalized shards on disk
+        existing_doc_shards = sorted(snapshot_dir.glob("documents_*.parquet"))
+        existing_chunk_shards = sorted(snapshot_dir.glob("chunks_*.parquet"))
+
+        valid_doc_shard_names = {f.name for f in existing_doc_shards}
+        valid_chunk_shard_names = {f.name for f in existing_chunk_shards}
+
+        for shard_f in existing_doc_shards:
+            meta = pq.read_metadata(str(shard_f))
+            doc_completed_shards.append({
+                "path": shard_f.name,
+                "sha256": hashlib.sha256(shard_f.read_bytes()).hexdigest(),
+                "type": "documents",
+                "rows": meta.num_rows,
+                "bytes": shard_f.stat().st_size,
+            })
+
+        for shard_f in existing_chunk_shards:
+            meta = pq.read_metadata(str(shard_f))
+            chunk_completed_shards.append({
+                "path": shard_f.name,
+                "sha256": hashlib.sha256(shard_f.read_bytes()).hexdigest(),
+                "type": "chunks",
+                "rows": meta.num_rows,
+                "bytes": shard_f.stat().st_size,
+            })
+
+        # 3. Clean up lookup.sqlite records pointing to non-existent shards
+        if valid_doc_shard_names:
+            placeholders = ",".join("?" * len(valid_doc_shard_names))
+            with lookup_conn:
+                lookup_conn.execute(
+                    f"DELETE FROM document_locations WHERE shard NOT IN ({placeholders})",
+                    list(valid_doc_shard_names),
+                )
+        else:
+            with lookup_conn:
+                lookup_conn.execute("DELETE FROM document_locations")
+
+        if valid_chunk_shard_names:
+            placeholders = ",".join("?" * len(valid_chunk_shard_names))
+            with lookup_conn:
+                lookup_conn.execute(
+                    f"DELETE FROM chunk_locations WHERE shard NOT IN ({placeholders})",
+                    list(valid_chunk_shard_names),
+                )
+        else:
+            with lookup_conn:
+                lookup_conn.execute("DELETE FROM chunk_locations")
+
+        # 4. Find max doc_id safely finalized
+        row = lookup_conn.execute(
+            """
+            SELECT COALESCE(MAX(doc_id), 0) FROM (
+                SELECT MAX(doc_id) AS doc_id FROM document_locations
+                UNION ALL
+                SELECT MAX(doc_id) AS doc_id FROM snapshot_gaps
+            )
+            """
+        ).fetchone()
+        last_processed_doc_id = int(row[0]) if row and row[0] is not None else 0
+
+        with lookup_conn:
+            lookup_conn.execute("DELETE FROM snapshot_gaps WHERE doc_id > ?", (last_processed_doc_id,))
+            lookup_conn.execute("DELETE FROM official_docs WHERE doc_id > ?", (last_processed_doc_id,))
+
+        logger.info(
+            f"Resuming snapshot '{config.name}' from doc_id > {last_processed_doc_id} "
+            f"({len(doc_completed_shards)} doc shards, {len(chunk_completed_shards)} chunk shards)"
+        )
+
+    # Setup sharded writers
+    doc_writer = ShardedParquetWriter(
+        output_dir=snapshot_dir,
+        prefix="documents",
+        schema=DOCUMENTS_SCHEMA,
+        row_group_size=config.parquet_row_group_size,
+        target_shard_bytes=config.target_shard_bytes,
+        start_shard_index=len(doc_completed_shards),
+        completed_shards=doc_completed_shards,
+    )
+    chunk_writer = ShardedParquetWriter(
+        output_dir=snapshot_dir,
+        prefix="chunks",
+        schema=CHUNKS_SCHEMA,
+        row_group_size=config.parquet_row_group_size,
+        target_shard_bytes=config.target_shard_bytes,
+        start_shard_index=len(chunk_completed_shards),
+        completed_shards=chunk_completed_shards,
+    )
 
     source_count = 0
     ready_document_count = 0
+    chunk_count = 0
     membership_hasher = hashlib.sha256()
     language_counts: dict[str, int] = Counter()
     quarantine_counts: dict[str, int] = Counter()
-    chunk_count = 0
-    gap_records: list[dict[str, Any]] = []
+
+    if resume and last_processed_doc_id > 0:
+        row_ready = lookup_conn.execute("SELECT COUNT(*) FROM document_locations").fetchone()
+        ready_document_count = int(row_ready[0]) if row_ready else 0
+
+        row_chunks = lookup_conn.execute("SELECT COUNT(*) FROM chunk_locations").fetchone()
+        chunk_count = int(row_chunks[0]) if row_chunks else 0
+
+        row_src = lookup_conn.execute("SELECT COUNT(*) FROM official_docs").fetchone()
+        source_count = int(row_src[0]) if row_src else 0
+
+        for (d_id,) in lookup_conn.execute("SELECT doc_id FROM document_locations ORDER BY doc_id ASC"):
+            membership_hasher.update(f"{d_id}\n".encode("utf-8"))
+
+        row_lang = lookup_conn.execute("SELECT val FROM snapshot_checkpoint WHERE key = 'language_counts'").fetchone()
+        if row_lang:
+            try:
+                language_counts.update(json.loads(row_lang[0]))
+            except Exception:
+                pass
+        row_quar = lookup_conn.execute("SELECT val FROM snapshot_checkpoint WHERE key = 'quarantine_counts'").fetchone()
+        if row_quar:
+            try:
+                quarantine_counts.update(json.loads(row_quar[0]))
+            except Exception:
+                pass
 
     # Extraction cache to avoid duplicate work when alias doc_ids point to same raw hash
     extraction_cache: dict[tuple[str, str], ExtractedDocument] = {}
 
+    last_seen_doc_id = last_processed_doc_id
+    doc_loc_batch: list[tuple[int, str, int]] = []
+    chunk_loc_batch: list[tuple[str, int, str, int, int]] = []
+    official_doc_batch: list[tuple[int]] = []
+    gap_batch: list[tuple[int, str, str, int]] = []
+
     try:
-        # Fetch all sources and their fetch jobs from registry
-        cursor = registry.conn.execute(
-            """
+        t_start = time.time()
+        sql = """
             SELECT s.doc_id, s.original_url, s.fetch_job_id,
                    f.state, f.raw_path, f.raw_sha256, f.mime_type, f.http_status
             FROM sources s
             LEFT JOIN fetch_jobs f ON s.fetch_job_id = f.job_id
+            WHERE s.doc_id > ?
             ORDER BY s.doc_id ASC
-            """
-        )
-        doc_loc_batch: list[tuple[int, str, int]] = []
-        chunk_loc_batch: list[tuple[str, int, str, int, int]] = []
-        official_doc_batch: list[tuple[int]] = []
+        """
+        params = [last_processed_doc_id]
+        if source_limit is not None and source_limit > 0:
+            sql += f" LIMIT {source_limit}"
+        cursor = registry.conn.execute(sql, params)
 
         while True:
             rows = cursor.fetchmany(1000)
@@ -429,6 +576,7 @@ def build_snapshot(
                 break
 
             for doc_id, original_url, job_id, state, raw_path_str, raw_sha256, mime_type, http_status in rows:
+                last_seen_doc_id = doc_id
                 source_count += 1
                 official_doc_batch.append((doc_id,))
 
@@ -444,12 +592,7 @@ def build_snapshot(
                         gap_reason = f"unresolved_{state}"
                     else:
                         gap_reason = f"fetch_state_{state}"
-                    gap_records.append({
-                        "doc_id": doc_id,
-                        "original_url": original_url,
-                        "reason": gap_reason,
-                        "http_status": http_status if http_status is not None else -1,
-                    })
+                    gap_batch.append((doc_id, original_url, gap_reason, http_status if http_status is not None else -1))
                     continue
 
                 raw_path = Path(raw_path_str)
@@ -460,12 +603,7 @@ def build_snapshot(
 
                 if not raw_path.exists():
                     logger.warning(f"Raw file {raw_path_str} not found for doc {doc_id}")
-                    gap_records.append({
-                        "doc_id": doc_id,
-                        "original_url": original_url,
-                        "reason": "missing_raw_file",
-                        "http_status": http_status if http_status is not None else -1,
-                    })
+                    gap_batch.append((doc_id, original_url, "missing_raw_file", http_status if http_status is not None else -1))
                     continue
 
                 # Read raw content
@@ -609,12 +747,12 @@ def build_snapshot(
                 else:
                     for flg in quality.flags:
                         quarantine_counts[flg] += 1
-                    gap_records.append({
-                        "doc_id": doc_id,
-                        "original_url": original_url,
-                        "reason": f"quarantined:{','.join(quality.flags)}" if quality.flags else "quarantined",
-                        "http_status": http_status if http_status is not None else -1,
-                    })
+                    gap_batch.append((
+                        doc_id,
+                        original_url,
+                        f"quarantined:{','.join(quality.flags)}" if quality.flags else "quarantined",
+                        http_status if http_status is not None else -1,
+                    ))
 
             # Commit batches to lookup db periodically
             if len(official_doc_batch) >= 1000:
@@ -635,6 +773,36 @@ def build_snapshot(
                 doc_loc_batch.clear()
                 chunk_loc_batch.clear()
 
+            if len(gap_batch) >= 500:
+                with lookup_conn:
+                    lookup_conn.executemany(
+                        "INSERT OR REPLACE INTO snapshot_gaps (doc_id, original_url, reason, http_status) VALUES (?, ?, ?, ?)",
+                        gap_batch,
+                    )
+                gap_batch.clear()
+
+            # Periodic progress reporting
+            if source_count % 10000 < len(rows) or source_count == len(rows):
+                elapsed = max(time.time() - t_start, 0.1)
+                rate = source_count / elapsed
+                pct = source_count / 4394718 * 100
+                rem_s = (4394718 - source_count) / max(rate, 0.1)
+                with lookup_conn:
+                    lookup_conn.execute(
+                        "INSERT OR REPLACE INTO snapshot_checkpoint (key, val) VALUES ('language_counts', ?)",
+                        (json.dumps(dict(language_counts)),),
+                    )
+                    lookup_conn.execute(
+                        "INSERT OR REPLACE INTO snapshot_checkpoint (key, val) VALUES ('quarantine_counts', ?)",
+                        (json.dumps(dict(quarantine_counts)),),
+                    )
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Snapshot: {source_count:,}/4,394,718 ({pct:.1f}%) | "
+                    f"ready={ready_document_count:,} chunks={chunk_count:,} | "
+                    f"{rate:.1f} src/s | ETA={rem_s/3600:.1f}h",
+                    flush=True,
+                )
+
         # Final commit to lookup db
         if official_doc_batch:
             with lookup_conn:
@@ -654,12 +822,52 @@ def build_snapshot(
             doc_loc_batch.clear()
             chunk_loc_batch.clear()
 
+        if gap_batch:
+            with lookup_conn:
+                lookup_conn.executemany(
+                    "INSERT OR REPLACE INTO snapshot_gaps (doc_id, original_url, reason, http_status) VALUES (?, ?, ?, ?)",
+                    gap_batch,
+                )
+            gap_batch.clear()
+
+        with lookup_conn:
+            lookup_conn.execute(
+                "INSERT OR REPLACE INTO snapshot_checkpoint (key, val) VALUES ('language_counts', ?)",
+                (json.dumps(dict(language_counts)),),
+            )
+            lookup_conn.execute(
+                "INSERT OR REPLACE INTO snapshot_checkpoint (key, val) VALUES ('quarantine_counts', ?)",
+                (json.dumps(dict(quarantine_counts)),),
+            )
+
         # Close writers and finalize all shards
         completed_doc_shards = doc_writer.close()
         completed_chunk_shards = chunk_writer.close()
         all_shards = completed_doc_shards + completed_chunk_shards
 
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received! Finalizing shards before exit...")
+        if official_doc_batch:
+            with lookup_conn:
+                lookup_conn.executemany("INSERT OR IGNORE INTO official_docs (doc_id) VALUES (?)", official_doc_batch)
+        if doc_loc_batch or chunk_loc_batch:
+            with lookup_conn:
+                lookup_conn.executemany("INSERT OR REPLACE INTO document_locations (doc_id, shard, row_idx) VALUES (?, ?, ?)", doc_loc_batch)
+                lookup_conn.executemany("INSERT OR REPLACE INTO chunk_locations (chunk_id, doc_id, shard, row_idx, chunk_index) VALUES (?, ?, ?, ?, ?)", chunk_loc_batch)
+        if gap_batch:
+            with lookup_conn:
+                lookup_conn.executemany("INSERT OR REPLACE INTO snapshot_gaps (doc_id, original_url, reason, http_status) VALUES (?, ?, ?, ?)", gap_batch)
+        doc_writer.close()
+        chunk_writer.close()
+        print(f"\n[PAUSED] Snapshot gracefully paused at doc_id={last_seen_doc_id}. Shards finalized. Resume anytime with --resume.")
+        raise
     finally:
+        # Load all gaps from SQLite table before closing lookup_conn
+        gap_rows = lookup_conn.execute("SELECT doc_id, original_url, reason, http_status FROM snapshot_gaps ORDER BY doc_id ASC").fetchall()
+        gap_records = [
+            {"doc_id": r[0], "original_url": r[1], "reason": r[2], "http_status": r[3] if r[3] is not None else -1}
+            for r in gap_rows
+        ]
         lookup_conn.close()
 
     # Calculate gap statistics and source scope

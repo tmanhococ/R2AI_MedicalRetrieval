@@ -1,9 +1,0 @@
-﻿ src/evaluation/__init__.py        |   2 +
- src/evaluation/error_analysis.py  | 206 +++++++++++++++++++++++++
- src/submission/__init__.py        |  12 ++
- src/submission/base.py            |  58 +++++++
- src/submission/competition_csv.py |  67 ++++++++
- src/submission/internal_jsonl.py  |  51 +++++++
- tests/test_error_analysis.py      | 314 ++++++++++++++++++++++++++++++++++++++
- tests/test_submission.py          | 151 ++++++++++++++++++
- 8 files changed, 861 insertions(+)

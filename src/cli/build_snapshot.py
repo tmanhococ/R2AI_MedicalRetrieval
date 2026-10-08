@@ -27,6 +27,8 @@ def run_build_snapshot(
     chunk_config: ChunkConfig | None = None,
     parquet_row_group_size: int = 5000,
     target_shard_bytes: int = 67108864,
+    source_limit: int | None = None,
+    resume: bool = False,
 ) -> SnapshotManifest:
     """Freezes official sources and paragraph/token chunk spans into an immutable snapshot."""
     reg_path = Path(registry_path)
@@ -52,6 +54,8 @@ def run_build_snapshot(
             extraction_config=extraction_config,
             chunk_config=chk_cfg,
             queries_path=Path(queries_path) if queries_path else None,
+            source_limit=source_limit,
+            resume=resume,
         )
 
     return manifest
@@ -91,6 +95,18 @@ def main(args: list[str] | None = None) -> None:
         type=Path,
         default=None,
         help="Path to raw payload storage directory",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional limit on number of sources to process",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume building from existing finalized shards and lookup db checkpoint",
     )
 
     parsed = parser.parse_args(args)
@@ -148,6 +164,8 @@ def main(args: list[str] | None = None) -> None:
         chunk_config=chunk_cfg,
         parquet_row_group_size=idx_cfg.get("parquet_row_group_size", 5000),
         target_shard_bytes=idx_cfg.get("target_shard_bytes", 67108864),
+        source_limit=parsed.limit,
+        resume=parsed.resume,
     )
     elapsed = time.time() - t0
 

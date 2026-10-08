@@ -199,8 +199,15 @@ async def _run_crawl_with_client(
                 blocked_count += 1
             elif result.state == "unsupported":
                 unsupported_count += 1
-
             total_bytes_written += result.bytes_written
+            processed_so_far = fetched_count + retry_wait_count + failed_count + blocked_count + unsupported_count
+            if processed_so_far > 0 and processed_so_far % 50 == 0:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"[{now_str}] Progress: {processed_so_far} items processed "
+                    f"(fetched={fetched_count}, retry={retry_wait_count}, blocked={blocked_count}, failed={failed_count}, data={total_bytes_written / 1024 / 1024:.2f} MiB)",
+                    flush=True,
+                )
 
     return CrawlReport(
         leased=total_leased,

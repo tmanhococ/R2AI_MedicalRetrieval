@@ -88,7 +88,7 @@ def run_crawl_cli(
             state_counts[row[0]] = row[1]
 
         host_counts: dict[str, dict[str, int]] = {}
-        for u, st in registry.conn.execute("SELECT url, state FROM fetch_jobs"):
+        for u, st in registry.conn.execute("SELECT url, state FROM fetch_jobs WHERE state != 'pending'"):
             h = urlparse(u).netloc.lower().split(":")[0]
             if h not in host_counts:
                 host_counts[h] = collections.defaultdict(int)

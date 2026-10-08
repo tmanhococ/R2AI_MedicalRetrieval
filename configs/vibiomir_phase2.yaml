@@ -18,6 +18,27 @@ campaign:
   require_no_unresolved_sources: true
   priority_changes_order_only: true
 
+extraction:
+  html_backend: lxml
+  pdf_backend: pymupdf
+  language_model_path: artifacts/models/lid.176.ftz
+  language_confidence_min: 0.70
+  accepted_languages: [vi, en, zh, und]
+  quarantine_unknown_language: false
+
+indexing:
+  snapshot_root: artifacts/vibiomir/snapshots
+  parquet_row_group_size: 5000
+  target_shard_bytes: 67108864
+  chunking:
+    mode: auto
+    auto_strategy:
+      type: paragraph_token_spans
+      body_max_tokens: 320
+      long_block_overlap_tokens: 64
+      contextual_header_max_tokens: 32
+      drop_short_blocks: false
+
 resources:
   embedding_start_batch: 8
   reranker_start_batch: 4

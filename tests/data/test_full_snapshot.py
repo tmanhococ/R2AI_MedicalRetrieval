@@ -607,3 +607,92 @@ def test_evidence_source_store_rejects_invalid_slice_bounds(tmp_path: Path):
 
     evidence_store.close()
 
+
+def test_build_snapshot_resume_interrupted(tmp_path: Path):
+    """Snapshot building can resume seamlessly after interruption without corrupting or duplicating data."""
+    db_path = tmp_path / "registry.db"
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    registry = SourceRegistry(db_path)
+
+    sources = [OfficialSource(doc_id=i, url=f"https://example.com/art_{i}") for i in range(1, 11)]
+    sources.append(OfficialSource(doc_id=11, url="https://example.com/fail_11"))
+    sources.append(OfficialSource(doc_id=12, url="https://example.com/fail_12"))
+    ingest_sources(sources, registry)
+
+    for i in range(1, 11):
+        html_bytes = f"<html><body><h1>Title {i}</h1><p>Medical body for article {i}</p></body></html>".encode("utf-8")
+        raw_path, raw_sha, _ = save_raw_atomic(raw_root, html_bytes)
+        job_id = registry.conn.execute("SELECT fetch_job_id FROM sources WHERE doc_id = ?", (i,)).fetchone()[0]
+        registry.finish_fetch(
+            FetchResult(
+                job_id=job_id,
+                state="fetched",
+                raw_path=str(raw_path),
+                raw_sha256=raw_sha,
+                final_url=f"https://example.com/art_{i}",
+                mime_type="text/html",
+                http_status=200,
+                fetched_at="2026-10-05T00:00:00Z",
+                error_code=None,
+                bytes_written=len(html_bytes),
+            )
+        )
+
+    for i in (11, 12):
+        job_id = registry.conn.execute("SELECT fetch_job_id FROM sources WHERE doc_id = ?", (i,)).fetchone()[0]
+        registry.finish_fetch(
+            FetchResult(
+                job_id=job_id,
+                state="blocked",
+                raw_path=None,
+                raw_sha256=None,
+                final_url=f"https://example.com/fail_{i}",
+                mime_type=None,
+                http_status=403,
+                fetched_at="2026-10-05T00:00:00Z",
+                error_code="robots_blocked",
+                bytes_written=0,
+            )
+        )
+
+    snap_cfg = SnapshotConfig(
+        snapshot_root=tmp_path / "snapshots",
+        name="resume_snap",
+        parquet_row_group_size=2,
+        target_shard_bytes=256,
+        chunk_config=ChunkConfig(body_max_tokens=20),
+    )
+
+    # Step 1: Run partially with source_limit = 5
+    build_snapshot(
+        registry=registry,
+        config=snap_cfg,
+        raw_root=raw_root,
+        language_detector=DummyLanguageDetector(),
+        source_limit=5,
+    )
+
+    # Step 2: Resume to completion
+    final_manifest = build_snapshot(
+        registry=registry,
+        config=snap_cfg,
+        raw_root=raw_root,
+        language_detector=DummyLanguageDetector(),
+        resume=True,
+    )
+
+    assert final_manifest.source_count == 12
+    assert final_manifest.ready_document_count == 10
+    assert final_manifest.gap_count == 2
+
+    # Step 3: Verify all documents can be retrieved via SnapshotSourceStore
+    snap_dir = tmp_path / "snapshots" / "resume_snap"
+    store = SnapshotSourceStore(snap_dir)
+    for doc_id in range(1, 11):
+        assert store.contains_official_doc(doc_id)
+        doc = store.get_document(doc_id)
+        assert f"Medical body for article {doc_id}" in doc.source_text
+    store.close()
+
+
