@@ -55,6 +55,7 @@ def main() -> None:
     ap.add_argument("--rows", type=int, default=3000, help="rows taken from each sampled part")
     ap.add_argument("--nq", type=int, default=10)
     ap.add_argument("--translate", action="store_true", help="run NLLB (downloads the model if not cached)")
+    ap.add_argument("--nllb", default=None, help="override the NLLB model id (e.g. the 600M one on a 4 GB GPU)")
     args = ap.parse_args()
 
     from huggingface_hub import snapshot_download
@@ -77,6 +78,8 @@ def main() -> None:
     app.vol = app.hf_vol = _LocalVolume()
     app.E5_DIR = Path(snapshot_download(app.E5_ID, local_files_only=True))
     app.RERANK_DIR = Path(snapshot_download(app.RERANK_ID, local_files_only=True))
+    if args.nllb:
+        app.NLLB_ID = args.nllb
 
     nq, v = args.nq, "smoke"
     o = {**app.DEFAULT_OPTS, "nq": nq, "version": v, "dense_k": 200, "bm25_chunk_k": 200, "bm25_doc_k": 100,
@@ -115,7 +118,8 @@ def main() -> None:
     results = json.loads((run / "results.json").read_text(encoding="utf-8"))
     scored = pq.read_table(run / "scored_pool.parquet", columns=["qid", "ce"]).to_pylist()
     errors = validate_results(results, [q for q, _ in app._load_queries(nq)])
-    report = {"final": final, "quality": quality_report(results, scored), "format_errors": errors, "timings": timings}
+    quality = quality_report(results, scored, min_median_ce=-3.0)  # a few thousand chunks: loose threshold
+    report = {"final": final, "quality": quality, "format_errors": errors, "timings": timings}
     (args.work / "smoke_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(report, indent=2, ensure_ascii=False))
     print("SMOKE PASS" if not errors and final["queries"] == nq else "SMOKE FAIL")

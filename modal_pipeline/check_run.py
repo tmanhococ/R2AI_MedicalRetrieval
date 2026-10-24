@@ -21,6 +21,8 @@ def main() -> None:
     ap.add_argument("run_dir", type=Path)
     ap.add_argument("--queries", type=Path, default=Path("data/official/query.parquet"))
     ap.add_argument("--nq", type=int, default=0, help="number of queries in the run (0 = all)")
+    ap.add_argument("--min-median-ce", type=float, default=0.0,
+                    help="median best reranker logit must exceed this (use -3 for tiny one-part runs)")
     args = ap.parse_args()
 
     ids = sorted(pq.read_table(args.queries, columns=["id"])["id"].to_pylist())
@@ -30,7 +32,7 @@ def main() -> None:
         results = json.loads(zf.read("results.json"))
     errors = ([] if names == ["results.json"] else [f"zip entries {names}"]) + validate_results(results, ids)
     scored = pq.read_table(args.run_dir / "scored_pool.parquet", columns=["qid", "ce"]).to_pylist()
-    report = {**quality_report(results, scored), "format_errors": errors[:5]}
+    report = {**quality_report(results, scored, args.min_median_ce), "format_errors": errors[:5]}
     report["passed"] = report["passed"] and not errors
     print(json.dumps(report, indent=2))
     print("PASS" if report["passed"] else "FAIL")

@@ -300,3 +300,10 @@ def test_compose_passage_tolerates_pandas_missing_values():
     assert vc.compose_passage("T", nan, "body") == "T\n\nbody"
     pool = pd.DataFrame({"title": ["T", None], "section": [None, None], "text": ["a", "b"]})
     assert [vc.compose_passage(a, b, c) for a, b, c in zip(pool["title"], pool["section"], pool["text"])] == ["T\n\na", "b"]
+
+
+def test_quality_report_threshold_is_configurable():
+    res = [{"id": q, "relevant_docs": [q], "relevant_chunks": []} for q in range(30)]
+    scored = [{"qid": q, "ce": -1.0} for q in range(30)]
+    assert not vc.quality_report(res, scored)["passed"]
+    assert vc.quality_report(res, scored, min_median_ce=-3.0)["passed"]

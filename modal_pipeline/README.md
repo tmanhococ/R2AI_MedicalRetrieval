@@ -46,7 +46,7 @@ Lệnh in ra `gpu_hours` và `est_usd_L4`. Nếu vượt ngân sách, đặt `"m
 
 ```powershell
 .venv\Scripts\modal.exe run modal_pipeline\app.py --stage all --parts 1 --nq 30
-.venv\Scripts\python.exe modal_pipeline\check_run.py artifacts\modal_runs\v1\p1_q30 --nq 30
+.venv\Scripts\python.exe modal_pipeline\check_run.py artifacts\modal_runs\v1\p1_q30 --nq 30 --min-median-ce -3
 ```
 
 ## 4. Chạy đầy đủ
