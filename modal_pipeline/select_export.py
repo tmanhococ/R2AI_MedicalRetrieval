@@ -1,9 +1,9 @@
 """Re-run output selection locally from scored_pool.parquet (no Modal credits needed).
 
     .venv/Scripts/python.exe modal_pipeline/select_export.py \
-        --pool artifacts/modal_runs/full/scored_pool.parquet \
+        --pool artifacts/modal_runs/v1/full/scored_pool.parquet \
         --queries data/official/query.parquet \
-        --out artifacts/modal_runs/full/try_docs60 --doc-max 60 --chunk-max 60
+        --out artifacts/modal_runs/v1/full/try_docs60 --doc-max 60 --chunk-max 60
 """
 from __future__ import annotations
 

@@ -183,3 +183,27 @@ def results_to_zip_bytes(results: list[dict]) -> tuple[bytes, bytes]:
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         zf.writestr(info, js)
     return js, buf.getvalue()
+
+
+def quality_report(results: list[dict], scored_rows: list[dict]) -> dict:
+    """Sanity signals that a validated submission is not degenerate.
+
+    Passes when queries are not all answered by the same document and the median
+    query's best reranker logit is positive (bge-reranker logits > 0 mean "relevant").
+    """
+    best: dict[int, float] = {}
+    for r in scored_rows:
+        q = int(r["qid"])
+        best[q] = max(best.get(q, float("-inf")), float(r["ce"]))
+    tops = sorted(best.values())
+    median_top = tops[len(tops) // 2] if tops else float("-inf")
+    n = len(results)
+    distinct = len({r["relevant_docs"][0] for r in results if r["relevant_docs"]})
+    report = {
+        "queries": n,
+        "empty_queries": sum(1 for r in results if not r["relevant_docs"]),
+        "distinct_top_docs": distinct,
+        "median_top_ce": round(median_top, 3),
+    }
+    report["passed"] = n > 0 and distinct >= min(10, max(1, n // 3)) and median_top > 0
+    return report

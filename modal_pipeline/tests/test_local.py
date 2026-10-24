@@ -185,3 +185,59 @@ def test_pool_and_finalize(stack):
     assert vc.validate_results(results, [q for q, _ in queries]) == []
     scored = pd.read_parquet(run / "scored_pool.parquet")
     assert len(scored) == len(pool) and scored["ce"].notna().all()
+
+
+def test_meta_staleness_detected(stack):
+    app, vol = stack
+    app.build_meta.local()
+    assert app._meta_is_current()
+    extra = vol / "data" / "chunks" / "part_00002.parquet"
+    extra.write_bytes((vol / "data" / "chunks" / "part_00001.parquet").read_bytes())
+    try:
+        assert not app._meta_is_current()
+    finally:
+        extra.unlink()
+    assert app._meta_is_current()
+
+
+def test_artifact_paths_depend_on_version_and_max_len(stack):
+    app, _ = stack
+    assert app._emb_path("part_00000.parquet", 512, "v1") != app._emb_path("part_00000.parquet", 256, "v1")
+    assert app._emb_path("part_00000.parquet", 512, "v1") != app._emb_path("part_00000.parquet", 512, "v2")
+    assert app._emb_path("part_00000.parquet", 512, "v1").name == "part_00000.npy"
+    assert app._bm25_dir(1, "v1") != app._bm25_dir(1, "v2")
+    assert app._run_dir(1, 30, "v1") != app._run_dir(1, 30, "v2")
+    assert app._run_dir(0, 0, "v1").name == "full"
+
+
+def test_run_opts_guard(stack, tmp_path):
+    app, _ = stack
+    o = dict(app.DEFAULT_OPTS)
+    app._check_run_opts(tmp_path, o)
+    assert (tmp_path / "run_opts.json").exists()
+    app._check_run_opts(tmp_path, {**o, "selection": {"doc_max": 60}, "nq": 5})  # selection-only changes are fine
+    with pytest.raises(ValueError, match="pool_size"):
+        app._check_run_opts(tmp_path, {**o, "pool_size": o["pool_size"] + 1})
+
+
+def test_index_done_checks_rows(stack, tmp_path):
+    app, _ = stack
+    assert not app._index_done(tmp_path, "chunks", 5)
+    (tmp_path / "chunks.done").write_text(json.dumps({"secs": 1, "rows": 5}))
+    assert app._index_done(tmp_path, "chunks", 5)
+    assert not app._index_done(tmp_path, "chunks", 6)
+
+
+def test_quality_report_flags_degenerate_output():
+    good_res = [{"id": q, "relevant_docs": [q], "relevant_chunks": [{"doc_id": q, "chunk_text": "x", "chunk_order": 0}]}
+                for q in range(30)]
+    good_scored = [{"qid": q, "ce": 2.0} for q in range(30)]
+    rep = vc.quality_report(good_res, good_scored)
+    assert rep["passed"] and rep["distinct_top_docs"] == 30 and rep["median_top_ce"] == 2.0
+
+    same_doc = [{**r, "relevant_docs": [7]} for r in good_res]
+    assert not vc.quality_report(same_doc, good_scored)["passed"]
+    low_ce = [{"qid": q, "ce": -4.0} for q in range(30)]
+    assert not vc.quality_report(good_res, low_ce)["passed"]
+    empty = good_res[:-1] + [{"id": 29, "relevant_docs": [], "relevant_chunks": []}]
+    assert vc.quality_report(empty, good_scored)["empty_queries"] == 1

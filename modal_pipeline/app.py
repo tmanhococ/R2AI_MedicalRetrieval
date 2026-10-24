@@ -46,6 +46,8 @@ GPU_SMALL = ["L4", "A10"]
 MAX_GPUS = 10  # Starter plan GPU concurrency
 
 DEFAULT_OPTS = {
+    "version": "v1",            # namespace of emb/, bm25/, runs/ outputs; bump to recompute after a fix
+    "retranslate": False,       # True: redo cached query translations
     "nq": 0,                    # >0: only the first nq queries (dry runs)
     "max_len": 512,             # E5 passage truncation (tokens)
     "dense_k": 1000,            # dense hits per query variant
@@ -139,12 +141,58 @@ def _shards(parts: int = 0) -> list[dict]:
     return shards[:parts] if parts else shards
 
 
+def _meta_is_current() -> bool:
+    """False when the uploaded parts differ from those recorded in meta/shards.json."""
+    path = VOL / "meta" / "shards.json"
+    if not path.exists():
+        return False
+    on_volume = sorted(p.name for p in (_data_dir() / "chunks").glob("part_*.parquet"))
+    return on_volume == [s["part"] for s in json.loads(path.read_text())]
+
+
 def _index_tag(parts: int) -> str:
     return "full" if not parts else f"p{parts}"
 
 
-def _run_dir(parts: int, nq: int) -> Path:
-    return VOL / "runs" / (_index_tag(parts) + (f"_q{nq}" if nq else ""))
+# Stages skip outputs that already exist, so every output path carries what produced it:
+# bump the "version" opt to recompute after a code fix instead of deleting volume files.
+def _emb_path(part: str, max_len: int, version: str) -> Path:
+    return VOL / "emb" / f"{version}_len{max_len}" / (Path(part).stem + ".npy")
+
+
+def _bm25_dir(parts: int, version: str) -> Path:
+    return VOL / "bm25" / version / _index_tag(parts)
+
+
+def _run_dir(parts: int, nq: int, version: str = DEFAULT_OPTS["version"]) -> Path:
+    return VOL / "runs" / version / (_index_tag(parts) + (f"_q{nq}" if nq else ""))
+
+
+def _index_done(target: Path, name: str, rows: int) -> bool:
+    marker = target / f"{name}.done"
+    return marker.exists() and json.loads(marker.read_text()).get("rows") == rows
+
+
+# Opts that change search/pool/rerank outputs; a run dir must not mix two settings of them.
+RUN_KEYS = ("version", "max_len", "dense_k", "bm25_chunk_k", "bm25_doc_k", "bm25_k1", "bm25_b", "rrf_k",
+            "w_dense", "w_sparse_chunk", "w_sparse_doc", "top_docs", "chunks_per_new_doc", "pool_size",
+            "rerank_batches")
+
+
+def _check_run_opts(run: Path, o: dict) -> None:
+    current = {k: o[k] for k in RUN_KEYS}
+    path = run / "run_opts.json"
+    if not path.exists():
+        run.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(current, indent=2))
+        return
+    saved = json.loads(path.read_text())
+    changed = sorted(k for k in RUN_KEYS if saved.get(k) != current[k])
+    if changed:
+        raise ValueError(
+            f"{run.name} was built with different {changed}; existing outputs would be reused silently. "
+            f'Pass a new "version" in --opts (e.g. "v2") to compute a fresh run.'
+        )
 
 
 def _load_queries(nq: int = 0) -> list[tuple[int, str]]:
@@ -243,14 +291,15 @@ def build_meta() -> dict:
 
 @app.function(
     image=gpu_image, gpu=GPU_ENCODE, volumes={VOL: vol}, cpu=2, memory=12288,
-    timeout=2 * 3600, retries=2, max_containers=MAX_GPUS,
+    timeout=2 * 3600, retries=1, max_containers=MAX_GPUS,
 )
-def encode_part(part: str, max_len: int = 512, sample: int = 0, token_budget: int = 32768) -> dict:
+def encode_part(part: str, max_len: int = 512, sample: int = 0, token_budget: int = 32768,
+                version: str = DEFAULT_OPTS["version"]) -> dict:
     import numpy as np
     import pyarrow.parquet as pq
     from vb_common import compose_passage
 
-    out = VOL / "emb" / (Path(part).stem + ".npy")
+    out = _emb_path(part, max_len, version)
     if not sample and out.exists():
         return {"part": part, "skipped": True}
     t = pq.read_table(_data_dir() / "chunks" / part, columns=["title", "section", "text"])
@@ -290,11 +339,14 @@ def translate_queries(nq: int = 0, force: bool = False) -> dict:
     queries = [(qid, q) for qid, q in _load_queries(nq) if qid not in done]
     if not queries:
         return {"skipped": True, "cached": len(done)}
+    from huggingface_hub import snapshot_download
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+    # Persist the download before loading: commit() reloads the volume, which fails on open (mmapped) files.
+    snapshot_download(NLLB_ID)
+    hf_vol.commit()
     tok = AutoTokenizer.from_pretrained(NLLB_ID, src_lang="vie_Latn")
     model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_ID).half().cuda().eval()
-    hf_vol.commit()
 
     # NLLB is sentence-level: translate sentences, then re-join per query.
     splitter = re.compile(r"(?<=[.!?…])\s+|\n+")
@@ -355,15 +407,17 @@ def _tokenize_part(args: tuple[str, int, str, str]) -> dict:
 
 
 @app.function(image=bm25_image, volumes={VOL: vol}, cpu=16, memory=65536, timeout=10 * 3600)
-def build_bm25(parts: int = 0, threads: int = 16) -> dict:
+def build_bm25(parts: int = 0, threads: int = 16, version: str = DEFAULT_OPTS["version"]) -> dict:
     import multiprocessing as mp
     import shutil
     import subprocess
     import sys
 
     vol.reload()
-    target = VOL / "bm25" / _index_tag(parts)
-    if (target / "chunks.done").exists() and (target / "docs.done").exists():
+    target = _bm25_dir(parts, version)
+    shards = _shards(parts)
+    rows = sum(s["rows"] for s in shards)
+    if _index_done(target, "chunks", rows) and _index_done(target, "docs", rows):
         return {"skipped": True}
     work = Path("/tmp/bm25")
     in_c, in_d = work / "in_chunks", work / "in_docs"
@@ -371,12 +425,12 @@ def build_bm25(parts: int = 0, threads: int = 16) -> dict:
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True)
     t0 = time.time()
-    jobs = [(str(_data_dir() / "chunks" / s["part"]), s["offset"], str(in_c), str(in_d)) for s in _shards(parts)]
+    jobs = [(str(_data_dir() / "chunks" / s["part"]), s["offset"], str(in_c), str(in_d)) for s in shards]
     with mp.get_context("fork").Pool(threads) as pool:
         stats = list(pool.imap_unordered(_tokenize_part, jobs))
     report = {"tokenize_secs": round(time.time() - t0), "tokens": sum(s["tokens"] for s in stats)}
     for name, inp in (("chunks", in_c), ("docs", in_d)):
-        if (target / f"{name}.done").exists():
+        if _index_done(target, name, rows):
             continue
         idx = work / f"idx_{name}"
         shutil.rmtree(idx, ignore_errors=True)
@@ -390,22 +444,23 @@ def build_bm25(parts: int = 0, threads: int = 16) -> dict:
         dest = target / name
         shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(idx, dest)
-        (target / f"{name}.done").write_text(json.dumps({"secs": round(time.time() - t1)}))
+        (target / f"{name}.done").write_text(json.dumps({"secs": round(time.time() - t1), "rows": rows, "parts": len(shards)}))
         vol.commit()
         report[f"{name}_index_secs"] = round(time.time() - t1)
     return report
 
 
 @app.function(image=bm25_image, volumes={VOL: vol}, cpu=16, memory=65536, timeout=4 * 3600)
-def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: float, threads: int = 16) -> dict:
+def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: float, version: str,
+                threads: int = 16) -> dict:
     import shutil
 
     import pandas as pd
     from vb_common import bm25_query_string
 
     vol.reload()
-    run = _run_dir(parts, nq)
-    src = VOL / "bm25" / _index_tag(parts)
+    run = _run_dir(parts, nq, version)
+    src = _bm25_dir(parts, version)
     qs = [(qid, lang, bm25_query_string(text)) for qid, lang, text in _query_variant_list(nq)]
     qs = [q for q in qs if q[2]]
     from pyserini.analysis import JWhiteSpaceAnalyzer
@@ -437,13 +492,13 @@ def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: f
 
 
 @app.function(image=gpu_image, gpu=GPU_SMALL, volumes={VOL: vol}, cpu=4, memory=32768, timeout=2 * 3600)
-def dense_search(parts: int, nq: int, k: int, max_len: int) -> dict:
+def dense_search(parts: int, nq: int, k: int, max_len: int, version: str) -> dict:
     import numpy as np
     import pandas as pd
     import torch
 
     vol.reload()
-    out = _run_dir(parts, nq) / "dense.parquet"
+    out = _run_dir(parts, nq, version) / "dense.parquet"
     if out.exists():
         return {"skipped": True}
     qs = _query_variant_list(nq)
@@ -456,7 +511,7 @@ def dense_search(parts: int, nq: int, k: int, max_len: int) -> dict:
     best_i = torch.full((m, k), -1, device="cuda", dtype=torch.long)
     t0 = time.time()
     for s in _shards(parts):
-        path = VOL / "emb" / (Path(s["part"]).stem + ".npy")
+        path = _emb_path(s["part"], max_len, version)
         if not path.exists():
             raise FileNotFoundError(f"missing embeddings for {s['part']}; run --stage encode")
         emb = torch.from_numpy(np.load(path)).cuda()
@@ -490,7 +545,7 @@ def build_pool(parts: int, nq: int, opts_json: str) -> dict:
 
     o = {**DEFAULT_OPTS, **json.loads(opts_json)}
     vol.reload()
-    run = _run_dir(parts, nq)
+    run = _run_dir(parts, nq, o["version"])
     out = run / "pool.parquet"
     if out.exists():
         return {"skipped": True}
@@ -603,16 +658,17 @@ def build_pool(parts: int, nq: int, opts_json: str) -> dict:
 
 @app.function(
     image=gpu_image, gpu=GPU_RERANK, volumes={VOL: vol}, cpu=2, memory=16384,
-    timeout=3 * 3600, retries=2, max_containers=MAX_GPUS,
+    timeout=3 * 3600, retries=1, max_containers=MAX_GPUS,
 )
-def rerank_batch(parts: int, nq: int, batch: int, nbatches: int, max_len: int = 512, token_budget: int = 16384) -> dict:
+def rerank_batch(parts: int, nq: int, batch: int, nbatches: int, version: str = DEFAULT_OPTS["version"],
+                 max_len: int = 512, token_budget: int = 16384) -> dict:
     import numpy as np
     import pandas as pd
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     from vb_common import compose_passage
 
-    run = _run_dir(parts, nq)
+    run = _run_dir(parts, nq, version)
     out = run / "rerank" / f"scores_{batch:03d}.parquet"
     if out.exists():
         return {"batch": batch, "skipped": True}
@@ -660,7 +716,7 @@ def finalize(parts: int, nq: int, opts_json: str) -> dict:
 
     o = {**DEFAULT_OPTS, **json.loads(opts_json)}
     vol.reload()
-    run = _run_dir(parts, nq)
+    run = _run_dir(parts, nq, o["version"])
     pool = pd.read_parquet(run / "pool.parquet", columns=["qid", "row", "doc_id", "chunk_rrf", "doc_rrf", "text"])
     files = sorted((run / "rerank").glob("scores_*.parquet"))
     if len(files) != o["rerank_batches"]:
@@ -703,16 +759,22 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
         log.append(line)
 
     all_stages = stage == "all"
-    if all_stages or stage == "meta" or not (VOL / "meta" / "shards.json").exists():
+    v = o["version"]
+    # Rebuild meta whenever the uploaded parts changed (e.g. full upload after the tiny run);
+    # a stale shard list would make bench, encode and bm25 silently cover only the old parts.
+    if all_stages or stage == "meta" or not _meta_is_current():
         note("meta", build_meta.remote())
     vol.reload()
     shards = _shards(parts)
+    if all_stages or stage in ("search", "pool", "rerank", "final"):
+        _check_run_opts(_run_dir(parts, nq, v), o)
+        vol.commit()
     rows = sum(s["rows"] for s in shards)
 
     if stage == "bench":
         full = _shards()
         picks = [full[i]["part"] for i in sorted({round(j * (len(full) - 1) / 3) for j in range(4)})]
-        res = list(encode_part.map(picks, kwargs={"max_len": o["max_len"], "sample": 4000}))
+        res = list(encode_part.map(picks, kwargs={"max_len": o["max_len"], "sample": 4000, "version": v}))
         rps = sum(r["rows"] for r in res) / sum(r["secs"] for r in res)
         total = sum(s["rows"] for s in full)
         hours = total / rps / 3600
@@ -723,12 +785,12 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
 
     bm25_call = translate_call = None
     if all_stages or stage == "bm25":
-        bm25_call = build_bm25.spawn(parts)
+        bm25_call = build_bm25.spawn(parts, version=v)
     if all_stages or stage == "translate":
-        translate_call = translate_queries.spawn(nq)
+        translate_call = translate_queries.spawn(nq, o["retranslate"])
     if all_stages or stage == "encode":
         t0 = time.time()
-        res = list(encode_part.map([s["part"] for s in shards], kwargs={"max_len": o["max_len"]}))
+        res = list(encode_part.map([s["part"] for s in shards], kwargs={"max_len": o["max_len"], "version": v}))
         done = [r for r in res if not r.get("skipped")]
         note("encode", {"parts": len(res), "encoded_now": len(done), "rows": rows,
                         "gpu_secs": round(sum(r["secs"] for r in done)), "wall_secs": round(time.time() - t0)})
@@ -738,15 +800,15 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
         note("translate", translate_call.get())
 
     if all_stages or stage == "search":
-        d = dense_search.spawn(parts, nq, o["dense_k"], o["max_len"])
-        s = bm25_search.spawn(parts, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"])
+        d = dense_search.spawn(parts, nq, o["dense_k"], o["max_len"], v)
+        s = bm25_search.spawn(parts, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"], v)
         note("dense search", d.get())
         note("bm25 search", s.get())
     if all_stages or stage == "pool":
         note("pool", build_pool.remote(parts, nq, json.dumps(o)))
     if all_stages or stage == "rerank":
         nb = o["rerank_batches"]
-        res = list(rerank_batch.map([parts] * nb, [nq] * nb, range(nb), [nb] * nb))
+        res = list(rerank_batch.map([parts] * nb, [nq] * nb, range(nb), [nb] * nb, [v] * nb))
         done = [r for r in res if not r.get("skipped")]
         note("rerank", {"batches": nb, "ran_now": len(done), "pairs": sum(r["pairs"] for r in done),
                         "gpu_secs": sum(r["secs"] for r in done)})
@@ -767,11 +829,11 @@ def main(stage: str = "all", parts: int = 0, nq: int = 0, opts: str = "{}", down
     for line in pipeline.remote(stage, parts, json.dumps(o)):
         print(line)
     if download and stage in ("all", "final"):
-        run_name = _run_dir(parts, o["nq"]).name
-        dest = Path("artifacts") / "modal_runs" / run_name
+        remote = _run_dir(parts, o["nq"], o["version"]).relative_to(VOL).as_posix()  # runs/<version>/<tag>
+        dest = Path("artifacts") / ("modal_" + remote)
         dest.mkdir(parents=True, exist_ok=True)
         for name in ("submission.zip", "selection.json", "scored_pool.parquet"):
             with open(dest / name, "wb") as f:
-                for chunk in vol.read_file(f"runs/{run_name}/{name}"):
+                for chunk in vol.read_file(f"{remote}/{name}"):
                     f.write(chunk)
             print(f"downloaded {dest / name}")

@@ -10,6 +10,7 @@ Mọi lệnh chạy từ thư mục `mvp-rag-medical/`.
 | `app.py` | Modal | Toàn bộ các stage trên cloud |
 | `vb_common.py` | cả hai | Tokenizer BM25, chọn kết quả, xuất `results.json` và zip |
 | `select_export.py` | máy local | Chọn lại kết quả từ `scored_pool.parquet` mà không tốn credit |
+| `check_run.py` | máy local | Kiểm tra một run đã tải về: định dạng zip, query rỗng, độ đa dạng doc top-1, điểm reranker |
 
 ## 0. Chuẩn bị (một lần)
 
@@ -46,21 +47,21 @@ Lần chạy này kiểm tra image, Java/Pyserini, GPU và định dạng submis
 .venv\Scripts\modal.exe run --detach modal_pipeline\app.py --stage all
 ```
 Với `--detach`, pipeline vẫn chạy nếu bạn tắt máy, vì bộ điều phối `pipeline` chạy trên Modal. Theo dõi log trên dashboard Modal.
-Khi terminal còn mở, `submission.zip`, `selection.json` và `scored_pool.parquet` được tải về `artifacts/modal_runs/full/`.
+Khi terminal còn mở, `submission.zip`, `selection.json` và `scored_pool.parquet` được tải về `artifacts/modal_runs/v1/full/`.
 Nếu terminal đã đóng thì tải bằng lệnh:
 
 ```powershell
-.venv\Scripts\modal.exe volume get vibiomir runs/full/submission.zip artifacts\modal_runs\full\
-.venv\Scripts\modal.exe volume get vibiomir runs/full/scored_pool.parquet artifacts\modal_runs\full\
+.venv\Scripts\modal.exe volume get vibiomir runs/v1/full/submission.zip artifacts\modal_runs\v1\full\
+.venv\Scripts\modal.exe volume get vibiomir runs/v1/full/scored_pool.parquet artifacts\modal_runs\v1\full\
 ```
 
 Mỗi stage bỏ qua phần việc đã có kết quả trên volume. Nếu một stage lỗi, sửa rồi chạy lại đúng stage đó, ví dụ `--stage rerank`.
-Để chạy lại một stage từ đầu, xoá output của nó: `modal volume rm -r vibiomir runs/full/pool.parquet`.
+Để tính lại sau khi sửa code hoặc đổi tham số tìm kiếm, đặt `"version": "v2"` trong file opts; không cần xoá gì trên volume. Nếu đổi tham số tìm kiếm mà giữ nguyên version, pipeline dừng và báo lỗi thay vì âm thầm dùng kết quả cũ.
 
 ## 5. Tinh chỉnh số doc/chunk xuất ra (miễn phí, chạy local)
 
 ```powershell
-.venv\Scripts\python.exe modal_pipeline\select_export.py --pool artifacts\modal_runs\full\scored_pool.parquet --queries data\official\query.parquet --out artifacts\modal_runs\full\try_60 --doc-max 60 --chunk-max 60
+.venv\Scripts\python.exe modal_pipeline\select_export.py --pool artifacts\modal_runs\v1\full\scored_pool.parquet --queries data\official\query.parquet --out artifacts\modal_runs\v1\full\try_60 --doc-max 60 --chunk-max 60
 ```
 Các tham số: `--doc-max --doc-min --doc-min-logit --chunk-max --chunk-min --chunk-min-logit --chunk-per-doc`.
 Nộp vài biến thể lên leaderboard public (tối đa 10 bài mỗi ngày) để chọn ngưỡng.
@@ -70,5 +71,5 @@ Nộp vài biến thể lên leaderboard public (tối đa 10 bài mỗi ngày) 
 Xem `DEFAULT_OPTS` trong `app.py`. Ví dụ `opts.json`:
 
 ```json
-{"max_len": 384, "pool_size": 300, "selection": {"doc_max": 80, "chunk_max": 80}}
+{"version": "v2", "max_len": 384, "pool_size": 300, "selection": {"doc_max": 80, "chunk_max": 80}}
 ```
