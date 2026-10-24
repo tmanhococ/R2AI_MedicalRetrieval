@@ -3,12 +3,18 @@ real Pyserini/Lucene, optionally real NLLB. The Modal volume is replaced by a lo
 
 Needs a Python 3.12 env with CUDA torch, transformers<5, pyserini, faiss-cpu, modal, and Java 21:
     uv venv --python 3.12 ../.venv-gpu
-    uv pip install --python ../.venv-gpu/Scripts/python.exe --index-url https://download.pytorch.org/whl/cu124 torch
     uv pip install --python ../.venv-gpu/Scripts/python.exe "transformers>=4.44,<5" sentencepiece protobuf \
-        huggingface_hub pyarrow numpy pandas modal pytest pyserini faiss-cpu
+        huggingface_hub pyarrow numpy pandas modal pytest pyserini faiss-cpu snowballstemmer
+    # this laptop's driver supports CUDA 12.2, so install the cu121 build after pyserini (which pulls torch>=2.9)
+    uv pip install --python ../.venv-gpu/Scripts/python.exe --index-url https://download.pytorch.org/whl/cu121 \
+        --reinstall-package torch torch==2.5.1
 
+    set JAVA_HOME and HF_HOME (models cached there), then:
     ../.venv-gpu/Scripts/python.exe modal_pipeline/local_smoke.py --bundle artifacts/modal_upload_v2 \
         --official-corpus ../hf_check/links_corpus_vi_en_zh.parquet --work ../smoke_work
+
+--translate with torch 2.5 needs NLLB weights as safetensors (the hub ships only pytorch_model.bin and
+transformers refuses torch.load below torch 2.6); the Modal image pins torch>=2.6, so this is local-only.
 """
 from __future__ import annotations
 
@@ -94,9 +100,8 @@ def main() -> None:
         return out
 
     stage("meta", app.build_meta.local)
-    for s in app._shards():
-        stage(f"encode {s['part']}", app.encode_part.local, s["part"], 512, 0, 8192, v)
-    stage("bm25 index", app.build_bm25.local, 0, 1, v)
+    # Translate first: on Modal it runs in its own container, and on a 4 GB laptop GPU loading NLLB
+    # after E5 + the JVM has crashed inside safetensors' mmap.
     if args.translate:
         stage("translate", app.translate_queries.local, nq, False)
     else:
@@ -104,6 +109,9 @@ def main() -> None:
         (vol_dir / "queries").mkdir(exist_ok=True)
         (vol_dir / "queries" / "variants.jsonl").write_text(
             "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    for s in app._shards():
+        stage(f"encode {s['part']}", app.encode_part.local, s["part"], 512, 0, 8192, v)
+    stage("bm25 index", app.build_bm25.local, 0, 1, v)
     app._check_run_opts(app._run_dir(0, nq, v), o)
     stage("dense search", app.dense_search.local, 0, nq, o["dense_k"], o["max_len"], v)
     stage("bm25 search", app.bm25_search.local, 0, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"], v, 2)

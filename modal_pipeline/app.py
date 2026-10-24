@@ -94,7 +94,7 @@ cpu_image = (
 
 gpu_image = (
     _base.uv_pip_install(
-        "torch>=2.4,<3",
+        "torch>=2.6,<3",  # NLLB ships only pytorch_model.bin; transformers refuses torch.load below 2.6
         "transformers>=4.44,<5",
         "sentencepiece",
         "protobuf",
