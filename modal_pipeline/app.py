@@ -118,7 +118,9 @@ bm25_image = (
         " && tar -xzf /tmp/jdk.tgz -C /opt/jdk --strip-components=1"
         " && rm /tmp/jdk.tgz && ln -sf /opt/jdk/bin/java /usr/local/bin/java"
     )
-    .env({"JAVA_HOME": "/opt/jdk"})
+    # pyserini 2.4 builds an OpenAI client at import time and openai>=2.x rejects an empty key; the
+    # placeholder is never used (only pyserini's OpenAI encoder reads it, and the pipeline does not use it).
+    .env({"JAVA_HOME": "/opt/jdk", "OPENAI_API_KEY": "unused-pyserini-import-guard"})
     .uv_pip_install("pyserini==2.4.0", "faiss-cpu", "snowballstemmer", "pyarrow>=16", "numpy>=1.26,<3", "pandas>=2.2")
     .add_local_file(str(_LEXICAL), "/root/lexical_tokens.py")
     .add_local_python_source("vb_common")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -24,6 +25,8 @@ import pyarrow.parquet as pq
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# Same guard as the Modal BM25 image: pyserini 2.4 builds an OpenAI client at import time.
+os.environ.setdefault("OPENAI_API_KEY", "unused-pyserini-import-guard")
 
 
 class _LocalVolume:
