@@ -59,7 +59,12 @@ def main() -> None:
     ap.add_argument("--boiler-min-count", type=int, default=5,
                     help="Drop chunk texts that occur at least this many times in the corpus (0 = keep all)")
     ap.add_argument("--limit-shards", type=int, default=0, help="Debug: only read the first N chunk shards")
+    ap.add_argument("--official-corpus", type=Path, default=None,
+                    help="Organizers' links parquet (id, url); chunks of documents outside it are dropped")
     args = ap.parse_args()
+    official = None
+    if args.official_corpus:
+        official = np.unique(pq.read_table(args.official_corpus, columns=["id"])["id"].to_numpy())
 
     shards = sorted(args.snapshot.glob("chunks_*.parquet"))
     if args.limit_shards:
@@ -71,10 +76,13 @@ def main() -> None:
     print(f"Pass 1/2: hashing chunk ids and texts in {len(shards)} shards ...", flush=True)
     shard_hashes: list[np.ndarray] = []
     id_hashes: list[np.ndarray] = []
+    shard_official: list[np.ndarray] = []
     for i, shard in enumerate(shards, 1):
-        t = pq.read_table(shard, columns=["chunk_id", "text"])
+        t = pq.read_table(shard, columns=["chunk_id", "doc_id", "text"])
         id_hashes.append(_text_hashes(t["chunk_id"].to_pylist()))
         shard_hashes.append(_text_hashes(t["text"].to_pylist()))
+        docs = t["doc_id"].to_numpy()
+        shard_official.append(np.isin(docs, official) if official is not None else np.ones(len(docs), dtype=bool))
         if i % 20 == 0 or i == len(shards):
             print(f"  [{time.time() - t0:5.0f}s] hashed {i}/{len(shards)}", flush=True)
     # The snapshot re-wrote some chunks when it was resumed: keep each chunk_id's first copy.
@@ -83,7 +91,9 @@ def main() -> None:
     first_copy[np.unique(all_ids, return_index=True)[1]] = True
     bounds = np.cumsum([0] + [len(h) for h in id_hashes])
     shard_first = [first_copy[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
-    uniq, counts = np.unique(np.concatenate(shard_hashes)[first_copy], return_counts=True)
+    # Boilerplate is judged inside the corpus that will be indexed (official docs only when filtering).
+    in_scope = first_copy & np.concatenate(shard_official)
+    uniq, counts = np.unique(np.concatenate(shard_hashes)[in_scope], return_counts=True)
     print(f"  {len(all_ids):,} rows, {int(first_copy.sum()):,} unique chunk ids, {len(uniq):,} distinct texts",
           flush=True)
     del all_ids, first_copy, id_hashes
@@ -103,8 +113,8 @@ def main() -> None:
     pending: list[pa.Table] = []
     pending_rows = 0
     part_idx = 0
-    stats = {"rows_in": 0, "rows_out": 0, "dropped_duplicate_id": 0, "dropped_boiler": 0,
-             "dropped_empty": 0, "dropped_noncontiguous": 0}
+    stats = {"rows_in": 0, "rows_out": 0, "dropped_duplicate_id": 0, "dropped_off_corpus": 0,
+             "dropped_boiler": 0, "dropped_empty": 0, "dropped_noncontiguous": 0}
     lang_counts: dict[str, int] = {}
     kept_docs: set[int] = set()
 
@@ -121,12 +131,14 @@ def main() -> None:
         )
         part_idx += 1
 
-    for i, (shard, hashes, firsts) in enumerate(zip(shards, shard_hashes, shard_first), 1):
+    for i, (shard, hashes, firsts, in_official) in enumerate(zip(shards, shard_hashes, shard_first, shard_official), 1):
         t = pq.read_table(shard, columns=CHUNK_COLS)
         stats["rows_in"] += t.num_rows
 
         keep = firsts.copy()
         stats["dropped_duplicate_id"] += int((~firsts).sum())
+        stats["dropped_off_corpus"] += int((keep & ~in_official).sum())
+        keep &= in_official
         if args.boiler_min_count:
             boiler = (counts[np.searchsorted(uniq, hashes)] >= args.boiler_min_count) & keep
             stats["dropped_boiler"] += int(boiler.sum())
@@ -186,6 +198,8 @@ def main() -> None:
     manifest = {
         "source_snapshot": str(args.snapshot),
         "boiler_min_count": args.boiler_min_count,
+        "official_corpus": str(args.official_corpus) if args.official_corpus else None,
+        "official_total": int(len(official)) if official is not None else None,
         "parts": part_idx,
         "docs_out": len(kept_docs),
         "languages_out": lang_counts,
