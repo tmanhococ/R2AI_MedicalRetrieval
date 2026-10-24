@@ -19,7 +19,8 @@ MAX_QUERY_TERMS = 1000  # Lucene BooleanQuery default max clause count is 1024
 
 def compose_passage(title: str | None, section: str | None, text: str) -> str:
     """Same layout as the snapshot's index_text: '<title> - <section>\\n\\n<text>'."""
-    head = " - ".join(x.strip() for x in (title, section) if x and x.strip())
+    # pandas hands missing strings over as None or NaN
+    head = " - ".join(x.strip() for x in (title, section) if isinstance(x, str) and x.strip())
     return f"{head}\n\n{text}" if head else text
 
 

@@ -292,3 +292,11 @@ def test_tokenize_part_stems_english_chunks(stack, tmp_path):
     assert chunks[0] == {"id": "100", "contents": "diabet trial treat patient"}
     assert chunks[2]["contents"] == "tiêu đề điều trị"
     assert docs[0] == {"id": "5", "contents": "diabet trial treat patient infect"}
+
+
+def test_compose_passage_tolerates_pandas_missing_values():
+    nan = float("nan")
+    assert vc.compose_passage(nan, None, "body") == "body"
+    assert vc.compose_passage("T", nan, "body") == "T\n\nbody"
+    pool = pd.DataFrame({"title": ["T", None], "section": [None, None], "text": ["a", "b"]})
+    assert [vc.compose_passage(a, b, c) for a, b, c in zip(pool["title"], pool["section"], pool["text"])] == ["T\n\na", "b"]
