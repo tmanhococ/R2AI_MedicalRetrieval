@@ -43,11 +43,26 @@ def _tokenize_lexical(text: str) -> list[str]:
     return _lexical.tokenize_lexical(text, language="und")
 
 
-def bm25_tokens(text: str | None) -> list[str]:
+_ASCII_WORD = re.compile(r"[a-z]+")
+_stemmer = None
+
+
+def _stem_english(tokens: list[str]) -> list[str]:
+    global _stemmer
+    if _stemmer is None:
+        import snowballstemmer
+
+        _stemmer = snowballstemmer.stemmer("english")
+    return [_stemmer.stemWord(t) if _ASCII_WORD.fullmatch(t) else t for t in tokens]
+
+
+def bm25_tokens(text: str | None, lang: str | None = None) -> list[str]:
     """Repo lexical tokenizer for non-CJK text, overlapping bigrams for CJK runs.
 
     The repo tokenizer emits single CJK characters; bigrams are the standard
     Lucene CJK treatment and are far more selective for Chinese BM25.
+    With lang="en", plain ASCII words are Snowball-stemmed (PubMed chunks and the English
+    query variant); medical tokens such as covid-19, her2+ or 50mg/ml are left as is.
     """
     if not text:
         return []
@@ -65,14 +80,14 @@ def bm25_tokens(text: str | None) -> list[str]:
         pos = m.end()
     if pos < len(text):
         out.extend(_tokenize_lexical(text[pos:]))
-    return out
+    return _stem_english(out) if lang == "en" else out
 
 
-def bm25_query_string(text: str | None) -> str:
+def bm25_query_string(text: str | None, lang: str | None = None) -> str:
     """Whitespace-joined tokens with at most MAX_QUERY_TERMS distinct terms."""
     kept: list[str] = []
     distinct: set[str] = set()
-    for tok in bm25_tokens(text):
+    for tok in bm25_tokens(text, lang):
         if tok not in distinct:
             if len(distinct) >= MAX_QUERY_TERMS:
                 continue

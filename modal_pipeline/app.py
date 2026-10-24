@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 import modal
@@ -118,7 +119,7 @@ bm25_image = (
         " && rm /tmp/jdk.tgz && ln -sf /opt/jdk/bin/java /usr/local/bin/java"
     )
     .env({"JAVA_HOME": "/opt/jdk"})
-    .uv_pip_install("pyserini", "faiss-cpu", "pyarrow>=16", "numpy>=1.26,<3", "pandas>=2.2")
+    .uv_pip_install("pyserini==2.4.0", "faiss-cpu", "snowballstemmer", "pyarrow>=16", "numpy>=1.26,<3", "pandas>=2.2")
     .add_local_file(str(_LEXICAL), "/root/lexical_tokens.py")
     .add_local_python_source("vb_common")
 )
@@ -383,21 +384,21 @@ def _tokenize_part(args: tuple[str, int, str, str]) -> dict:
     from vb_common import bm25_tokens
 
     path, offset, out_chunks, out_docs = args
-    t = pq.read_table(path, columns=["doc_id", "title", "section", "text"])
+    t = pq.read_table(path, columns=["doc_id", "language", "title", "section", "text"])
     stem = Path(path).stem
     title_cache: dict[int, list[str]] = {}
     doc_order: list[int] = []
     doc_body: dict[int, list[str]] = {}
     n_tokens = 0
     with open(f"{out_chunks}/{stem}.jsonl", "w", encoding="utf-8") as fc:
-        cols = (t[c].to_pylist() for c in ("doc_id", "title", "section", "text"))
-        for i, (doc, title, section, text) in enumerate(zip(*cols)):
+        cols = (t[c].to_pylist() for c in ("doc_id", "language", "title", "section", "text"))
+        for i, (doc, lang, title, section, text) in enumerate(zip(*cols)):
             if doc not in title_cache:
-                title_cache[doc] = bm25_tokens(title)
+                title_cache[doc] = bm25_tokens(title, lang)
                 doc_order.append(doc)
                 doc_body[doc] = []
-            body = " ".join(bm25_tokens(text))
-            head = " ".join(title_cache[doc] + bm25_tokens(section))
+            body = " ".join(bm25_tokens(text, lang))
+            head = " ".join(title_cache[doc] + bm25_tokens(section, lang))
             n_tokens += body.count(" ") + 1
             fc.write(json.dumps({"id": str(offset + i), "contents": f"{head} {body}".strip()}, ensure_ascii=False) + "\n")
             doc_body[doc].append(body)  # joined strings: per-token lists would cost GBs per worker
@@ -421,15 +422,18 @@ def build_bm25(parts: int = 0, threads: int = 16, version: str = DEFAULT_OPTS["v
     rows = sum(s["rows"] for s in shards)
     if _index_done(target, "chunks", rows) and _index_done(target, "docs", rows):
         return {"skipped": True}
-    work = Path("/tmp/bm25")
+    work = Path(tempfile.gettempdir()) / "bm25"
     in_c, in_d = work / "in_chunks", work / "in_docs"
     for d in (in_c, in_d):
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True)
     t0 = time.time()
     jobs = [(str(_data_dir() / "chunks" / s["part"]), s["offset"], str(in_c), str(in_d)) for s in shards]
-    with mp.get_context("fork").Pool(threads) as pool:
-        stats = list(pool.imap_unordered(_tokenize_part, jobs))
+    if threads > 1 and "fork" in mp.get_all_start_methods():
+        with mp.get_context("fork").Pool(threads) as pool:
+            stats = list(pool.imap_unordered(_tokenize_part, jobs))
+    else:  # local runs on Windows: no fork
+        stats = [_tokenize_part(j) for j in jobs]
     report = {"tokenize_secs": round(time.time() - t0), "tokens": sum(s["tokens"] for s in stats)}
     for name, inp in (("chunks", in_c), ("docs", in_d)):
         if _index_done(target, name, rows):
@@ -463,7 +467,7 @@ def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: f
     vol.reload()
     run = _run_dir(parts, nq, version)
     src = _bm25_dir(parts, version)
-    qs = [(qid, lang, bm25_query_string(text)) for qid, lang, text in _query_variant_list(nq)]
+    qs = [(qid, lang, bm25_query_string(text, lang)) for qid, lang, text in _query_variant_list(nq)]
     qs = [q for q in qs if q[2]]
     from pyserini.analysis import JWhiteSpaceAnalyzer
     from pyserini.search.lucene import LuceneSearcher
@@ -474,7 +478,7 @@ def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: f
         if out.exists():
             report[name] = "skipped"
             continue
-        local = Path(f"/tmp/idx_{name}")
+        local = Path(tempfile.gettempdir()) / f"idx_{name}"
         if not local.exists():
             shutil.copytree(src / name, local)
         searcher = LuceneSearcher(str(local))

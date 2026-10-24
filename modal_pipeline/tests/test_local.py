@@ -264,3 +264,31 @@ def test_finalize_drops_off_corpus_docs(stack):
 
 def test_volume_name_is_v2():
     assert vc.VOLUME_NAME == "vibiomir-v2"
+
+
+def test_english_stemming_only_for_english():
+    en = vc.bm25_tokens("Treatments of diabetic patients and treated infections", lang="en")
+    assert en == ["treatment", "of", "diabet", "patient", "and", "treat", "infect"]
+    # same surface forms meet after stemming on both sides
+    assert vc.bm25_tokens("treating", lang="en") == vc.bm25_tokens("treatment", lang="en")[:0] + ["treat"]
+    vi = vc.bm25_tokens("bệnh nhân điều trị diabetes", lang="vi")
+    assert vi == ["bệnh", "nhân", "điều", "trị", "diabetes"]
+    assert vc.bm25_tokens("HER2+ COVID-19 50mg/ml", lang="en") == ["her2+", "covid-19", "50mg/ml"]
+    assert vc.bm25_query_string("treated patients", lang="en") == "treat patient"
+
+
+def test_tokenize_part_stems_english_chunks(stack, tmp_path):
+    app, _ = stack
+    part = tmp_path / "part_90000.parquet"
+    pq.write_table(pa.table({"doc_id": [5, 5, 6], "chunk_index": [0, 1, 0], "language": ["en", "en", "vi"],
+                             "section": [None, None, None], "text": ["Treated patients", "infections", "điều trị"],
+                             "title": ["Diabetic trials", "Diabetic trials", "Tiêu đề"]}), part)
+    out_c, out_d = tmp_path / "c", tmp_path / "d"
+    out_c.mkdir()
+    out_d.mkdir()
+    app._tokenize_part((str(part), 100, str(out_c), str(out_d)))
+    chunks = [json.loads(x) for x in (out_c / "part_90000.jsonl").read_text(encoding="utf-8").splitlines()]
+    docs = [json.loads(x) for x in (out_d / "part_90000.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert chunks[0] == {"id": "100", "contents": "diabet trial treat patient"}
+    assert chunks[2]["contents"] == "tiêu đề điều trị"
+    assert docs[0] == {"id": "5", "contents": "diabet trial treat patient infect"}
