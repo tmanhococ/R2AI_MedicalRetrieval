@@ -140,7 +140,10 @@ def main() -> None:
         stats["dropped_off_corpus"] += int((keep & ~in_official).sum())
         keep &= in_official
         if args.boiler_min_count:
-            boiler = (counts[np.searchsorted(uniq, hashes)] >= args.boiler_min_count) & keep
+            # counts only cover in-scope texts, so look up kept rows only
+            boiler = np.zeros(len(keep), dtype=bool)
+            kept = np.flatnonzero(keep)
+            boiler[kept] = counts[np.searchsorted(uniq, hashes[kept])] >= args.boiler_min_count
             stats["dropped_boiler"] += int(boiler.sum())
             keep &= ~boiler
         empty = ~pc.greater(pc.utf8_length(pc.utf8_trim_whitespace(t["text"])), 0).to_numpy(zero_copy_only=False)

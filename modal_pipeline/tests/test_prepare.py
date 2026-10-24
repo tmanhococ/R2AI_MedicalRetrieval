@@ -25,8 +25,10 @@ def _snapshot(root: Path) -> Path:
             _chunk(2, 0, "doc two off corpus"),
             _chunk(3, 0, "doc three"), _chunk(3, 1, "menu")]
     rows += [_chunk(10 + i, 0, "menu") for i in range(5)]  # boilerplate only in off-corpus docs
+    # many distinct off-corpus texts: some hash beyond every in-corpus hash (regression for an IndexError)
+    rows += [_chunk(100 + i, 0, f"off corpus text {i}") for i in range(50)]
     pq.write_table(pa.Table.from_pylist(rows), snap / "chunks_00000.parquet")
-    pq.write_table(pa.Table.from_pylist([{"doc_id": d, "title": f"T{d}"} for d in (1, 2, 3, *range(10, 15))]),
+    pq.write_table(pa.Table.from_pylist([{"doc_id": d, "title": f"T{d}"} for d in (1, 2, 3, *range(10, 15), *range(100, 150))]),
                    snap / "documents_00000.parquet")
     pq.write_table(pa.table({"id": [1], "query": ["q"]}), root / "query.parquet")
     pq.write_table(pa.table({"id": [1, 3, 99], "url": ["u1", "u3", "u99"]}), root / "official.parquet")
@@ -47,7 +49,7 @@ def test_official_filter_drops_off_corpus_docs(tmp_path):
     assert sorted(set(t["doc_id"].to_pylist())) == [1, 3]
     # boilerplate is counted inside the official corpus only: "menu" occurs once there, so it is kept
     assert "menu" in t["text"].to_pylist()
-    assert m["official_total"] == 3 and m["docs_out"] == 2 and m["dropped_off_corpus"] == 6
+    assert m["official_total"] == 3 and m["docs_out"] == 2 and m["dropped_off_corpus"] == 56
 
 
 def test_without_official_filter_keeps_all_docs(tmp_path):
