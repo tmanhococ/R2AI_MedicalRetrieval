@@ -198,6 +198,8 @@ def main() -> None:
         stats["rows_out"] += pending_rows
 
     shutil.copy2(args.queries, args.out / "query.parquet")
+    if args.official_corpus:  # finalize on Modal rejects any doc id outside this list
+        shutil.copy2(args.official_corpus, args.out / "official_corpus.parquet")
     manifest = {
         "source_snapshot": str(args.snapshot),
         "boiler_min_count": args.boiler_min_count,

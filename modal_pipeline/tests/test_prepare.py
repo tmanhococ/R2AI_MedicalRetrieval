@@ -50,6 +50,8 @@ def test_official_filter_drops_off_corpus_docs(tmp_path):
     # boilerplate is counted inside the official corpus only: "menu" occurs once there, so it is kept
     assert "menu" in t["text"].to_pylist()
     assert m["official_total"] == 3 and m["docs_out"] == 2 and m["dropped_off_corpus"] == 56
+    # the bundle carries the official list so finalize can reject off-corpus docs on Modal
+    assert pq.read_table(tmp_path / "out" / "official_corpus.parquet")["id"].to_pylist() == [1, 3, 99]
 
 
 def test_without_official_filter_keeps_all_docs(tmp_path):
