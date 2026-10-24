@@ -87,7 +87,7 @@ def _download_models() -> None:
 _base = modal.Image.debian_slim(python_version="3.12")
 
 cpu_image = (
-    _base.uv_pip_install("pyarrow>=16", "numpy>=1.26,<3", "pandas>=2.2")
+    _base.uv_pip_install("pyarrow>=16", "numpy>=1.26,<3", "pandas>=2.2", "snowballstemmer")
     .add_local_file(str(_LEXICAL), "/root/lexical_tokens.py")
     .add_local_python_source("vb_common")
 )
@@ -102,6 +102,7 @@ gpu_image = (
         "pyarrow>=16",
         "numpy>=1.26,<3",
         "pandas>=2.2",
+        "snowballstemmer",
     )
     .run_function(_download_models)
     .env({"HF_HOME": "/hf", "TOKENIZERS_PARALLELISM": "true"})
@@ -167,6 +168,13 @@ def _emb_path(part: str, max_len: int, version: str) -> Path:
 
 def _bm25_dir(parts: int, version: str) -> Path:
     return VOL / "bm25" / version / _index_tag(parts)
+
+
+def _local_index_dir(src: Path, name: str) -> Path:
+    """Container-local copy of a Lucene index, keyed by its source so a warm container that served
+    a tiny run never answers a full run from the tiny index."""
+    key = "_".join(src.relative_to(VOL).parts + (name,))
+    return Path(tempfile.gettempdir()) / f"idx_{key}"
 
 
 def _run_dir(parts: int, nq: int, version: str = DEFAULT_OPTS["version"]) -> Path:
@@ -386,21 +394,21 @@ def _tokenize_part(args: tuple[str, int, str, str]) -> dict:
     from vb_common import bm25_tokens
 
     path, offset, out_chunks, out_docs = args
-    t = pq.read_table(path, columns=["doc_id", "language", "title", "section", "text"])
+    t = pq.read_table(path, columns=["doc_id", "title", "section", "text"])
     stem = Path(path).stem
     title_cache: dict[int, list[str]] = {}
     doc_order: list[int] = []
     doc_body: dict[int, list[str]] = {}
     n_tokens = 0
     with open(f"{out_chunks}/{stem}.jsonl", "w", encoding="utf-8") as fc:
-        cols = (t[c].to_pylist() for c in ("doc_id", "language", "title", "section", "text"))
-        for i, (doc, lang, title, section, text) in enumerate(zip(*cols)):
+        cols = (t[c].to_pylist() for c in ("doc_id", "title", "section", "text"))
+        for i, (doc, title, section, text) in enumerate(zip(*cols)):
             if doc not in title_cache:
-                title_cache[doc] = bm25_tokens(title, lang)
+                title_cache[doc] = bm25_tokens(title)
                 doc_order.append(doc)
                 doc_body[doc] = []
-            body = " ".join(bm25_tokens(text, lang))
-            head = " ".join(title_cache[doc] + bm25_tokens(section, lang))
+            body = " ".join(bm25_tokens(text))
+            head = " ".join(title_cache[doc] + bm25_tokens(section))
             n_tokens += body.count(" ") + 1
             fc.write(json.dumps({"id": str(offset + i), "contents": f"{head} {body}".strip()}, ensure_ascii=False) + "\n")
             doc_body[doc].append(body)  # joined strings: per-token lists would cost GBs per worker
@@ -469,7 +477,7 @@ def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: f
     vol.reload()
     run = _run_dir(parts, nq, version)
     src = _bm25_dir(parts, version)
-    qs = [(qid, lang, bm25_query_string(text, lang)) for qid, lang, text in _query_variant_list(nq)]
+    qs = [(qid, lang, bm25_query_string(text)) for qid, lang, text in _query_variant_list(nq)]
     qs = [q for q in qs if q[2]]
     from pyserini.analysis import JWhiteSpaceAnalyzer
     from pyserini.search.lucene import LuceneSearcher
@@ -480,7 +488,7 @@ def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: f
         if out.exists():
             report[name] = "skipped"
             continue
-        local = Path(tempfile.gettempdir()) / f"idx_{name}"
+        local = _local_index_dir(src, name)
         if not local.exists():
             shutil.copytree(src / name, local)
         searcher = LuceneSearcher(str(local))

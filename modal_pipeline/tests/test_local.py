@@ -266,15 +266,13 @@ def test_volume_name_is_v2():
     assert vc.VOLUME_NAME == "vibiomir-v2"
 
 
-def test_english_stemming_only_for_english():
-    en = vc.bm25_tokens("Treatments of diabetic patients and treated infections", lang="en")
+def test_english_stemming():
+    en = vc.bm25_tokens("Treatments of diabetic patients and treated infections")
     assert en == ["treatment", "of", "diabet", "patient", "and", "treat", "infect"]
-    # same surface forms meet after stemming on both sides
-    assert vc.bm25_tokens("treating", lang="en") == vc.bm25_tokens("treatment", lang="en")[:0] + ["treat"]
-    vi = vc.bm25_tokens("bệnh nhân điều trị diabetes", lang="vi")
-    assert vi == ["bệnh", "nhân", "điều", "trị", "diabetes"]
-    assert vc.bm25_tokens("HER2+ COVID-19 50mg/ml", lang="en") == ["her2+", "covid-19", "50mg/ml"]
-    assert vc.bm25_query_string("treated patients", lang="en") == "treat patient"
+    assert vc.bm25_tokens("treating") == ["treat"]
+    assert vc.bm25_tokens("bệnh nhân điều trị diabetes") == ["bệnh", "nhân", "điều", "trị", "diabet"]
+    assert vc.bm25_tokens("HER2+ COVID-19 50mg/ml") == ["her2+", "covid-19", "50mg/ml"]
+    assert vc.bm25_query_string("treated patients") == "treat patient"
 
 
 def test_tokenize_part_stems_english_chunks(stack, tmp_path):
@@ -307,3 +305,21 @@ def test_quality_report_threshold_is_configurable():
     scored = [{"qid": q, "ce": -1.0} for q in range(30)]
     assert not vc.quality_report(res, scored)["passed"]
     assert vc.quality_report(res, scored, min_median_ce=-3.0)["passed"]
+
+
+def test_ascii_words_are_stemmed_in_every_language():
+    # loanwords in Vietnamese text must meet stemmed PubMed text, and vice versa
+    assert vc.bm25_tokens("Bệnh diabetes và hepatitis") == vc.bm25_tokens("bệnh diabetic và hepatitis")[:1] + ["diabet", "và", "hepat"]
+    assert vc.bm25_tokens("diabetes") == vc.bm25_tokens("diabetic") == ["diabet"]
+    # common accent-free Vietnamese syllables are left alone
+    syllables = "sinh tinh trong phong hay theo mang cao tay may gan tim ung thu con cho khi nam thanh nhung tai mat"
+    assert vc.bm25_tokens(syllables) == syllables.split()
+
+
+def test_local_index_copy_is_keyed_by_source(stack):
+    app, _ = stack
+    tiny = app._local_index_dir(app._bm25_dir(1, "v1"), "chunks")
+    full = app._local_index_dir(app._bm25_dir(0, "v1"), "chunks")
+    other = app._local_index_dir(app._bm25_dir(0, "v2"), "chunks")
+    assert len({tiny, full, other}) == 3
+    assert app._local_index_dir(app._bm25_dir(0, "v1"), "docs") != full
