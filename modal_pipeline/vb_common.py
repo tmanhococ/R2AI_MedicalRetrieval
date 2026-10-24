@@ -11,6 +11,8 @@ import re
 import unicodedata
 import zipfile
 
+VOLUME_NAME = "vibiomir-v2"  # v2 data layout (official-corpus filter + PubMed); v1 lives on "vibiomir"
+
 _CJK_RUN = re.compile(r"[㐀-䶿一-鿿豈-﫿]+")
 MAX_QUERY_TERMS = 1000  # Lucene BooleanQuery default max clause count is 1024
 

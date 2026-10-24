@@ -17,6 +17,7 @@ import zipfile
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -241,3 +242,25 @@ def test_quality_report_flags_degenerate_output():
     assert not vc.quality_report(good_res, low_ce)["passed"]
     empty = good_res[:-1] + [{"id": 29, "relevant_docs": [], "relevant_chunks": []}]
     assert vc.quality_report(empty, good_scored)["empty_queries"] == 1
+
+
+def test_finalize_drops_off_corpus_docs(stack):
+    app, vol = stack
+    run = app._run_dir(2, NQ)
+    pool = pd.read_parquet(run / "pool.parquet")
+    banned = int(pool["doc_id"].value_counts().index[0])  # the doc with most pool rows
+    allowed = sorted(set(np.load(vol / "meta" / "chunk_doc.npy").tolist()) - {banned})
+    pq.write_table(pa.table({"id": allowed, "url": ["u"] * len(allowed)}), vol / "data" / "official_corpus.parquet")
+    try:
+        opts = {**app.DEFAULT_OPTS, "nq": NQ, "rerank_batches": 3}
+        info = app.finalize.local(2, NQ, json.dumps(opts))
+        results = json.loads((run / "results.json").read_text(encoding="utf-8"))
+    finally:
+        (vol / "data" / "official_corpus.parquet").unlink()
+    assert info["dropped_off_corpus_rows"] == int((pool["doc_id"] == banned).sum())
+    assert all(banned not in r["relevant_docs"] for r in results)
+    assert all(c["doc_id"] != banned for r in results for c in r["relevant_chunks"])
+
+
+def test_volume_name_is_v2():
+    assert vc.VOLUME_NAME == "vibiomir-v2"

@@ -1,10 +1,10 @@
-"""Resumable upload of the prepared bundle to the Modal volume `vibiomir` under /data.
+"""Resumable upload of the prepared bundle to the Modal volume (vb_common.VOLUME_NAME) under /data.
 
 Files already on the volume with the same size are skipped, so the script can be
 re-run after a dropped connection.
 
-    python modal_pipeline/upload.py artifacts/modal_upload
-    python modal_pipeline/upload.py artifacts/modal_upload --only query.parquet upload_manifest.json chunks/part_00000.parquet
+    python modal_pipeline/upload.py artifacts/modal_upload_v2
+    python modal_pipeline/upload.py artifacts/modal_upload_v2 --only query.parquet official_corpus.parquet chunks/part_00000.parquet
 """
 from __future__ import annotations
 
@@ -16,16 +16,19 @@ import time
 
 import modal
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from vb_common import VOLUME_NAME  # noqa: E402
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("src", nargs="?", type=Path, default=Path("artifacts/modal_upload"))
+    ap.add_argument("src", nargs="?", type=Path, default=Path("artifacts/modal_upload_v2"))
     ap.add_argument("--only", nargs="+", default=None, help="glob patterns relative to src (posix paths)")
     args = ap.parse_args()
     src = args.src
     if not (src / "chunks").is_dir():
         sys.exit(f"{src} has no chunks/ folder; run prepare_upload.py first")
-    vol = modal.Volume.from_name("vibiomir", create_if_missing=True)
+    vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     try:
         remote = {e.path.lstrip("/"): e.size for e in vol.listdir("/data", recursive=True)}
     except Exception:  # nothing uploaded yet

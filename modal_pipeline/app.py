@@ -30,6 +30,8 @@ import modal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # so add_local_python_source finds vb_common
 
+from vb_common import VOLUME_NAME  # noqa: E402
+
 APP_NAME = "vibiomir"
 VOL = Path("/vol")
 MODELS = Path("/models")
@@ -69,7 +71,7 @@ DEFAULT_OPTS = {
 _HERE = Path(__file__).resolve().parent
 _LEXICAL = _HERE.parent / "src" / "indexing" / "lexical_tokens.py"
 
-vol = modal.Volume.from_name("vibiomir", create_if_missing=True)
+vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 hf_vol = modal.Volume.from_name("vibiomir-hf-cache", create_if_missing=True)
 
 
@@ -725,6 +727,14 @@ def finalize(parts: int, nq: int, opts_json: str) -> dict:
     scored = pool.merge(scores, on=["qid", "row"], how="left")
     if scored["ce"].isna().any():
         raise RuntimeError(f"{int(scored['ce'].isna().sum())} pool rows have no reranker score")
+    # Documents outside the organizers' corpus can never be correct; drop them before selection.
+    dropped_off_corpus = 0
+    official_path = _data_dir() / "official_corpus.parquet"
+    if official_path.exists():
+        official = pd.read_parquet(official_path, columns=["id"])["id"]
+        inside = scored["doc_id"].isin(official)
+        dropped_off_corpus = int((~inside).sum())
+        scored = scored[inside]
     _write_parquet(scored, run / "scored_pool.parquet")
 
     params = SelectionParams(**o["selection"])
@@ -744,6 +754,7 @@ def finalize(parts: int, nq: int, opts_json: str) -> dict:
         "avg_docs": round(sum(len(r["relevant_docs"]) for r in results) / n, 1),
         "avg_chunks": round(sum(len(r["relevant_chunks"]) for r in results) / n, 1),
         "zip_mb": round(len(zbytes) / 1e6, 1),
+        "dropped_off_corpus_rows": dropped_off_corpus,
     }
 
 
