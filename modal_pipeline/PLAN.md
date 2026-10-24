@@ -13,7 +13,7 @@ with 1 part and 30 queries.
   No `--stage bench`, no full run, no H100/A100. Upload only `chunks/part_00000.parquet`, `query.parquet`, `upload_manifest.json`.
 - Max 2 retries per failing Modal command; after that stop and record the failure in `RUN_STATUS.md`.
 - If Modal refuses GPUs (no payment method), stop the cloud part, record it, do not work around it.
-- Never print the token values; load them from `.env` into the environment only.
+- Never print token values. Auth comes from `~/.modal.toml` (profile `mle29022`, set up by the user); no `.env` is used.
 - Never delete anything on the Modal volume.
 
 ## Tasks and gates
@@ -43,7 +43,7 @@ Gate T4: `git ls-remote origin refs/heads/feature/modal-pipeline` prints the sam
 If push needs interactive credentials, skip and record it (the commit stays local).
 
 ### T5. Tiny run on Modal
-Preconditions: `.env` exists with MODAL_TOKEN_ID / MODAL_TOKEN_SECRET; `modal` installed in `.venv`;
+Preconditions: `modal profile current` prints `mle29022`; `modal` installed in `.venv`;
 `modal profile current` (or a `Volume.from_name(...).listdir` call) succeeds.
 Steps: upload subset -> `modal run modal_pipeline/app.py --stage all --parts 1 --nq 30`.
 Gate T5: exit code 0; log has lines for meta, encode, bm25 index, translate, dense search, bm25 search, pool, rerank,
