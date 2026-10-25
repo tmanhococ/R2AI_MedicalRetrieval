@@ -28,8 +28,13 @@ Corpus chính thức: `https://huggingface.co/datasets/AIGuruTinix/ViBioMIR/reso
 
 ## 1. Dựng bundle v2 (đã chạy sẵn đêm 25/10, kết quả ở `artifacts\modal_upload_v2`)
 
+Snapshot 22 GB `phase2_full` đã được thu gọn thành `phase2_official` (2,9 GB), chỉ giữ tài liệu thuộc corpus chính thức,
+bằng `slim_snapshot.py`. Đã kiểm chứng: dựng bundle từ bản thu gọn cho ra 34 part giống hệt bundle v2.
+Bản 22 GB đã được xoá theo yêu cầu. Phải chạy `build_extra_parts.py` lại sau mỗi lần chạy `prepare_upload.py`,
+vì `prepare_upload.py` xoá thư mục `chunks/`.
+
 ```powershell
-.venv\Scripts\python.exe modal_pipeline\prepare_upload.py --snapshot artifacts\vibiomir\snapshots\phase2_full --queries data\official\query.parquet --official-corpus ..\hf_check\links_corpus_vi_en_zh.parquet --out artifacts\modal_upload_v2
+.venv\Scripts\python.exe modal_pipeline\prepare_upload.py --snapshot artifacts\vibiomir\snapshots\phase2_official --queries data\official\query.parquet --official-corpus ..\hf_check\links_corpus_vi_en_zh.parquet --out artifacts\modal_upload_v2
 .venv\Scripts\python.exe modal_pipeline\fetch_pubmed.py --official-corpus ..\hf_check\links_corpus_vi_en_zh.parquet --out artifacts\pubmed
 .venv\Scripts\python.exe modal_pipeline\build_extra_parts.py --pubmed artifacts\pubmed --bundle artifacts\modal_upload_v2
 .venv\Scripts\python.exe modal_pipeline\upload.py artifacts\modal_upload_v2

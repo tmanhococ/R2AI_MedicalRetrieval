@@ -1,4 +1,4 @@
-"""Slim the local phase2_full snapshot into a compact upload bundle for Modal.
+"""Slim the local snapshot (phase2_official since 2026-10-25) into a compact upload bundle for Modal.
 
 Pass 1 hashes every chunk text and counts exact duplicates across the corpus.
 Pass 2 drops boilerplate (texts repeated >= --boiler-min-count times: menus,
@@ -10,7 +10,7 @@ every Modal stage (BM25, embeddings, rerank) keys chunks by that row id.
 
 Usage (from mvp-rag-medical/):
     .venv/Scripts/python.exe modal_pipeline/prepare_upload.py \
-        --snapshot artifacts/vibiomir/snapshots/phase2_full \
+        --snapshot artifacts/vibiomir/snapshots/phase2_official \
         --queries data/official/query.parquet \
         --out artifacts/modal_upload
 """
