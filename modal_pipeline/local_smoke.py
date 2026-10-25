@@ -11,7 +11,7 @@ Needs a Python 3.12 env with CUDA torch, transformers<5, pyserini, faiss-cpu, mo
 
     set JAVA_HOME and HF_HOME (models cached there), then:
     ../.venv-gpu/Scripts/python.exe modal_pipeline/local_smoke.py --bundle artifacts/modal_upload_v2 \
-        --official-corpus ../hf_check/links_corpus_vi_en_zh.parquet --work ../smoke_work
+        --official-corpus data/official/links_corpus_vi_en_zh.parquet --work ../smoke_work
 
 --translate with torch 2.5 needs NLLB weights as safetensors (the hub ships only pytorch_model.bin and
 transformers refuses torch.load below torch 2.6); the Modal image pins torch>=2.6, so this is local-only.

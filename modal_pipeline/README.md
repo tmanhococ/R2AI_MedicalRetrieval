@@ -24,7 +24,7 @@ uv pip install --python .venv\Scripts\python.exe modal snowballstemmer   # venv 
 ```
 Modal yêu cầu có thẻ thanh toán thì mới dùng được GPU. Gói Starter có 30 USD credit mỗi tháng và tối đa 10 GPU chạy cùng lúc.
 Corpus chính thức: `https://huggingface.co/datasets/AIGuruTinix/ViBioMIR/resolve/main/links_corpus_vi_en_zh.parquet`
-(đã tải sẵn về `..\hf_check\`).
+(đã tải sẵn về `data\official\`).
 
 ## 1. Dựng bundle v2 (đã chạy sẵn đêm 25/10, kết quả ở `artifacts\modal_upload_v2`)
 
@@ -34,8 +34,8 @@ Bản 22 GB đã được xoá theo yêu cầu. Phải chạy `build_extra_parts
 vì `prepare_upload.py` xoá thư mục `chunks/`.
 
 ```powershell
-.venv\Scripts\python.exe modal_pipeline\prepare_upload.py --snapshot artifacts\vibiomir\snapshots\phase2_official --queries data\official\query.parquet --official-corpus ..\hf_check\links_corpus_vi_en_zh.parquet --out artifacts\modal_upload_v2
-.venv\Scripts\python.exe modal_pipeline\fetch_pubmed.py --official-corpus ..\hf_check\links_corpus_vi_en_zh.parquet --out artifacts\pubmed
+.venv\Scripts\python.exe modal_pipeline\prepare_upload.py --snapshot artifacts\vibiomir\snapshots\phase2_official --queries data\official\query.parquet --official-corpus data\official\links_corpus_vi_en_zh.parquet --out artifacts\modal_upload_v2
+.venv\Scripts\python.exe modal_pipeline\fetch_pubmed.py --official-corpus data\official\links_corpus_vi_en_zh.parquet --out artifacts\pubmed
 .venv\Scripts\python.exe modal_pipeline\build_extra_parts.py --pubmed artifacts\pubmed --bundle artifacts\modal_upload_v2
 .venv\Scripts\python.exe modal_pipeline\upload.py artifacts\modal_upload_v2
 ```

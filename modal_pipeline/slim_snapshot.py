@@ -6,7 +6,7 @@ repo's SnapshotSourceStore rebuilds it when missing).
 
     .venv/Scripts/python.exe modal_pipeline/slim_snapshot.py \
         --snapshot artifacts/vibiomir/snapshots/phase2_full \
-        --official-corpus ../hf_check/links_corpus_vi_en_zh.parquet \
+        --official-corpus data/official/links_corpus_vi_en_zh.parquet \
         --out artifacts/vibiomir/snapshots/phase2_official
 """
 from __future__ import annotations

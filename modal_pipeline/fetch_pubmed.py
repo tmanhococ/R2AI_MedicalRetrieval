@@ -6,7 +6,7 @@ from Europe PMC's public REST API (EMBL-EBI), which serves the same MEDLINE titl
 Resumable: one JSONL file per batch of 250 PMIDs; finished batches are skipped. At most 2 requests/s.
 
     .venv/Scripts/python.exe modal_pipeline/fetch_pubmed.py \
-        --official-corpus ../hf_check/links_corpus_vi_en_zh.parquet --out artifacts/pubmed
+        --official-corpus data/official/links_corpus_vi_en_zh.parquet --out artifacts/pubmed
 """
 from __future__ import annotations
 
