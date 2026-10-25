@@ -31,8 +31,9 @@ import modal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # so add_local_python_source finds vb_common
 
-from vb_common import VOLUME_NAME  # noqa: E402
-
+# Keep module-level imports to stdlib + modal: the image build imports this file (run_function) before
+# vb_common is added to the image. Must equal vb_common.VOLUME_NAME (asserted in tests).
+VOLUME_NAME = "vibiomir-v2"
 APP_NAME = "vibiomir"
 VOL = Path("/vol")
 MODELS = Path("/models")

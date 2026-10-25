@@ -323,3 +323,23 @@ def test_local_index_copy_is_keyed_by_source(stack):
     other = app._local_index_dir(app._bm25_dir(0, "v2"), "chunks")
     assert len({tiny, full, other}) == 3
     assert app._local_index_dir(app._bm25_dir(0, "v1"), "docs") != full
+
+
+def test_app_module_level_imports_are_stdlib_or_modal():
+    # Modal's image build runs _download_models by importing app.py before local sources are added,
+    # so app.py may only import the standard library and modal at module level.
+    import ast
+
+    tree = ast.parse((PIPELINE / "app.py").read_text(encoding="utf-8"))
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            names.add(node.module.split(".")[0])
+    assert names <= set(sys.stdlib_module_names) | {"modal", "__future__"}, names
+
+
+def test_volume_name_matches_between_app_and_upload(stack):
+    app, _ = stack
+    assert app.VOLUME_NAME == vc.VOLUME_NAME == "vibiomir-v2"
