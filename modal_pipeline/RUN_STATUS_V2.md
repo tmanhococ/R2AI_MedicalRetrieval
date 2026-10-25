@@ -92,3 +92,21 @@ uv pip install --python .venv\Scripts\python.exe snowballstemmer
 
 - Volume cũ `vibiomir` không bị xoá và không còn được dùng.
 - Muốn chạy lại smoke local: `..\.venv-gpu` đã cài sẵn. Lệnh ở đầu `local_smoke.py`.
+
+## Kết quả chạy thật trên Modal (25/10/2026)
+
+| Lần chạy | Kết quả | Thời gian thực | GPU |
+|---|---|---|---|
+| tiny (1 part, 30 query) | `check_run` PASS: median điểm reranker top-1 = 0,70; 29/30 doc top-1 khác nhau | 6 phút | encode 181 s, rerank 71 s |
+| full (38 part, 1.200 query) | `check_run` PASS: 0 query rỗng, 1.173 doc top-1 khác nhau, **median điểm reranker top-1 = 3,81** | **24 phút** | encode 4.704 s (13 phút thực trên 10 L4), rerank 2.469 s |
+
+Lần chạy đầu bị lỗi khi build image: `app.py` import `vb_common` ở cấp module, mà `run_function` import `app.py`
+trước khi `vb_common` được thêm vào image. Đã sửa (`45287d1`) và thêm test chặn kiểu import này.
+
+File nộp (đã tải về `artifacts/modal_runs/v1/full/`):
+- `submission.zip`: mặc định, khoảng 85 doc và 90 chunk mỗi query
+- `try_60/submission.zip`: khoảng 57 doc và 58 chunk mỗi query
+- `try_40/submission.zip`: khoảng 39 doc và 39 chunk mỗi query
+
+Doc trả về theo ngôn ngữ: vi 79,7%, zh 10,3%, en (PubMed) 10,0%. Hạn chế đã thấy: NLLB dịch sai một số thành ngữ
+(ví dụ "nổi nóng" thành "发热" = sốt), làm lẫn tài liệu tiếng Trung không liên quan vào kết quả.
