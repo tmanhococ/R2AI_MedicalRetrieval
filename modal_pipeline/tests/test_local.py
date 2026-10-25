@@ -23,7 +23,7 @@ import pytest
 
 PIPELINE = Path(__file__).resolve().parent.parent
 REPO = PIPELINE.parent
-BUNDLE = REPO / "artifacts" / "modal_upload"
+BUNDLE = REPO / "artifacts" / "modal_upload_v2"
 sys.path.insert(0, str(PIPELINE))
 
 import vb_common as vc  # noqa: E402
@@ -81,7 +81,7 @@ class _FakeVolume:
 def stack(tmp_path_factory):
     src = BUNDLE / "chunks"
     if not (src / "part_00000.parquet").exists():
-        pytest.skip("artifacts/modal_upload not prepared")
+        pytest.skip("artifacts/modal_upload_v2 not prepared")
     vol = tmp_path_factory.mktemp("vol")
     (vol / "data" / "chunks").mkdir(parents=True)
     for i, n in enumerate(PART_ROWS):
