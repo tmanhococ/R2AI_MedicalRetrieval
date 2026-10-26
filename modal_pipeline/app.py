@@ -56,6 +56,7 @@ MAX_GPUS = 10  # Starter plan GPU concurrency
 
 DEFAULT_OPTS = {
     "version": "v1",            # namespace of emb/, bm25/, runs/ outputs; bump to recompute after a fix
+    "run_name": "",             # extra runs/ namespace: new search/pool/rerank settings, same emb/ and bm25/
     "dense_model": "e5",        # key of DENSE_MODELS
     "retranslate": False,       # True: redo cached query translations
     "nq": 0,                    # >0: only the first nq queries (dry runs)
@@ -188,8 +189,9 @@ def _local_index_dir(src: Path, name: str) -> Path:
     return Path(tempfile.gettempdir()) / f"idx_{key}"
 
 
-def _run_dir(parts: int, nq: int, version: str = DEFAULT_OPTS["version"]) -> Path:
-    return VOL / "runs" / version / (_index_tag(parts) + (f"_q{nq}" if nq else ""))
+def _run_dir(parts: int, nq: int, version: str = DEFAULT_OPTS["version"], run_name: str = "") -> Path:
+    base = VOL / "runs" / version / run_name if run_name else VOL / "runs" / version
+    return base / (_index_tag(parts) + (f"_q{nq}" if nq else ""))
 
 
 def _index_done(target: Path, name: str, rows: int) -> bool:
@@ -485,14 +487,14 @@ def build_bm25(parts: int = 0, threads: int = 16, version: str = DEFAULT_OPTS["v
 
 @app.function(image=bm25_image, volumes={VOL: vol}, cpu=16, memory=65536, timeout=4 * 3600)
 def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: float, version: str,
-                threads: int = 16) -> dict:
+                run_name: str = "", threads: int = 16) -> dict:
     import shutil
 
     import pandas as pd
     from vb_common import bm25_query_string
 
     vol.reload()
-    run = _run_dir(parts, nq, version)
+    run = _run_dir(parts, nq, version, run_name)
     src = _bm25_dir(parts, version)
     qs = [(qid, lang, bm25_query_string(text)) for qid, lang, text in _query_variant_list(nq)]
     qs = [q for q in qs if q[2]]
@@ -525,13 +527,14 @@ def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: f
 
 
 @app.function(image=gpu_image, gpu=GPU_SMALL, volumes={VOL: vol}, cpu=4, memory=32768, timeout=2 * 3600)
-def dense_search(parts: int, nq: int, k: int, max_len: int, version: str, dense_model: str = "e5") -> dict:
+def dense_search(parts: int, nq: int, k: int, max_len: int, version: str, dense_model: str = "e5",
+                 run_name: str = "") -> dict:
     import numpy as np
     import pandas as pd
     import torch
 
     vol.reload()
-    out = _run_dir(parts, nq, version) / "dense.parquet"
+    out = _run_dir(parts, nq, version, run_name) / "dense.parquet"
     if out.exists():
         return {"skipped": True}
     qs = _query_variant_list(nq)
@@ -579,7 +582,7 @@ def build_pool(parts: int, nq: int, opts_json: str) -> dict:
 
     o = {**DEFAULT_OPTS, **json.loads(opts_json)}
     vol.reload()
-    run = _run_dir(parts, nq, o["version"])
+    run = _run_dir(parts, nq, o["version"], o["run_name"])
     out = run / "pool.parquet"
     if out.exists():
         return {"skipped": True}
@@ -695,14 +698,14 @@ def build_pool(parts: int, nq: int, opts_json: str) -> dict:
     timeout=3 * 3600, retries=1, max_containers=MAX_GPUS,
 )
 def rerank_batch(parts: int, nq: int, batch: int, nbatches: int, version: str = DEFAULT_OPTS["version"],
-                 max_len: int = 512, token_budget: int = 16384) -> dict:
+                 run_name: str = "", max_len: int = 512, token_budget: int = 16384) -> dict:
     import numpy as np
     import pandas as pd
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     from vb_common import compose_passage
 
-    run = _run_dir(parts, nq, version)
+    run = _run_dir(parts, nq, version, run_name)
     out = run / "rerank" / f"scores_{batch:03d}.parquet"
     if out.exists():
         return {"batch": batch, "skipped": True}
@@ -750,7 +753,7 @@ def finalize(parts: int, nq: int, opts_json: str) -> dict:
 
     o = {**DEFAULT_OPTS, **json.loads(opts_json)}
     vol.reload()
-    run = _run_dir(parts, nq, o["version"])
+    run = _run_dir(parts, nq, o["version"], o["run_name"])
     pool = pd.read_parquet(run / "pool.parquet", columns=["qid", "row", "doc_id", "chunk_rrf", "doc_rrf", "text"])
     files = sorted((run / "rerank").glob("scores_*.parquet"))
     if len(files) != o["rerank_batches"]:
@@ -810,7 +813,7 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
     vol.reload()
     shards = _shards(parts)
     if all_stages or stage in ("search", "pool", "rerank", "final"):
-        _check_run_opts(_run_dir(parts, nq, v), o)
+        _check_run_opts(_run_dir(parts, nq, v, o["run_name"]), o)
         vol.commit()
     rows = sum(s["rows"] for s in shards)
 
@@ -845,15 +848,16 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
         note("translate", translate_call.get())
 
     if all_stages or stage == "search":
-        d = dense_search.spawn(parts, nq, o["dense_k"], o["max_len"], v, o["dense_model"])
-        s = bm25_search.spawn(parts, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"], v)
+        d = dense_search.spawn(parts, nq, o["dense_k"], o["max_len"], v, o["dense_model"], o["run_name"])
+        s = bm25_search.spawn(parts, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"], v,
+                              o["run_name"])
         note("dense search", d.get())
         note("bm25 search", s.get())
     if all_stages or stage == "pool":
         note("pool", build_pool.remote(parts, nq, json.dumps(o)))
     if all_stages or stage == "rerank":
         nb = o["rerank_batches"]
-        res = list(rerank_batch.map([parts] * nb, [nq] * nb, range(nb), [nb] * nb, [v] * nb))
+        res = list(rerank_batch.map([parts] * nb, [nq] * nb, range(nb), [nb] * nb, [v] * nb, [o["run_name"]] * nb))
         done = [r for r in res if not r.get("skipped")]
         note("rerank", {"batches": nb, "ran_now": len(done), "pairs": sum(r["pairs"] for r in done),
                         "gpu_secs": sum(r["secs"] for r in done)})
@@ -874,7 +878,7 @@ def main(stage: str = "all", parts: int = 0, nq: int = 0, opts: str = "{}", down
     for line in pipeline.remote(stage, parts, json.dumps(o)):
         print(line)
     if download and stage in ("all", "final"):
-        remote = _run_dir(parts, o["nq"], o["version"]).relative_to(VOL).as_posix()  # runs/<version>/<tag>
+        remote = _run_dir(parts, o["nq"], o["version"], o["run_name"]).relative_to(VOL).as_posix()
         dest = Path("artifacts") / ("modal_" + remote)
         dest.mkdir(parents=True, exist_ok=True)
         for name in ("submission.zip", "selection.json", "scored_pool.parquet"):

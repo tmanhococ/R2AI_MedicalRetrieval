@@ -114,10 +114,10 @@ def main() -> None:
     stage("bm25 index", app.build_bm25.local, 0, 1, v)
     app._check_run_opts(app._run_dir(0, nq, v), o)
     stage("dense search", app.dense_search.local, 0, nq, o["dense_k"], o["max_len"], v)
-    stage("bm25 search", app.bm25_search.local, 0, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"], v, 2)
+    stage("bm25 search", app.bm25_search.local, 0, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"], v, "", 2)
     stage("pool", app.build_pool.local, 0, nq, json.dumps(o))
     for b in range(o["rerank_batches"]):
-        stage(f"rerank {b}", app.rerank_batch.local, 0, nq, b, o["rerank_batches"], v, 512, 4096)
+        stage(f"rerank {b}", app.rerank_batch.local, 0, nq, b, o["rerank_batches"], v, "", 512, 4096)
     final = stage("final", app.finalize.local, 0, nq, json.dumps(o))
 
     from vb_common import quality_report, validate_results

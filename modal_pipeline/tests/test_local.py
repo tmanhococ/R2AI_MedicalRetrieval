@@ -379,3 +379,12 @@ def test_dense_model_registry_and_paths(stack):
     assert app._emb_path("part_00000.parquet", 512, "v1", "e5") == app.VOL / "emb" / "v1_len512" / "part_00000.npy"
     assert app._emb_path("part_00000.parquet", 512, "v1", "bge-m3") == app.VOL / "emb" / "v1_bge-m3_len512" / "part_00000.npy"
     assert app.DEFAULT_OPTS["dense_model"] == "e5" and "dense_model" in app.RUN_KEYS
+
+
+def test_run_name_separates_runs_without_touching_indexes(stack):
+    app, _ = stack
+    assert app.DEFAULT_OPTS["run_name"] == ""
+    assert app._run_dir(0, 0, "v1") == app.VOL / "runs" / "v1" / "full"
+    assert app._run_dir(0, 0, "v1", "e3") == app.VOL / "runs" / "v1" / "e3" / "full"
+    # embeddings and BM25 stay keyed by version only
+    assert app._bm25_dir(0, "v1") == app.VOL / "bm25" / "v1" / "full"
