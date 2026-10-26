@@ -368,3 +368,14 @@ def test_docs_as_chunks_one_window_per_selected_doc():
     assert out[0]["relevant_docs"] == [7, 9] and out[1]["relevant_chunks"] == []
     win = vc.docs_as_chunks(results, best_row, doc_chunks, max_chars=6)
     assert win[0]["relevant_chunks"][0]["chunk_text"] == "p1\n\np2"
+
+
+def test_dense_model_registry_and_paths(stack):
+    app, _ = stack
+    e5, m3 = app.DENSE_MODELS["e5"], app.DENSE_MODELS["bge-m3"]
+    assert (e5["pooling"], e5["query_prefix"], e5["passage_prefix"]) == ("mean", "query: ", "passage: ")
+    assert (m3["id"], m3["pooling"], m3["query_prefix"], m3["passage_prefix"]) == ("BAAI/bge-m3", "cls", "", "")
+    # e5 keeps the v2 layout so existing embeddings on the volume are reused
+    assert app._emb_path("part_00000.parquet", 512, "v1", "e5") == app.VOL / "emb" / "v1_len512" / "part_00000.npy"
+    assert app._emb_path("part_00000.parquet", 512, "v1", "bge-m3") == app.VOL / "emb" / "v1_bge-m3_len512" / "part_00000.npy"
+    assert app.DEFAULT_OPTS["dense_model"] == "e5" and "dense_model" in app.RUN_KEYS

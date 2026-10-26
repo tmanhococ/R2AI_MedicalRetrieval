@@ -41,6 +41,11 @@ E5_ID = "intfloat/multilingual-e5-base"
 RERANK_ID = "BAAI/bge-reranker-v2-m3"
 NLLB_ID = "facebook/nllb-200-distilled-1.3B"
 E5_DIR = MODELS / "e5"
+# Dense encoders: E5 uses mean pooling with query/passage prefixes; bge-m3 (dense head) uses CLS pooling.
+DENSE_MODELS = {
+    "e5": {"id": E5_ID, "dir": E5_DIR, "pooling": "mean", "query_prefix": "query: ", "passage_prefix": "passage: "},
+    "bge-m3": {"id": "BAAI/bge-m3", "dir": MODELS / "bge-m3", "pooling": "cls", "query_prefix": "", "passage_prefix": ""},
+}
 RERANK_DIR = MODELS / "reranker"
 
 # GPU choices: L4 ($0.80/h) is the cheapest per token for these encoder-only models.
@@ -51,6 +56,7 @@ MAX_GPUS = 10  # Starter plan GPU concurrency
 
 DEFAULT_OPTS = {
     "version": "v1",            # namespace of emb/, bm25/, runs/ outputs; bump to recompute after a fix
+    "dense_model": "e5",        # key of DENSE_MODELS
     "retranslate": False,       # True: redo cached query translations
     "nq": 0,                    # >0: only the first nq queries (dry runs)
     "max_len": 512,             # E5 passage truncation (tokens)
@@ -83,6 +89,9 @@ def _download_models() -> None:
     ignore = ["*.bin", "*.onnx", "onnx/*", "openvino/*", "*.h5", "*.msgpack", "*.ot"]
     snapshot_download(E5_ID, local_dir=str(E5_DIR), ignore_patterns=ignore)
     snapshot_download(RERANK_ID, local_dir=str(RERANK_DIR), ignore_patterns=ignore)
+    m3 = DENSE_MODELS["bge-m3"]  # ships only pytorch_model.bin; skip ONNX and the colbert/sparse heads
+    snapshot_download(m3["id"], local_dir=str(m3["dir"]),
+                      ignore_patterns=["*.onnx", "onnx/*", "*.pt", "*.jpg", "imgs/*"])
 
 
 _base = modal.Image.debian_slim(python_version="3.12")
@@ -163,8 +172,9 @@ def _index_tag(parts: int) -> str:
 
 # Stages skip outputs that already exist, so every output path carries what produced it:
 # bump the "version" opt to recompute after a code fix instead of deleting volume files.
-def _emb_path(part: str, max_len: int, version: str) -> Path:
-    return VOL / "emb" / f"{version}_len{max_len}" / (Path(part).stem + ".npy")
+def _emb_path(part: str, max_len: int, version: str, dense_model: str = "e5") -> Path:
+    model_tag = "" if dense_model == "e5" else f"_{dense_model}"  # e5 keeps the v2 layout
+    return VOL / "emb" / f"{version}{model_tag}_len{max_len}" / (Path(part).stem + ".npy")
 
 
 def _bm25_dir(parts: int, version: str) -> Path:
@@ -188,7 +198,7 @@ def _index_done(target: Path, name: str, rows: int) -> bool:
 
 
 # Opts that change search/pool/rerank outputs; a run dir must not mix two settings of them.
-RUN_KEYS = ("version", "max_len", "dense_k", "bm25_chunk_k", "bm25_doc_k", "bm25_k1", "bm25_b", "rrf_k",
+RUN_KEYS = ("version", "dense_model", "max_len", "dense_k", "bm25_chunk_k", "bm25_doc_k", "bm25_k1", "bm25_b", "rrf_k",
             "w_dense", "w_sparse_chunk", "w_sparse_doc", "top_docs", "chunks_per_new_doc", "pool_size",
             "rerank_batches")
 
@@ -230,7 +240,7 @@ def _query_variant_list(nq: int) -> list[tuple[int, str, str]]:
     return [(v["id"], lang, v[lang]) for v in _load_variants(nq) for lang in ("vi", "en", "zh") if v.get(lang)]
 
 
-def _embed(model, tok, ids: list[list[int]], token_budget: int):
+def _embed(model, tok, ids: list[list[int]], token_budget: int, pooling: str = "mean"):
     """Length-sorted, token-budgeted batches; mean pooling + L2 norm (E5 recipe)."""
     import numpy as np
     import torch
@@ -250,19 +260,24 @@ def _embed(model, tok, ids: list[list[int]], token_budget: int):
         mask = batch["attention_mask"].cuda(non_blocking=True)
         with torch.inference_mode():
             h = model(input_ids=input_ids, attention_mask=mask).last_hidden_state.float()
-            m = mask.unsqueeze(-1).float()
-            e = torch.nn.functional.normalize((h * m).sum(1) / m.sum(1).clamp(min=1.0), dim=-1)
+            if pooling == "cls":
+                pooled = h[:, 0]
+            else:
+                m = mask.unsqueeze(-1).float()
+                pooled = (h * m).sum(1) / m.sum(1).clamp(min=1.0)
+            e = torch.nn.functional.normalize(pooled, dim=-1)
         out[sel] = e.half().cpu().numpy()
         i += bs
     return out
 
 
-def _load_e5():
+def _load_dense(dense_model: str = "e5"):
     import torch
     from transformers import AutoModel, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(str(E5_DIR))
-    model = AutoModel.from_pretrained(str(E5_DIR)).half().cuda().eval()
+    model_dir = str(DENSE_MODELS[dense_model]["dir"])
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModel.from_pretrained(model_dir).half().cuda().eval()
     torch.backends.cuda.matmul.allow_tf32 = True
     return tok, model
 
@@ -308,12 +323,13 @@ def build_meta() -> dict:
     timeout=2 * 3600, retries=1, max_containers=MAX_GPUS,
 )
 def encode_part(part: str, max_len: int = 512, sample: int = 0, token_budget: int = 32768,
-                version: str = DEFAULT_OPTS["version"]) -> dict:
+                version: str = DEFAULT_OPTS["version"], dense_model: str = "e5") -> dict:
     import numpy as np
     import pyarrow.parquet as pq
     from vb_common import compose_passage
 
-    out = _emb_path(part, max_len, version)
+    out = _emb_path(part, max_len, version, dense_model)
+    spec = DENSE_MODELS[dense_model]
     if not sample and out.exists():
         return {"part": part, "skipped": True}
     t = pq.read_table(_data_dir() / "chunks" / part, columns=["title", "section", "text"])
@@ -321,12 +337,12 @@ def encode_part(part: str, max_len: int = 512, sample: int = 0, token_budget: in
     idx = range(t.num_rows)
     if sample:
         idx = np.random.default_rng(0).choice(t.num_rows, size=min(sample, t.num_rows), replace=False)
-    passages = ["passage: " + compose_passage(titles[i], sections[i], texts[i]) for i in idx]
+    passages = [spec["passage_prefix"] + compose_passage(titles[i], sections[i], texts[i]) for i in idx]
 
-    tok, model = _load_e5()
+    tok, model = _load_dense(dense_model)
     t0 = time.time()
     ids = tok(passages, truncation=True, max_length=max_len)["input_ids"]
-    vecs = _embed(model, tok, ids, token_budget)
+    vecs = _embed(model, tok, ids, token_budget, spec["pooling"])
     secs = time.time() - t0
     if not sample:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -509,7 +525,7 @@ def bm25_search(parts: int, nq: int, k_chunks: int, k_docs: int, k1: float, b: f
 
 
 @app.function(image=gpu_image, gpu=GPU_SMALL, volumes={VOL: vol}, cpu=4, memory=32768, timeout=2 * 3600)
-def dense_search(parts: int, nq: int, k: int, max_len: int, version: str) -> dict:
+def dense_search(parts: int, nq: int, k: int, max_len: int, version: str, dense_model: str = "e5") -> dict:
     import numpy as np
     import pandas as pd
     import torch
@@ -519,16 +535,17 @@ def dense_search(parts: int, nq: int, k: int, max_len: int, version: str) -> dic
     if out.exists():
         return {"skipped": True}
     qs = _query_variant_list(nq)
-    tok, model = _load_e5()
-    ids = tok(["query: " + text for _, _, text in qs], truncation=True, max_length=max_len)["input_ids"]
-    q = torch.from_numpy(_embed(model, tok, ids, 32768)).cuda()
+    spec = DENSE_MODELS[dense_model]
+    tok, model = _load_dense(dense_model)
+    ids = tok([spec["query_prefix"] + text for _, _, text in qs], truncation=True, max_length=max_len)["input_ids"]
+    q = torch.from_numpy(_embed(model, tok, ids, 32768, spec["pooling"])).cuda()
     del model
     m = q.shape[0]
     best_s = torch.full((m, k), float("-inf"), device="cuda", dtype=torch.float16)
     best_i = torch.full((m, k), -1, device="cuda", dtype=torch.long)
     t0 = time.time()
     for s in _shards(parts):
-        path = _emb_path(s["part"], max_len, version)
+        path = _emb_path(s["part"], max_len, version, dense_model)
         if not path.exists():
             raise FileNotFoundError(f"missing embeddings for {s['part']}; run --stage encode")
         emb = torch.from_numpy(np.load(path)).cuda()
@@ -800,7 +817,8 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
     if stage == "bench":
         full = _shards()
         picks = [full[i]["part"] for i in sorted({round(j * (len(full) - 1) / 3) for j in range(4)})]
-        res = list(encode_part.map(picks, kwargs={"max_len": o["max_len"], "sample": 4000, "version": v}))
+        res = list(encode_part.map(picks, kwargs={"max_len": o["max_len"], "sample": 4000, "version": v,
+                                                       "dense_model": o["dense_model"]}))
         rps = sum(r["rows"] for r in res) / sum(r["secs"] for r in res)
         total = sum(s["rows"] for s in full)
         hours = total / rps / 3600
@@ -816,7 +834,8 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
         translate_call = translate_queries.spawn(nq, o["retranslate"])
     if all_stages or stage == "encode":
         t0 = time.time()
-        res = list(encode_part.map([s["part"] for s in shards], kwargs={"max_len": o["max_len"], "version": v}))
+        res = list(encode_part.map([s["part"] for s in shards], kwargs={"max_len": o["max_len"], "version": v,
+                                                                              "dense_model": o["dense_model"]}))
         done = [r for r in res if not r.get("skipped")]
         note("encode", {"parts": len(res), "encoded_now": len(done), "rows": rows,
                         "gpu_secs": round(sum(r["secs"] for r in done)), "wall_secs": round(time.time() - t0)})
@@ -826,7 +845,7 @@ def pipeline(stage: str, parts: int = 0, opts_json: str = "{}") -> list[str]:
         note("translate", translate_call.get())
 
     if all_stages or stage == "search":
-        d = dense_search.spawn(parts, nq, o["dense_k"], o["max_len"], v)
+        d = dense_search.spawn(parts, nq, o["dense_k"], o["max_len"], v, o["dense_model"])
         s = bm25_search.spawn(parts, nq, o["bm25_chunk_k"], o["bm25_doc_k"], o["bm25_k1"], o["bm25_b"], v)
         note("dense search", d.get())
         note("bm25 search", s.get())

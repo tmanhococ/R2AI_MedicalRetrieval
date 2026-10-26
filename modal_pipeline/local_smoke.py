@@ -82,7 +82,7 @@ def main() -> None:
     spec.loader.exec_module(app)
     app.VOL = vol_dir
     app.vol = app.hf_vol = _LocalVolume()
-    app.E5_DIR = Path(snapshot_download(app.E5_ID, local_files_only=True))
+    app.DENSE_MODELS["e5"]["dir"] = Path(snapshot_download(app.E5_ID, local_files_only=True))
     app.RERANK_DIR = Path(snapshot_download(app.RERANK_ID, local_files_only=True))
     if args.nllb:
         app.NLLB_ID = args.nllb
