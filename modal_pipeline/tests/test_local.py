@@ -343,3 +343,28 @@ def test_app_module_level_imports_are_stdlib_or_modal():
 def test_volume_name_matches_between_app_and_upload(stack):
     app, _ = stack
     assert app.VOLUME_NAME == vc.VOLUME_NAME == "vibiomir-v2"
+
+
+def test_doc_window_grows_around_center_within_budget():
+    texts = ["aaaa", "bbbb", "cccc", "dddd", "eeee"]
+    assert vc.doc_window(texts, 2, 0) == "aaaa\n\nbbbb\n\ncccc\n\ndddd\n\neeee"  # 0 = whole document
+    assert vc.doc_window(texts, 2, 4) == "cccc"
+    assert vc.doc_window(texts, 2, 16) == "bbbb\n\ncccc\n\ndddd"  # grows next, previous, next... while it fits
+    assert vc.doc_window(texts, 0, 10) == "aaaa\n\nbbbb"
+    assert vc.doc_window(texts, 4, 10) == "dddd\n\neeee"
+    assert vc.doc_window(["x" * 50], 0, 10) == "x" * 50  # the center chunk is always kept whole
+
+
+def test_docs_as_chunks_one_window_per_selected_doc():
+    results = [{"id": 1, "relevant_docs": [7, 9], "relevant_chunks": [{"doc_id": 7, "chunk_text": "old", "chunk_order": 0}]},
+               {"id": 2, "relevant_docs": [], "relevant_chunks": []}]
+    doc_chunks = {7: [(100, "p0"), (101, "p1"), (102, "p2")], 9: [(200, "q0")]}
+    best_row = {(1, 7): 102, (1, 9): 200}
+    out = vc.docs_as_chunks(results, best_row, doc_chunks, max_chars=0)
+    assert out[0]["relevant_chunks"] == [
+        {"doc_id": 7, "chunk_text": "p0\n\np1\n\np2", "chunk_order": 0},
+        {"doc_id": 9, "chunk_text": "q0", "chunk_order": 1},
+    ]
+    assert out[0]["relevant_docs"] == [7, 9] and out[1]["relevant_chunks"] == []
+    win = vc.docs_as_chunks(results, best_row, doc_chunks, max_chars=6)
+    assert win[0]["relevant_chunks"][0]["chunk_text"] == "p1\n\np2"

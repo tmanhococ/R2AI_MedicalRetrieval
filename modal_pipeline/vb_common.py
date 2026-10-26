@@ -228,3 +228,52 @@ def quality_report(results: list[dict], scored_rows: list[dict], min_median_ce: 
     }
     report["passed"] = n > 0 and distinct >= min(10, max(1, n // 3)) and median_top > min_median_ce
     return report
+
+
+def doc_window(texts: list[str], center: int, max_chars: int) -> str:
+    """Chunk texts of one document joined around texts[center].
+
+    max_chars <= 0 returns the whole document. Otherwise neighbours are added alternately
+    (next, previous, next, ...) while the joined text stays within max_chars; the center
+    chunk is always included in full.
+    """
+    if max_chars <= 0:
+        return "\n\n".join(texts)
+    lo = hi = center
+    size = len(texts[center])
+    take_next = True
+    while lo > 0 or hi < len(texts) - 1:
+        cand = hi + 1 if take_next else lo - 1
+        take_next = not take_next
+        if not 0 <= cand < len(texts):
+            continue
+        grown = size + 2 + len(texts[cand])
+        if grown > max_chars:
+            break
+        size = grown
+        lo, hi = min(lo, cand), max(hi, cand)
+    return "\n\n".join(texts[lo : hi + 1])
+
+
+def docs_as_chunks(results: list[dict], best_row: dict, doc_chunks: dict, max_chars: int) -> list[dict]:
+    """Replace each query's chunks with one prediction per selected document.
+
+    The scorer counts a predicted chunk when its token LCS covers >= 40% of a gold chunk and does not
+    penalise long predictions, so a window of the document (the whole document when max_chars <= 0),
+    centred on the document's best reranked chunk, matches whenever the document is right.
+    best_row: (qid, doc_id) -> row of the document's best chunk; doc_chunks: doc_id -> [(row, text)] in order.
+    """
+    out = []
+    for r in results:
+        chunks = []
+        for d in r["relevant_docs"]:
+            parts = doc_chunks.get(d)
+            if not parts:
+                continue
+            rows = [row for row, _ in parts]
+            best = best_row.get((r["id"], d), rows[0])
+            center = rows.index(best) if best in rows else 0
+            text = doc_window([t for _, t in parts], center, max_chars)
+            chunks.append({"doc_id": int(d), "chunk_text": text, "chunk_order": len(chunks)})
+        out.append({**r, "relevant_chunks": chunks})
+    return out
